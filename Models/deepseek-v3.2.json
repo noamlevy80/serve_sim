@@ -1,0 +1,57 @@
+{
+  "name": "DeepSeek-V3.2",
+  "source": "https://huggingface.co/deepseek-ai/DeepSeek-V3.2",
+  "global": {
+    "num_layers": 61,
+    "hidden_size": 7168,
+    "vocab_size": 129280,
+    "tie_word_embeddings": false,
+    "param_dtype_bytes": 1,
+    "kv_dtype_bytes": 2,
+    "layer_pattern": [
+      "dense", "dense", "dense",
+      "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe",
+      "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe",
+      "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe",
+      "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe",
+      "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe", "moe",
+      "moe", "moe", "moe", "moe", "moe", "moe", "moe"
+    ]
+  },
+  "blocks": {
+    "attention": {
+      "block_type": "attention",
+      "attention_type": "MLA",
+      "num_query_heads": 128,
+      "q_lora_rank": 1536,
+      "kv_lora_rank": 512,
+      "qk_rope_head_dim": 64,
+      "qk_nope_head_dim": 128,
+      "v_head_dim": 128,
+      "sparse_attention": true,
+      "sparse_topk": 2048,
+      "index_n_heads": 64,
+      "index_head_dim": 128
+    },
+    "dense": {
+      "block_type": "ffn",
+      "ffn_type": "dense",
+      "intermediate_size": 18432,
+      "gated": true
+    },
+    "moe": {
+      "block_type": "ffn",
+      "ffn_type": "MoE",
+      "intermediate_size": 2048,
+      "gated": true,
+      "num_experts": 256,
+      "num_experts_per_token": 8,
+      "num_shared_experts": 1,
+      "shared_expert_intermediate_size": 2048
+    }
+  },
+  "mtp": {
+    "num_mtp_layers": 1,
+    "mtp_layer_pattern": ["attention", "moe"]
+  }
+}

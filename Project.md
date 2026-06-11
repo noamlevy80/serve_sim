@@ -1,380 +1,130 @@
-# Product Requirements Document (PRD)
+# Overview
+The purpose of this project is to ingest inference session traces and simulate workloads at the datacenter scale, extracting useful statistics to allow architectural exploration and discovery of bottlenecks.
 
-## 1. Purpose
-This project simulates LLM serving workloads at datacenter scale by replaying trace-derived sessions over a configurable system model. Its primary goal is to quantify bottlenecks caused by memory hierarchy design and data movement, especially for KV cache, MoE expert weights, and intermediate tensors.
+# Elements
+## Models
+A model is an abstract representation of an LLM, which contains all the information required to allow to calculate the inference rate given the compute device description, and the type of parallelism chosen.
+The model contains information about that allows calculating the required memory, bandwidth and compute to run a forward pass, which means the sizing of the tensors of each layer so that the compute and bandwidth load could be calculated.
 
-The simulator is intended for architecture exploration, not cycle-accurate hardware modeling.
+Models will support:
+- FFN - dense or MoE
+- Attention: MHA, GQA, MLA, DSA
+- Linear attention: Mamba V2
 
-## 2. Problem Statement
-Real serving systems exhibit performance behavior that depends on compute capability, memory tiering, network topology, orchestration policy, and workload shape. Existing trace analysis alone does not answer "what if" questions for alternate hardware and placement strategies.
+### Model parameters
 
-This project must provide a repeatable environment to:
-- Ingest real traces.
-- Model event-level execution and contention.
-- Compare architecture and scheduling options with standardized metrics.
+These are the minimal parameters required to size every tensor in a forward pass so that compute (FLOPs), parameter/KV memory, and bandwidth can be derived. Parameters are grouped by scope; the `Applies to` column indicates when a parameter is relevant.
 
-## 3. Goals
-- Simulate end-to-end prefill and decode behavior for many concurrent conversations.
-- Capture effects of data placement and movement across memory tiers.
-- Model MoE-specific behavior, including expert residency and weight movement.
-- Evaluate orchestration strategies including prefix reuse and disaggregation.
-- Output serving metrics and detailed event logs for offline analysis and visualization.
+#### Global
 
-## 4. Non-Goals
-- Cycle-level microarchitecture simulation.
-- Exact kernel-level modeling for specific vendor stacks.
-- Training workloads.
-- Full tool execution modeling; only trace-observed tool latency is represented.
-- Non-autoregressive model families in the initial version.
+| Parameter | Symbol | Description | Applies to |
+|---|---|---|---|
+| `num_layers` | $L$ | Number of transformer/block layers. | All |
+| `hidden_size` | $d_\text{model}$ | Residual stream / token embedding width. | All |
+| `vocab_size` | $V$ | Vocabulary size; sizes the embedding and LM head matrices. | All |
+| `tie_word_embeddings` | — | Whether the LM head shares weights with the input embedding (affects parameter memory). | All |
+| `param_dtype_bytes` | $b_w$ | Bytes per stored weight element (e.g. 2 for fp16/bf16, 1 for fp8). Sizes parameter memory and weight-load bandwidth. | All |
+| `kv_dtype_bytes` | $b_{kv}$ | Bytes per KV cache element. Sizes KV memory and KV transfer bandwidth. | Attention |
+| `layer_pattern` | — | Per-layer assignment of block type (e.g. first $k$ dense then MoE, or interleaved attention/Mamba). Lets per-layer params vary across the stack. | All |
 
-## 5. Scope and Assumptions
-- Models are autoregressive and MoE in v1.
-- Time is modeled as event boundaries, not hardware ticks.
-- Trace input may come from LMCache Agentic Traces and other sources after normalization.
-- The simulator must remain deterministic when randomness is disabled and random seed is fixed.
+#### Attention block
 
-Reference dataset:
+| Parameter | Symbol | Description | Applies to |
+|---|---|---|---|
+| `attention_type` | — | Base attention mechanism: `MHA`, `GQA`, or `MLA`. | Attention |
+| `num_query_heads` | $h_q$ | Number of query heads. | MHA, GQA, MLA |
+| `num_kv_heads` | $h_{kv}$ | Number of key/value heads (= $h_q$ for MHA, < $h_q$ for GQA). Sizes KV cache. | MHA, GQA |
+| `head_dim` | $d_h$ | Per-head dimension for Q/K/V. | MHA, GQA |
+| `q_lora_rank` | $r_q$ | Rank of the down-projected query latent. | MLA |
+| `kv_lora_rank` | $r_{kv}$ | Rank of the compressed KV latent (this is what is cached). | MLA |
+| `qk_rope_head_dim` | $d_h^\text{rope}$ | Per-head dimension carrying rotary position info. | MLA |
+| `qk_nope_head_dim` | $d_h^\text{nope}$ | Per-head dimension without rotary embedding. | MLA |
+| `v_head_dim` | $d_h^v$ | Per-head value dimension. | MLA |
+| `sparse_attention` | — | Whether a lightweight indexer selects a sparse subset of past tokens to attend to (DeepSeek Sparse Attention / DSA). Overlays any base `attention_type`. | Attention |
+| `sparse_topk` | $k_\text{attn}$ | Number of past tokens the indexer selects per query (sparse attention budget). | DSA |
+| `index_n_heads` | $h_\text{idx}$ | Number of heads in the indexer that scores tokens for selection. | DSA |
+| `index_head_dim` | $d_\text{idx}$ | Per-head dimension of the indexer. | DSA |
+
+#### FFN block
+
+| Parameter | Symbol | Description | Applies to |
+|---|---|---|---|
+| `ffn_type` | — | `dense` or `MoE`. | FFN |
+| `intermediate_size` | $d_\text{ff}$ | FFN hidden dimension (per routed expert for MoE). | FFN |
+| `gated` | — | Whether the FFN is gated (e.g. SwiGLU → 3 weight matrices vs. 2 for an ungated activation like ReLU²). Affects FLOPs and weight memory. | FFN |
+| `num_experts` | $E$ | Total number of routed experts. | MoE |
+| `num_experts_per_token` | $k_E$ | Active experts per token (router top-k); drives MoE compute. | MoE |
+| `num_shared_experts` | $E_s$ | Always-active shared experts. | MoE |
+| `shared_expert_intermediate_size` | $d_\text{ff}^s$ | FFN hidden dimension of the shared expert(s) when it differs from the routed experts. | MoE |
+| `moe_latent_size` | $d_\text{lat}$ | Latent width that tokens are down-projected to for routing and expert computation (LatentMoE). When set, adds hidden→latent and latent→hidden projections and experts operate at $d_\text{lat}$ instead of $d_\text{model}$. | MoE |
+
+#### Mamba V2 (linear attention) block
+
+| Parameter | Symbol | Description | Applies to |
+|---|---|---|---|
+| `mamba_d_state` | $N$ | SSM state dimension. | Mamba V2 |
+| `mamba_d_conv` | $k_\text{conv}$ | Causal convolution kernel width. | Mamba V2 |
+| `mamba_expand` | $e$ | Expansion factor for the inner dimension ($d_\text{inner} = e \cdot d_\text{model}$). | Mamba V2 |
+| `mamba_num_heads` | $h_m$ | Number of SSM heads. | Mamba V2 |
+| `mamba_head_dim` | $d_h^m$ | Per-head dimension of the SSM. | Mamba V2 |
+| `mamba_n_groups` | $g$ | Number of B/C projection groups; sizes the input projection and causal conv ($d_\text{inner} + 2 g N$ channels). | Mamba V2 |
+
+#### Multi-Token Prediction (MTP)
+
+Optional speculative-decoding head appended after the main stack. Needed to model the extra per-step compute and the draft tokens it produces.
+
+| Parameter | Symbol | Description | Applies to |
+|---|---|---|---|
+| `num_mtp_layers` | $L_\text{mtp}$ | Number of MTP modules (predicted future tokens per step). | MTP |
+| `mtp_layer_pattern` | — | Block type(s) composing each MTP module (reuses the attention/FFN/Mamba block definitions above). | MTP |
+
+## Workloads
+A workload is a multi turn conversation with or without tool calling
+
 https://huggingface.co/datasets/sammshen/lmcache-agentic-traces
 
-## 6. Personas and Primary Use Cases
-### Personas
-- Serving architect evaluating memory and network designs.
-- Performance engineer validating bottleneck hypotheses.
-- Researcher comparing orchestration policies under realistic traces.
+In the simulator, we will 'run' several workloads in parallel to simulate a high concurrency system
 
-### Use Cases
-- Compare baseline GPU-only serving against tiered memory serving.
-- Quantify impact of prefill-decode disaggregation on latency and throughput.
-- Evaluate prefix reuse effectiveness with multi-turn conversational traces.
-- Estimate network pressure from remote KV/expert fetches under high concurrency.
+## Test Suite
+A test suite is a list of workloads that the system should simulate.
 
-## 7. High-Level System Design
-Each simulation element is represented by Python classes and instantiated from JSON configuration.
+## Compute Devices
+A compute device is a GPU or other inference oriented device.
 
-Core entities:
-- Model
-- Workload
-- Test suite
-- Compute device
-- Memory device
-- Node
-- System
-- Orchestrator
-- Event engine
+The compute device is defined by the native compute performance, and native memory (e.g. HBM) volume and bandwidth. These parameters will be used to calculate the inference events duration and resource usage.
+A compute event is an ask for the compute device to do a forward pass; the actual amount of work depends on the model, the parallelism and concurrency.
+The output will of the event will be the expected duration of the event.
+The expected duration will be affected by the amount of compute and bandwidth needed, vs. what is available, where availability of resources could be influenced by prior events not ending yet.
 
-## 8. Data Contracts and Configuration
-### 8.1 Model Definition
-A model describes the computational and memory behavior needed to estimate event durations and resource usage for prefill and decode.
 
-Required parameters:
-- model_id: unique model name.
-- architecture_type: fixed to "autoregressive_moe" in v1.
-- num_layers: transformer layer count.
-- hidden_size: model hidden dimension.
-- num_attention_heads: total attention heads.
-- num_kv_heads: KV heads for grouped/multi-query attention.
-- vocab_size: tokenizer vocabulary size.
-- max_context_tokens: maximum supported context length.
-- precision: default compute/storage precision assumptions.
-- prefill_flops_per_token: effective FLOPs/token for prefill.
-- decode_flops_per_token: effective FLOPs/token for decode.
-- kv_bytes_per_token: KV cache bytes per token per sequence.
-- activation_bytes_per_token: transient activation footprint for prefill/decode.
-- moe_num_experts: total experts.
-- moe_top_k: experts selected per token.
-- moe_expert_param_bytes: bytes of parameters per expert.
-- moe_router_overhead_flops_per_token: routing overhead.
-- expert_residency_model: statistical parameters for expert locality.
-- tensor_parallel_supported: boolean.
-- pipeline_parallel_supported: boolean.
 
-Optional parameters:
-- calibration_profile: empirical scaling corrections by device family.
-- quantization_profiles: alternate precision-specific coefficients.
+## Memory Devices
+The system will support standalone memory devices, which are not necessarily part of an inference device, and are connected to the other devices in the node and in other nodes via the node interconnect or the scale up network. Memory devices are characterized by volume and bandwidth.
+A device may use a memory device in lieu of its internal storage, and pay the extra bandwidth and latency
 
-### 8.2 Workload Definition
-A workload represents a single conversation/session trace.
+## Node
+A node contains a management device (CPU), and a number of inference devices, which could be the identical or different from each other.
+The node is charachetarized by it's internal latency and bandwidth between components (e.g. CXL)
 
-Required parameters:
-- workload_id: unique identifier.
-- source: dataset/source metadata.
-- model_id: model used by this workload.
-- turns: ordered list of turns.
-- arrival_time_ms: external arrival timestamp or synthetic start.
+## System
+The full system contains a number of nodes, each could be different
+The nodes are connected via a scale up network.
+The system is characterized by the latency and bandwidth of this scale up network.
 
-Each turn includes:
-- turn_index
-- input_tokens
-- output_tokens
-- has_tool_call
-- tool_latency_ms (0 when absent)
-- inter_turn_gap_ms
-- trace_metadata (opaque source fields)
+# Behavior
+## Event based simulation
+The simulation will model events. An event can be: calculating one time step of a batch on a device, transferring a chunk of KV cache between memory tiers
 
-Standard normalized trace format (v1):
-- Flat JSON schema with explicit token counts and timing fields.
-- No source-specific parsing logic in simulation core.
-- Adapters convert raw datasets into normalized format.
+## Orchestration
+As the workloads are traces of a single concurrency, the system must orchestrate concurrency to make the simulation interesting. We will take a greedy approach, where each N conversations are grouped at once, according to the order they appeared in the test suite.
 
-### 8.3 Test Suite Definition
-A test suite is a collection of workloads plus run policy.
+The system should identify common prefixes and attempt to reuse them as much as possible to avoid unneccesary prefill computations.
+In a multi turn conversation, the system should try to fetch the existing KV cache conversation from memory and prefill the previous turns.
+The heart of the simulation will be to capture how efficient this process can be.
 
-Required parameters:
-- suite_id
-- workloads: list of workload references or embedded workloads.
-- default_model_id
-- concurrency_policy
-- sampling_policy
-- random_seed
+## Randomness
 
-Optional parameters:
-- workload_weights for weighted replay.
-- suite_duration_limit_ms.
-- warmup_workloads_count.
 
-### 8.4 Compute Device Definition
-A compute device models execution capability and local memory.
 
-Required parameters:
-- device_id
-- device_type (GPU/CPU/TPU/other)
-- peak_flops_by_precision
-- sustained_flops_efficiency
-- local_memory_capacity_bytes
-- local_memory_bandwidth_bytes_per_s
-- local_memory_latency_ms
-- interconnect_ports
-- max_concurrent_compute_events
-- max_active_sequences
-- supported_precisions
 
-Two-tier memory support on compute device:
-- tier0: on-device native memory (for example HBM).
-- tier1: attached/remote memory mapping with added latency/bandwidth limits.
-
-### 8.5 Memory Device Definition
-Standalone memory devices can serve as capacity or bandwidth tiers for compute devices.
-
-Required parameters:
-- memory_device_id
-- memory_type (DRAM/CXL/NVMe-backed cache/other)
-- capacity_bytes
-- read_bandwidth_bytes_per_s
-- write_bandwidth_bytes_per_s
-- access_latency_ms
-- max_concurrent_transfers
-- placement_scope (node-local or remote)
-
-Optional parameters:
-- bandwidth_sharing_policy
-- eviction_policy for managed caches.
-
-### 8.6 Node Definition
-A node groups management and inference devices.
-
-Required parameters:
-- node_id
-- management_device profile
-- compute_devices list
-- memory_devices list
-- intra_node_topology
-- intra_node_link_bandwidth_bytes_per_s
-- intra_node_link_latency_ms
-
-### 8.7 System Definition
-The system contains one or more nodes and inter-node fabric.
-
-Required parameters:
-- system_id
-- nodes
-- inter_node_topology
-- scale_up_link_bandwidth_bytes_per_s
-- scale_up_link_latency_ms
-- network_bisection_bandwidth_bytes_per_s
-- routing_policy
-
-The system configuration references concrete implemented component types and named instances. The repository must include sample JSONs for representative setups.
-
-## 9. Simulation Behavior
-### 9.1 Event-Based Engine
-Simulation is event-based with dependency-aware scheduling.
-
-Event examples:
-- Compute forward step (prefill/decode micro-batch).
-- KV movement between memory tiers.
-- Expert weight fetch or migration.
-- Tensor transfer between devices.
-- Tool wait event (latency-only).
-
-Event properties:
-- event_id
-- event_type
-- requested_start_time_ms
-- actual_start_time_ms
-- end_time_ms
-- dependencies
-- resource_claims
-- payload_size_bytes (for transfer events)
-- workload/session attribution metadata
-
-The engine computes event end times from model, device, and contention state. Ongoing events consume resources for their active interval and affect overlap behavior.
-
-### 9.2 Randomness Model
-Randomness applies multiplicative noise to expected event duration:
-
-duration_ms = expected_duration_ms * (1 + randomness_scale * randn())
-
-Requirements:
-- randomness_scale is configurable globally and optionally by event type.
-- Random seed must fully control reproducibility.
-- Randomness can be disabled.
-- Negative or near-zero durations are clamped to a minimum duration floor.
-
-### 9.3 Resource Utilization Model
-At minimum, track utilization for:
-- Compute throughput capacity.
-- Memory capacity occupancy.
-- Memory bandwidth.
-- Intra-node network bandwidth.
-- Inter-node network bandwidth.
-
-Resource contention rules must define whether bandwidth is shared fairly, priority-based, or weighted.
-
-## 10. Orchestration Requirements
-### 10.1 Concurrency Construction
-Because traces are mostly single-session timelines, the simulator synthesizes multi-session concurrency using suite policy.
-
-Baseline policy (v1):
-- Eager grouping of every N conversations in suite order.
-- Configurable batch window and max in-flight sessions.
-
-### 10.2 Prefix Reuse and KV Rehydration
-The orchestrator must:
-- Detect reusable prompt prefixes across active sessions.
-- Reuse compatible prefill results when valid.
-- Retrieve prior-turn KV for multi-turn sessions when available.
-- Account for misses, re-prefill cost, and movement overhead.
-
-### 10.3 Data Movement Decisions
-The orchestrator chooses when and where to place, prefetch, evict, and move KV, expert weights, and tensors. Policies must be pluggable so multiple heuristics can be compared.
-
-### 10.4 Prefill-Decode Disaggregation
-Optional mode in which prefill and decode may run on different devices.
-
-v1 assignment policy:
-- Eager assignment to device with highest expected throughput at dispatch time.
-
-Must account for:
-- Handoff latency and movement overhead.
-- Queueing effects from assignment choices.
-
-### 10.5 Attention-FFN Disaggregation
-Not implemented in v1, but architecture must support later separation of attention and FFN execution onto different devices through extensible event and placement abstractions.
-
-## 11. Runtime Parameters
-Required runtime controls:
-- random_seed
-- randomness_scale
-- simulation_start_time_ms
-- simulation_end_condition (all workloads done or time limit)
-- max_in_flight_workloads
-- orchestration_policy_id
-- placement_policy_id
-- prefetch_policy_id
-- enable_prefix_reuse
-- enable_kv_rehydration
-- enable_prefill_decode_disaggregation
-- metrics_sampling_interval_ms
-- event_log_level
-- output_directory
-
-Optional runtime controls:
-- warmup_duration_ms
-- cooldown_duration_ms
-- device_failure_injection profile (future-facing)
-
-## 12. Outputs
-### 12.1 Standard Serving Metrics
-The simulator must output AIperf-style metrics where applicable:
-- TTFT
-- TTFOT
-- Output TPS per user
-- Prefill TPS per user
-
-Additional required metrics:
-- Time to task completion
-- End-to-end latency percentiles (P50/P90/P99)
-- Throughput (sessions/s and tokens/s)
-- Compute utilization (aggregate and per device)
-- Memory capacity utilization (aggregate and per device)
-- Memory bandwidth utilization
-- Network utilization (intra-node and inter-node)
-- Prefix reuse hit rate
-- KV rehydration hit rate
-- Data moved by type (KV/weights/tensors)
-- Queueing delay by stage (prefill/decode/transfer)
-
-### 12.2 Event Log
-The simulator must emit a complete event log for offline analysis.
-
-Event log requirements:
-- Structured format (JSONL or Parquet).
-- Stable schema versioning.
-- One record per event with timestamps, resource attribution, and causality references.
-- Optional compressed output.
-
-### 12.3 Run Manifest
-Each run must include a manifest containing:
-- Input config digests.
-- Runtime parameters.
-- Simulator version.
-- Random seed.
-- Summary metrics pointers.
-
-## 13. Visualization Requirements
-Web-based visualization is required for interactive result analysis.
-
-Minimum features:
-1. Time-series graphs of compute, memory capacity, memory bandwidth, and network utilization.
-2. Per-device drill-down views for hotspots and idle time.
-3. Latency and throughput distributions (histogram and percentile curves).
-4. Event timeline (Gantt-style) by workload and resource.
-5. Data movement breakdown by type (KV/weights/tensors) and path.
-6. Policy comparison view between two or more simulation runs.
-7. Filters by workload subset, model, node, device, and event type.
-
-## 14. Validation and Acceptance Criteria
-### 14.1 Correctness Criteria
-- Deterministic replay with fixed seed and randomness disabled.
-- Conservation checks for data movement accounting.
-- No resource over-allocation beyond configured capacities unless explicitly modeled.
-
-### 14.2 Performance Criteria
-- Must support at least 10k session traces per run in offline mode.
-- Runtime should scale sub-quadratically with number of events for typical workloads.
-
-### 14.3 Product Acceptance
-The v1 PRD is considered satisfied when:
-- All required entities and parameters are supported in config.
-- Baseline orchestration and disaggregation modes run end-to-end.
-- Required metrics and logs are generated with schema documentation.
-- Visualization supports required minimum features.
-
-## 15. Risks and Open Questions
-- How to calibrate FLOPs/token and bandwidth efficiency for realism across hardware families.
-- How sensitive conclusions are to trace quality and adapter normalization.
-- How to model MoE expert locality shifts under changing concurrency.
-- Whether fairness or tail-latency optimization should drive default orchestration policy.
-- Which event log format should be default for scale: JSONL simplicity vs Parquet efficiency.
-
-## 16. Roadmap
-### v1
-- Event engine, core entities, normalized trace ingestion, baseline orchestration, required metrics/logging, basic visualization.
-
-### v1.1
-- Additional orchestration heuristics, richer policy comparison, improved calibration workflow.
-
-### v2 (future)
-- Attention-FFN disaggregation.
-- Failure modeling and resilience scenarios.
-- Multi-tenant SLA-aware scheduling policies.
+ 

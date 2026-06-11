@@ -1,0 +1,62 @@
+{
+  "name": "NVIDIA-Nemotron-3-Ultra-550B-A55B",
+  "source": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16",
+  "global": {
+    "num_layers": 108,
+    "hidden_size": 8192,
+    "vocab_size": 131072,
+    "tie_word_embeddings": false,
+    "param_dtype_bytes": 2,
+    "kv_dtype_bytes": 2,
+    "layer_pattern": [
+      "mamba", "moe", "mamba", "moe", "mamba", "moe", "mamba", "attention",
+      "moe", "mamba", "moe", "mamba", "moe", "mamba", "attention", "moe",
+      "mamba", "moe", "mamba", "moe", "mamba", "moe", "mamba", "attention",
+      "moe", "mamba", "moe", "mamba", "moe", "mamba", "moe", "mamba",
+      "attention", "moe", "mamba", "moe", "mamba", "moe", "mamba", "attention",
+      "moe", "mamba", "moe", "mamba", "moe", "mamba", "moe", "mamba",
+      "attention", "moe", "mamba", "moe", "mamba", "moe", "mamba", "moe",
+      "mamba", "attention", "moe", "mamba", "moe", "mamba", "moe", "mamba",
+      "attention", "moe", "mamba", "moe", "mamba", "moe", "mamba", "moe",
+      "mamba", "attention", "moe", "mamba", "moe", "mamba", "moe", "mamba",
+      "moe", "mamba", "attention", "moe", "mamba", "moe", "mamba", "moe",
+      "mamba", "attention", "moe", "mamba", "moe", "mamba", "moe", "mamba",
+      "moe", "mamba", "attention", "moe", "mamba", "moe", "mamba", "moe",
+      "mamba", "moe", "mamba", "moe"
+    ]
+  },
+  "blocks": {
+    "attention": {
+      "block_type": "attention",
+      "attention_type": "GQA",
+      "num_query_heads": 64,
+      "num_kv_heads": 2,
+      "head_dim": 128,
+      "sparse_attention": false
+    },
+    "moe": {
+      "block_type": "ffn",
+      "ffn_type": "MoE",
+      "intermediate_size": 5120,
+      "gated": false,
+      "num_experts": 512,
+      "num_experts_per_token": 22,
+      "num_shared_experts": 1,
+      "shared_expert_intermediate_size": 10240,
+      "moe_latent_size": 2048
+    },
+    "mamba": {
+      "block_type": "mamba",
+      "mamba_d_state": 128,
+      "mamba_d_conv": 4,
+      "mamba_expand": 2,
+      "mamba_num_heads": 256,
+      "mamba_head_dim": 64,
+      "mamba_n_groups": 8
+    }
+  },
+  "mtp": {
+    "num_mtp_layers": 1,
+    "mtp_layer_pattern": ["attention", "moe"]
+  }
+}
