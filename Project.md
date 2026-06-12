@@ -78,15 +78,22 @@ Optional speculative-decoding head appended after the main stack. Needed to mode
 | `num_mtp_layers` | $L_\text{mtp}$ | Number of MTP modules (predicted future tokens per step). | MTP |
 | `mtp_layer_pattern` | — | Block type(s) composing each MTP module (reuses the attention/FFN/Mamba block definitions above). | MTP |
 
-## Workloads
-A workload is a multi turn conversation with or without tool calling
+## Sequence Tracker
+The sequence tracker takes a conversation and tokenizes it. Conversations are tokenized using a standard tokenizer (just to get indices from the conversation string, not to actually use them as tokens) - only one tokenizer is ever used in the simulator, there is no need to model different tokenizers of different models.
+All KV Cache Trackers are bounded to the sequence tracker so it provides an abstraction, and KV cache trackers only need to track the index within a sequence.
+Two seperate sequence trackers can find the common prefix between sequences, and create the links between the KV cache trackers accordingly.
 
-https://huggingface.co/datasets/sammshen/lmcache-agentic-traces
+## KV Cache Tracker
+The KV cache tracker element tracks KV cache placement (we will have a seperate tracker per model, per convesation, per layer).
+When a conversation is initiated, all the tokens (input and output) are tracked via a KV cache tracker.
+KV cache trackers are instantiated under a sequence tracker.
+The KV cache tracker tracks whether a KV token was generated or not, and on which devices it is currently found (each token might be found on more than one device).
+To allow for sharing KV cache across different sequences, KV cache trackers may track KV tokens to different KV cache trackers instead of to a physical device, in case a common prefix is identified for an already prefilled sequence.
 
-In the simulator, we will 'run' several workloads in parallel to simulate a high concurrency system
-
-## Test Suite
-A test suite is a list of workloads that the system should simulate.
+## Model Weights Tracker
+The model weights tracker, like the KV cache tracker, divides the model weights into all it's different layers, and for each layers the different expert FFNs, attention or MAMBA matrices, etc. Each of these is a weight shard.
+As in the KV cache tracker, each weight shard may be stored on one or more devices.
+Unlike the KV cache tracker, weight shards cannot have a state of "not generated" yet. They typically start off on an NVM memory device.
 
 ## Compute Devices
 A compute device is a GPU or other inference oriented device.
@@ -96,20 +103,105 @@ A compute event is an ask for the compute device to do a forward pass; the actua
 The output will of the event will be the expected duration of the event.
 The expected duration will be affected by the amount of compute and bandwidth needed, vs. what is available, where availability of resources could be influenced by prior events not ending yet.
 
+A compute device is tightly coupled to at least one memory device, which represents its first tier memory.
+Optionally, it may be tied to a second memory device which represents its second tier memory.
+A memory device may be connected to the compute device directly (representing memory within the same package), or via the inter-node CXL, or via the scale-up network.
 
+A compute device has the following parameter:
+- Nominal FP16 FLOPs
 
 ## Memory Devices
-The system will support standalone memory devices, which are not necessarily part of an inference device, and are connected to the other devices in the node and in other nodes via the node interconnect or the scale up network. Memory devices are characterized by volume and bandwidth.
-A device may use a memory device in lieu of its internal storage, and pay the extra bandwidth and latency
+A memory device represents volatile or non volatile memory in the system. The memory device contains parts of the model weights and KV cache.
+The memory device class tracks the information "stored" (no actual information is stored) on it and may return available space. 
+Memory device does not "know" what parts of the model and what parts of the KV cache are stored on it. That is up to the respective trackers.
+The memory device, depending on the type, has an intrinsic bandwidth which is the absolute limit to how fast data can be read from it (i.e., the aboslute maximum limit to the bandwidth allocated to compute or data transfer events related to it)
+
+A memory device has the following parameter:
+- Capacity
+- Nominal unconstrained bandwidth
+
+## Work shard generator
+A work shard is an atomic piece of work executable by a single compute device.
+Work shards are precursors to compute or data transfer events.
+Example of work shards:
+- Prefilling a chunk of C tokens in a batch of B (in a layer )
+- Decoding a batch of B for decode (in a layer)
+
+The work shard contains the total FLOPs (and type of FLOPs) and the total bytes read needed to perform the action, in addition to KV cache dependencies as pointers to the sequence, and model weights dependecies.
+
+The work shard generator is instantiated in connection to a sequence tracker. It receives the following:
+- Index of the last existing cache token (or None if no existing cache)
+- Index of the last prefill token
+- Index of the last decode token
+And outputs all the relevant shards.
 
 ## Node
 A node contains a management device (CPU), and a number of inference devices, which could be the identical or different from each other.
-The node is charachetarized by it's internal latency and bandwidth between components (e.g. CXL)
 
-## System
-The full system contains a number of nodes, each could be different
-The nodes are connected via a scale up network.
-The system is characterized by the latency and bandwidth of this scale up network.
+The node is characterized by compute devices (with linked memory devices), optionally free-floating memory devices.
+
+The node accepts the following parameter:
+- CXL Bandwidth (we will model point to point bandwidth)
+
+## System Level Definitions
+The system is defined by the following parameter:
+- Scale up network bandwidth (we will model point to point, we will not model network congestion at this stage)
+- Scale up network latency
+
+## Workloads
+A workload is a multi turn conversation with or without tool calling
+https://huggingface.co/datasets/sammshen/lmcache-agentic-traces
+
+## Test Suite
+A test suite is a list of workloads that the system should simulate, each workload is mapped to a model.
+
+## Event Generator
+The event generator is the heart of the simulation.
+It is tasked with generating simulation events to produce a single output sequence, i.e. to convert one series of work shards to events.
+The main scope of it is to map the work shards to actual work and calculate the duration of the work.
+
+The event generator gets a list of compute devices and memory devices needed to execute the sequence, as well as the actual sequence tracker with its associated KV trackers. The event generator decides upon initiatization on the division of work (in case more then one compute device is chosen). It supports pipeline and expert parellilism and accepts it as a parameter of the simulation.
+
+The event generator can and should consolidate adjacent work shards if they run on the same device, so as to minimize thrashing of the simulation with events.
+
+Events generated:
+
+### Data transfer
+Memory to memory data transfers generate data transfer events
+Data transfer events cost latency + transfer time, where transfer time is the volume / bandwidth
+Bandwidth is the minimum across both ends of the transfer, and latency is the maximum 
+
+### Compute
+Compute events take the maximum of compute-bound time and bandwidth-bound time
+Bandwidth is the bandwidth of the 1st tier memory (using 2nd tier memory requires a transfer event to the 1st tier)
+Compute is defined by the nominal capabilities of the device. If using a different "data type", the compute is scaled so that 8 bits is 2x faster than nominal, 4 bits is 4x faster, and FP32 is 2x slower.
+
+
+# Simluation Flow
+1. Preprocessing:
+Workload -> Sequence + Model -> Work Shards
+(for all workloads and all turns - each turn is a different set of work shards)
+
+2. Running:
+- Choose sequences and map to devices, initiate event generators (Orchestration)
+- Generate events to execute the chosen sequences
+- Repeat
+
+3. Post processing:
+Analyze and create logs and reports
+
+## Orchestration
+Orchestration will generally be eager, mapping sequences to the devices which it expects will best execute them according to the information it has at the point in time where the decision is made.
+
+Orchestration parameters:
+- Target concurrency
+
+
+----- Not implemented yet -------
+
+
+
+In the simulator, we will 'run' several workloads in parallel to simulate a high concurrency system
 
 # Behavior
 ## Event based simulation
