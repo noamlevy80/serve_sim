@@ -184,12 +184,16 @@ def derive_expert_cache_capacity(
     model,
     first_tier_capacity_bytes: float,
     batch_work: list[SequenceWork],
+    expert_parallel: int = 1,
 ) -> int:
-    """First-tier routed-expert capacity, in expert indices.
+    """First-tier routed-expert capacity, in expert indices, per device.
 
     Reserves space for the peak KV cache and the always-resident non-expert
     weights; the remainder is divided by the per-index expert footprint (that
-    expert's routed weights summed across all MoE layers).
+    expert's routed weights summed across all MoE layers). Under expert
+    parallelism the KV and non-expert weights are split across the
+    ``expert_parallel`` devices of a stage, so each device reserves a
+    proportional share.
 
     Raises:
         ValueError: If the first tier cannot even hold the reserved bytes plus
@@ -199,10 +203,14 @@ def derive_expert_cache_capacity(
     model = LayeredModel.from_model(model)
     if model.num_moe_layers == 0:
         raise ValueError("model has no MoE layers")
+    if expert_parallel < 1:
+        raise ValueError("expert_parallel must be >= 1")
     per_index_bytes = sum(ffn.routed_expert_params for ffn in model.moe_ffns()) * (
         model.param_dtype_bytes
     )
-    reserved = _peak_kv_bytes(model, batch_work) + _nonexpert_weight_bytes(model)
+    reserved = (
+        _peak_kv_bytes(model, batch_work) + _nonexpert_weight_bytes(model)
+    ) / expert_parallel
     budget = first_tier_capacity_bytes - reserved
     capacity = int(budget // per_index_bytes)
     if capacity < 1:

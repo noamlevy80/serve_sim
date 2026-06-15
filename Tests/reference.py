@@ -376,3 +376,81 @@ def reference_layered(
         total += max(flops / eff_peak, bytes_read / bw)
 
     return total
+
+
+# --- independent reference for expert-parallel expert movement ------------------
+
+
+def _moe_bytes_per_miss(model) -> int:
+    """Bytes moved when one expert index misses: its routed weights across all
+    MoE layers (works for both the flat ``Model`` and a ``LayeredModel``)."""
+
+    m = LayeredModel.from_model(model)
+    return sum(ffn.routed_expert_params for ffn in m.moe_ffns()) * m.param_dtype_bytes
+
+
+def reference_ep_transfer(
+    devices: list[ComputeDevice],
+    model,
+    trace: list[GroupActivation],
+    capacity: int,
+    expert_parallel: int,
+    shared_tier2: bool,
+) -> float:
+    """Total expert-movement time under expert parallelism, re-derived.
+
+    Expert ``e`` is owned by rank ``e % expert_parallel``; each rank replays its
+    own LRU residency (capacity in expert indices) over the experts it owns. A
+    group's movement runs the ranks concurrently: with a private second tier the
+    group time is the slowest rank, with a shared second tier the aggregate is
+    also bounded by that tier's bandwidth.
+    """
+
+    ep = expert_parallel
+    bpm = _moe_bytes_per_miss(model)
+    resident: list[list[int]] = [[] for _ in range(ep)]
+    total_time = 0.0
+    for group in trace:
+        rank_bytes = [0.0] * ep
+        for r in range(ep):
+            active = sorted(e for e in group.active_experts if e % ep == r)
+            if len(active) > capacity:
+                raise ValueError("first tier too small for active set")
+            misses = 0
+            for idx in active:
+                if idx in resident[r]:
+                    resident[r].remove(idx)
+                    resident[r].append(idx)
+                else:
+                    misses += 1
+                    resident[r].append(idx)
+            while len(resident[r]) > capacity:
+                resident[r].pop(0)
+            rank_bytes[r] = misses * bpm
+        if not any(rank_bytes):
+            continue
+        if shared_tier2:
+            tier2_bw = devices[0].second_tier_memory.bandwidth_bytes_per_s
+            tier1_floor = max(
+                (
+                    rank_bytes[r] / devices[r].first_tier_memory.bandwidth_bytes_per_s
+                    for r in range(ep)
+                    if rank_bytes[r] > 0
+                ),
+                default=0.0,
+            )
+            total_time += max(sum(rank_bytes) / tier2_bw, tier1_floor)
+        else:
+            total_time += max(
+                (
+                    rank_bytes[r]
+                    / min(
+                        devices[r].first_tier_memory.bandwidth_bytes_per_s,
+                        devices[r].second_tier_memory.bandwidth_bytes_per_s,
+                    )
+                    for r in range(ep)
+                    if rank_bytes[r] > 0
+                ),
+                default=0.0,
+            )
+    return total_time

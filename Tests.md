@@ -25,8 +25,12 @@ Network tests auto-skip if the dataset API is unreachable.
 - **Stage 4 — Model mechanisms:** per-layer block model (GQA/MHA + sliding
   window, MLA + DSA, Mamba-2, dense/MoE incl. shared + LatentMoE) and the three
   reference model configs loaded from JSON and run end-to-end. 22 offline tests.
+- **Stage 5 — Parallelism:** expert parallelism (distributed experts + even-split
+  compute) composed with pipeline parallelism, and the two memory scenarios
+  (every device holds the model; a shared system-NVM second tier). 18 offline
+  tests.
 
-Totals: 241 tests (236 offline + 5 live).
+Totals: 259 tests (254 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -278,5 +282,48 @@ agrees with the flat `reference_roofline`, anchoring the new path to the old one
   attention, and LatentMoE FFNs. Loads with one mixer-or-FFN per layer and
   matches the reference.
 
-(Tensor/pipeline/expert parallelism for these models is deferred to the next
-stage; MTP heads are documented but not yet costed.)
+(Tensor parallelism beyond the expert-parallel group is not modeled; MTP heads
+are documented but not yet costed.)
+
+## Stage 5: Parallelism
+
+Stage 5 lays a batch's work onto a `pipeline_parallel x expert_parallel` device
+grid. Pipeline stages of a group run sequentially (single batch); the
+expert-parallel ranks of a stage run concurrently with the stage compute split
+evenly across them, and each rank keeps its own LRU residency of the experts it
+owns. 18 offline tests in [Tests/test_parallel.py](Tests/test_parallel.py).
+
+### Independent reference — [Tests/reference.py](Tests/reference.py)
+
+`reference_ep_transfer` re-derives expert-movement time under expert
+parallelism: experts are partitioned by `e mod expert_parallel`, each rank
+replays its own LRU residency, and a group's movement runs the ranks
+concurrently (a private second tier charges the slowest rank; a shared second
+tier also bounds the aggregate by its bandwidth). The compute side reuses the
+Stage-2/4 references divided by `expert_parallel`.
+
+### Expert-parallel compute
+
+- Even-split compute conserves total FLOPs/bytes and gives an exact `1/EP`
+  makespan (a balanced stage is `expert_parallel` times faster); verified
+  against the single-device reference and across two and four devices.
+- Applies to dense models too (the split is of the whole stage).
+- Composes with pipeline parallelism: a `PP x EP` grid equals the `PP`-only
+  makespan divided by `EP` and conserves work.
+- Validation: the device count must be divisible by `PP x EP`; two-tier expert
+  movement still requires `pipeline_parallel == 1`.
+
+### Scenario A — every device holds the whole model
+
+Single-tier devices: experts are all resident, so no transfer events are emitted
+and the makespan is the distributed compute (`single / EP`). Splitting experts
+across devices never needs more per-device residency capacity, and
+`derive_expert_cache_capacity` leaves more room as `expert_parallel` grows.
+
+### Scenario B — shared second tier (system NVM)
+
+The devices share one second-tier `MemoryDevice` (same instance). Expert
+movement matches `reference_ep_transfer`, and because a shared NVM funnels every
+rank's loads through one pipe it is never faster than an equivalent per-device
+tier. Both the flat toy MoE model and the real DeepSeek config (on a toy system)
+are checked end-to-end.

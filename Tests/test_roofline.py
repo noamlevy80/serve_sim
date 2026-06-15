@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from serve_sim.model import toy_model
+from serve_sim.model import toy_model, toy_moe_model
 from serve_sim.hardware import ComputeDevice, MemoryDevice
 from serve_sim.shards import WorkShardGenerator
 from serve_sim.tracker import SequenceWork
@@ -259,7 +259,7 @@ def test_event_generator_layers_divisible_by_pipeline():
         EventGenerator(model, [make_device("a"), make_device("b")], pipeline_parallel=2)
 
 
-def test_event_generator_rejects_expert_parallel():
-    model = toy_model()
-    with pytest.raises(NotImplementedError, match="expert parallelism"):
-        EventGenerator(model, [make_device()], expert_parallel=2)
+def test_event_generator_accepts_expert_parallel():
+    model = toy_moe_model()
+    # two devices, expert_parallel=2 -> constructs without error (see test_parallel.py)
+    EventGenerator(model, [make_device("a"), make_device("b")], expert_parallel=2)

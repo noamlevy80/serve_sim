@@ -173,6 +173,9 @@ It is tasked with generating simulation events to produce a single output batch,
 The main scope of it is to map the work shards to actual work and calculate the duration of the work.
 
 The event generator gets a list of compute devices and memory devices needed to execute the sequence, as well as the actual batch tracker with its associated sequence and KV trackers. The event generator decides upon initiatization on the division of work (in case more then one compute device is chosen). It supports pipeline and expert parellilism and accepts it as a parameter of the simulation.
+Expert parellelism is performed eagerly, with experts hosted on devices based on the best available knowledge at the time, and evicted by LRU.
+
+The devices form a `pipeline_parallel x expert_parallel` grid. Pipeline parallelism partitions the layers across stages; for a single batch the stages of a group run sequentially (no pipeline overlap), so latency is the sum of the stage times. Expert parallelism partitions the routed experts across the devices of a stage (expert `e` is owned by rank `e mod expert_parallel`) and splits the stage compute evenly across those ranks (balanced routing, with the non-expert work tensor-parallel), so the ranks run concurrently and a balanced stage is `expert_parallel` times faster. Each rank keeps its own LRU residency of the experts it owns: when every device's first tier can hold the whole model there is no expert movement, and when the second tier is a single shared device (a system NVM) its bandwidth bounds the aggregate movement of all ranks.
 
 The number of devices must be devisable by the product of the parallelism options (for simplicity).
 
