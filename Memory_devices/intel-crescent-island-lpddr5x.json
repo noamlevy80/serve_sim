@@ -1,0 +1,7 @@
+{
+  "name": "Intel Crescent Island LPDDR5X",
+  "source": "Intel announcement, OCP Global Summit Oct 2025 (inference GPU, Xe3P, 160 GB LPDDR5X; sampling 2H 2026)",
+  "capacity_bytes": 1.6e11,
+  "bandwidth_bytes_per_s": 5.0e11,
+  "notes": "ESTIMATE - Intel disclosed 160 GB LPDDR5X capacity but NOT bandwidth. 500 GB/s is a placeholder for a wide LPDDR5X interface; please confirm."
+}

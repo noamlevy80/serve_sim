@@ -1,0 +1,7 @@
+{
+  "name": "Groq LPU",
+  "source": "Groq GroqChip / LPU v1 (https://groq.com/lpu-architecture): ~188 TFLOPS FP16 (750 TOPS INT8)",
+  "peak_flops_fp16": 1.88e14,
+  "first_tier_memory": "groq-lpu-sram",
+  "notes": "Single GroqChip / LPU v1. Designed for many-chip deployments."
+}

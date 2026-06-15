@@ -19,6 +19,12 @@ from .blocks import (
 )
 from .model_config import load_model_config, model_from_config
 from .hardware import ComputeDevice, MemoryDevice, dtype_compute_scale
+from .device_config import (
+    compute_device_from_config,
+    load_compute_device,
+    load_memory_device,
+    memory_device_from_config,
+)
 from .tokenizer import Tokenizer, TiktokenTokenizer, WhitespaceTokenizer
 from .tracker import BatchTracker, SequenceTracker, SequenceWork
 from .experts import ExpertUsageModel
@@ -56,6 +62,10 @@ __all__ = [
     "ComputeDevice",
     "MemoryDevice",
     "dtype_compute_scale",
+    "compute_device_from_config",
+    "load_compute_device",
+    "load_memory_device",
+    "memory_device_from_config",
     # tokenization + trackers
     "Tokenizer",
     "TiktokenTokenizer",

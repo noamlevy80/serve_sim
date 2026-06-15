@@ -1,0 +1,7 @@
+{
+  "name": "Groq LPU On-Chip SRAM",
+  "source": "Groq GroqChip / LPU v1 (https://groq.com/lpu-architecture): 230 MB on-chip SRAM, 80 TB/s on-die bandwidth",
+  "capacity_bytes": 2.3e8,
+  "bandwidth_bytes_per_s": 8.0e13,
+  "notes": "Single first tier: 230 MB SRAM at 80 TB/s. Latest publicly specified Groq chip is the v1 LPU."
+}
