@@ -86,6 +86,7 @@ The batch tracker is responsible for tracking a batch of workloads and instantia
 The sequence tracker takes a conversation and tokenizes it. Conversations are tokenized using a standard tokenizer (just to get indices from the conversation string, not to actually use them as tokens) - only one tokenizer is ever used in the simulator, there is no need to model different tokenizers of different models.
 All KV Cache Trackers are bounded to the sequence tracker so it provides an abstraction, and KV cache trackers only need to track the index within a sequence.
 Two seperate sequence trackers can find the common prefix between sequences, and create the links between the KV cache trackers accordingly.
+The sequence tracker can also report on wait for tool events which derive from tool calling.
 
 ## KV Cache Tracker
 The KV cache tracker element tracks KV cache placement (we will have a seperate tracker per model, per convesation, per layer).
@@ -181,6 +182,11 @@ Bandwidth is the minimum across both ends of the transfer, and latency is the ma
 Compute events take the maximum of compute-bound time and bandwidth-bound time
 Bandwidth is the bandwidth of the 1st tier memory (using 2nd tier memory requires a transfer event to the 1st tier)
 Compute is defined by the nominal capabilities of the device. If using a different "data type", the compute is scaled so that 8 bits is 2x faster than nominal, 4 bits is 4x faster, and FP32 is 2x slower.
+
+### Tool call
+We do not model the event of computing a tool call, but we do model waiting for the tool call to complete.
+Tool call events represents time that the sequence must wait before receiving the tool response.
+Tool call times are provided by the dataset, but they may be globally scaled by the tool_calling_speedup system parameter.
 
 # Simluation Flow
 1. Preprocessing:
