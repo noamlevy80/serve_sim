@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from .hardware import ComputeDevice
 from .model import Model
 from .shards import WorkShard
+from .tiering import ExpertResidencyCache, GroupActivation
 
 
 @dataclass(frozen=True)
@@ -118,11 +119,48 @@ class EventGenerator:
             return self.pipeline_parallel - 1
         return layer_index // self._layers_per_stage
 
-    def run(self, shards: list[WorkShard]) -> EventSchedule:
-        """Consolidate shards into events and time them sequentially."""
+    def run(
+        self,
+        shards: list[WorkShard],
+        expert_trace: list[GroupActivation] | None = None,
+        expert_cache_capacity: int | None = None,
+    ) -> EventSchedule:
+        """Consolidate shards into events and time them sequentially.
+
+        When the device has a second memory tier, the model is MoE, and an
+        ``expert_trace`` is supplied, a data-transfer event for the routed
+        experts moved from the second tier to the first precedes each group's
+        compute (modelling expert weight movement with residency reuse).
+        """
 
         schedule = EventSchedule()
         clock = 0.0
+
+        two_tier = (
+            expert_trace is not None
+            and self.model.ffn_type == "moe"
+            and self.devices[0].second_tier_memory is not None
+        )
+        cache: ExpertResidencyCache | None = None
+        trace_by_group: dict[int, GroupActivation] = {}
+        transfer_bandwidth = 0.0
+        if two_tier:
+            if self.pipeline_parallel != 1:
+                raise NotImplementedError(
+                    "two-tier expert movement is only supported with "
+                    "pipeline_parallel == 1"
+                )
+            if expert_cache_capacity is None:
+                raise ValueError(
+                    "expert_cache_capacity is required for two-tier execution"
+                )
+            cache = ExpertResidencyCache(expert_cache_capacity)
+            trace_by_group = {g.group_index: g for g in expert_trace}
+            tier1 = self.devices[0].first_tier_memory
+            tier2 = self.devices[0].second_tier_memory
+            transfer_bandwidth = min(
+                tier1.bandwidth_bytes_per_s, tier2.bandwidth_bytes_per_s
+            )
 
         # Preserve group order; within a group, order events by device/stage.
         groups: dict[int, list[WorkShard]] = {}
@@ -134,8 +172,30 @@ class EventGenerator:
             groups[shard.group_index].append(shard)
 
         for group_index in order:
+            group_shards = groups[group_index]
+
+            if two_tier and group_index in trace_by_group:
+                assert cache is not None
+                misses = cache.access(trace_by_group[group_index].active_experts)
+                moe_layers = sum(
+                    1
+                    for s in group_shards
+                    if s.layer_index is not None
+                    and self.model.is_moe_layer(s.layer_index)
+                )
+                if misses > 0 and moe_layers > 0:
+                    transfer = self._build_transfer_event(
+                        group_index,
+                        misses * moe_layers * self.model.routed_expert_bytes,
+                        transfer_bandwidth,
+                        group_shards[0].phase,
+                        clock,
+                    )
+                    clock = transfer.end
+                    schedule.events.append(transfer)
+
             per_device: dict[int, list[WorkShard]] = {}
-            for shard in groups[group_index]:
+            for shard in group_shards:
                 device_index = self._stage_of_layer(shard.layer_index)
                 per_device.setdefault(device_index, []).append(shard)
 
@@ -146,6 +206,28 @@ class EventGenerator:
                 schedule.events.append(event)
 
         return schedule
+
+    def _build_transfer_event(
+        self,
+        group_index: int,
+        total_bytes: float,
+        bandwidth: float,
+        phase: str,
+        start: float,
+    ) -> ComputeEvent:
+        duration = total_bytes / bandwidth
+        return ComputeEvent(
+            group_index=group_index,
+            phase="transfer",
+            device_index=0,
+            flops=0.0,
+            bytes_read=total_bytes,
+            compute_time=0.0,
+            bandwidth_time=duration,
+            duration=duration,
+            start=start,
+            end=start + duration,
+        )
 
     def _build_event(
         self,

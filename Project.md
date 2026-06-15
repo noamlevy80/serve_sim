@@ -6,10 +6,17 @@ The purpose of this project is to ingest inference session traces and simulate w
 A model is an abstract representation of an LLM, which contains all the information required to allow to calculate the inference rate given the compute device description, and the type of parallelism chosen.
 The model contains information about that allows calculating the required memory, bandwidth and compute to run a forward pass, which means the sizing of the tensors of each layer so that the compute and bandwidth load could be calculated.
 
-Models will support:
+
+### Supported Layers
 - FFN - dense or MoE
 - Attention: MHA, GQA, MLA, DSA
 - Linear attention: Mamba V2
+
+### Expert usage:
+Per token expert usage will be modelled when generating work shards. It will be based on a statistical model where each expert remains live for expert_persistance consecutive tokens before being switched to a different expert, where expert_persistance is a random poisson variable and defined globally per model (default mean - 16, variance - 4)
+For simplicity we will assume expert selection is the same across all the layers of a model. That will be a worse case in terms of weight movement bandwidth peak.
+
+When a model is split across two memory tiers, the first tier holds the KV cache, the non-expert weights, and a working set of routed experts; the rest of the experts live in the second tier. Residency follows an LRU policy keyed on expert index (one index covers that expert across all MoE layers, since selection is shared). A group that touches an expert not currently resident incurs a transfer event moving it up; persistence keeps recently used experts resident so they are reused across decode steps. The first-tier expert capacity is derived from its memory minus the peak KV cache and the always-resident non-expert weights.
 
 ### Model parameters
 

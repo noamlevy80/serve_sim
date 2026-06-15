@@ -20,8 +20,10 @@ Network tests auto-skip if the dataset API is unreachable.
   offline + 5 live).
 - **Stage 2 — Event generation:** roofline simulation path (model sizing,
   devices, trackers, work shards, events). 75 offline tests.
+- **Stage 3 — MoE:** expert-usage model, MoE sizing/shards, MoE roofline, and
+  two-tier expert movement. 90 offline tests.
 
-Totals: 129 tests (124 offline + 5 live).
+Totals: 219 tests (214 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -167,3 +169,67 @@ verify the simulator rather than mirror it.
   single batch; places the LM head on the last stage.
 - Event-generator validation: requires devices, device count divisible by the
   parallelism product, layers divisible by PP, and expert parallelism rejected.
+
+## Stage 3: MoE
+
+Stage 3 adds Mixture-of-Experts: a statistical expert-usage model, MoE-aware
+sizing and shards, and a two-tier system where routed experts move from a second
+memory tier into the first on demand. 90 offline tests.
+
+### Expert usage — [Tests/test_experts.py](Tests/test_experts.py)
+
+- `ExpertUsageModel` construction and `from_model`.
+- Closed-form `expected_distinct`: monotone in tokens, bounded by `E` and by the
+  number of picks; the consecutive (prefill) regime sees fewer distinct experts
+  than the independent (decode) regime for the same token count; depends only on
+  the persistence **mean**, not its variance.
+- Persistence sampling is clamped to `≥ 1` and rounds a Gaussian about the mean.
+- Monte-Carlo `sample_distinct` approximates the closed form in the independent
+  regime (`rel=0.1`) and is in the right ballpark for consecutive (`rel=0.3`).
+
+### MoE sizing + shards — [Tests/test_moe.py](Tests/test_moe.py)
+
+- `toy_moe_model` builds an MoE model; `is_moe_layer` / `num_moe_layers` respect
+  `num_dense_layers`.
+- Routed/shared expert params and bytes; MoE layer weight params; MoE
+  constructor validation.
+- Shard generation: routed FFN FLOPs scale with `tokens · k_E`; routed bytes
+  scale with the distinct active experts; shared-expert work is always present;
+  dense layers in a hybrid stack still use the dense FFN cost.
+
+### MoE roofline — [Tests/test_moe_roofline.py](Tests/test_moe_roofline.py)
+
+`reference_roofline` is extended with the MoE FFN cost (routed + shared) using an
+independent re-derivation of expected distinct experts. The full pipeline matches
+it for single sequences, batches, ragged batches, and chunked prefill, and keeps
+matching as MoE parameters (`num_experts`, `num_experts_per_token`,
+`num_shared_experts`, persistence, dense-layer count) and the usual system
+parameters vary.
+
+### Two-tier residency — [Tests/test_tiering.py](Tests/test_tiering.py)
+
+- `ExpertResidencyCache`: first access all-miss, reuse hits, LRU eviction order,
+  rejection when the active set exceeds capacity, capacity validation.
+- `build_activation_trace`: empty for dense models; group indices match the work
+  shards (with and without chunking); seed-reproducible; active sets stay within
+  `[0, E)` and within the per-group top-k bound; higher persistence yields fewer
+  distinct experts per prefill group.
+- `derive_expert_cache_capacity`: positive for a generous tier, grows with tier
+  size, raises when the tier cannot hold the reserved bytes plus one expert, and
+  rejects dense models.
+
+### Two-tier roofline — [Tests/test_two_tier.py](Tests/test_two_tier.py)
+
+`reference_two_tier` = compute roofline + an independent LRU replay of the same
+activation trace. Tests assert:
+
+- Total makespan matches the reference for single sequences, batches, chunked
+  prefill, and a derived cache capacity.
+- The total decomposes exactly into compute (= single-tier makespan) plus
+  transfer time.
+- Transfer time falls with higher expert persistence and with faster second-tier
+  bandwidth, and never rises as capacity grows; with capacity `≥ E` each expert
+  is loaded exactly once.
+- Validation: capacity smaller than a group's active set raises; two-tier
+  execution requires a capacity and rejects pipeline parallelism; a two-tier
+  device with no expert trace falls back to the single-tier path.

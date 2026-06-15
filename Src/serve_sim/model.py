@@ -35,6 +35,15 @@ class Model:
     kv_dtype_bytes: int = 2
     tie_word_embeddings: bool = False
     include_lm_head: bool = True
+    # --- MoE FFN (ffn_type == "moe") ---
+    ffn_type: str = "dense"
+    num_experts: int = 0
+    num_experts_per_token: int = 0
+    num_shared_experts: int = 0
+    shared_expert_intermediate_size: int | None = None
+    num_dense_layers: int = 0
+    expert_persistence_mean: float = 16.0
+    expert_persistence_variance: float = 4.0
     name: str = "model"
 
     def __post_init__(self) -> None:
@@ -54,6 +63,25 @@ class Model:
         ):
             if getattr(self, field_name) <= 0:
                 raise ValueError(f"{field_name} must be positive")
+        if self.ffn_type not in ("dense", "moe"):
+            raise ValueError(f"ffn_type must be 'dense' or 'moe', got {self.ffn_type!r}")
+        if self.ffn_type == "moe":
+            if self.num_experts <= 0:
+                raise ValueError("MoE model requires num_experts > 0")
+            if not 1 <= self.num_experts_per_token <= self.num_experts:
+                raise ValueError(
+                    "num_experts_per_token must be in [1, num_experts] "
+                    f"(got {self.num_experts_per_token} of {self.num_experts})"
+                )
+            if self.num_shared_experts < 0:
+                raise ValueError("num_shared_experts must be non-negative")
+            if not 0 <= self.num_dense_layers <= self.num_layers:
+                raise ValueError(
+                    "num_dense_layers must be in [0, num_layers] "
+                    f"(got {self.num_dense_layers} of {self.num_layers})"
+                )
+            if self.expert_persistence_mean <= 0:
+                raise ValueError("expert_persistence_mean must be positive")
 
     # --- dimensions ---------------------------------------------------------
 
@@ -78,18 +106,62 @@ class Model:
         d = self.hidden_size
         return d * self.q_dim + 2 * d * self.kv_dim + self.q_dim * d
 
-    @property
-    def ffn_weight_params(self) -> int:
-        """Weights in one FFN block (3 matrices if gated, else 2)."""
+    def _ffn_params(self, intermediate: int) -> int:
+        """Weights in one FFN with the given hidden width (3 if gated, else 2)."""
 
         matrices = 3 if self.gated else 2
-        return matrices * self.hidden_size * self.intermediate_size
+        return matrices * self.hidden_size * intermediate
+
+    @property
+    def ffn_weight_params(self) -> int:
+        """Weights in one dense FFN block (3 matrices if gated, else 2)."""
+
+        return self._ffn_params(self.intermediate_size)
 
     @property
     def layer_weight_params(self) -> int:
-        """Total weights in one transformer layer (attention + FFN)."""
+        """Total weights in one dense transformer layer (attention + FFN)."""
 
         return self.attention_weight_params + self.ffn_weight_params
+
+    # --- MoE sizing ---------------------------------------------------------
+
+    def is_moe_layer(self, layer_index: int) -> bool:
+        """Whether the layer at ``layer_index`` uses a MoE FFN."""
+
+        return self.ffn_type == "moe" and layer_index >= self.num_dense_layers
+
+    @property
+    def num_moe_layers(self) -> int:
+        """Number of layers that use a MoE FFN."""
+
+        if self.ffn_type != "moe":
+            return 0
+        return self.num_layers - self.num_dense_layers
+
+    @property
+    def routed_expert_params(self) -> int:
+        """Weights in one routed expert FFN."""
+
+        return self._ffn_params(self.intermediate_size)
+
+    @property
+    def shared_expert_params(self) -> int:
+        """Total weights across all always-active shared experts in a layer."""
+
+        if self.num_shared_experts == 0:
+            return 0
+        width = self.shared_expert_intermediate_size or self.intermediate_size
+        return self.num_shared_experts * self._ffn_params(width)
+
+    def moe_layer_weight_params(self) -> int:
+        """Stored weights in one MoE layer (attention + all experts + shared)."""
+
+        return (
+            self.attention_weight_params
+            + self.num_experts * self.routed_expert_params
+            + self.shared_expert_params
+        )
 
     @property
     def lm_head_params(self) -> int:
@@ -104,6 +176,22 @@ class Model:
     @property
     def layer_weight_bytes(self) -> int:
         return self.layer_weight_params * self.param_dtype_bytes
+
+    @property
+    def attention_weight_bytes(self) -> int:
+        return self.attention_weight_params * self.param_dtype_bytes
+
+    @property
+    def dense_ffn_bytes(self) -> int:
+        return self.ffn_weight_params * self.param_dtype_bytes
+
+    @property
+    def routed_expert_bytes(self) -> int:
+        return self.routed_expert_params * self.param_dtype_bytes
+
+    @property
+    def shared_expert_bytes(self) -> int:
+        return self.shared_expert_params * self.param_dtype_bytes
 
     @property
     def lm_head_bytes(self) -> int:
@@ -121,6 +209,26 @@ class Model:
         """FLOPs for the dense projections (QKVO + FFN) over ``tokens`` tokens."""
 
         return 2 * tokens * self.layer_weight_params
+
+    def attention_proj_flops(self, tokens: int) -> int:
+        """FLOPs for the QKVO projections over ``tokens`` tokens."""
+
+        return 2 * tokens * self.attention_weight_params
+
+    def dense_ffn_flops(self, tokens: int) -> int:
+        """FLOPs for one dense FFN over ``tokens`` tokens."""
+
+        return 2 * tokens * self.ffn_weight_params
+
+    def routed_expert_flops(self, token_expert_pairs: int) -> int:
+        """FLOPs for ``token_expert_pairs`` (token, routed-expert) activations."""
+
+        return 2 * token_expert_pairs * self.routed_expert_params
+
+    def shared_expert_flops(self, tokens: int) -> int:
+        """FLOPs for the always-active shared experts over ``tokens`` tokens."""
+
+        return 2 * tokens * self.shared_expert_params
 
     def attention_flops(self, query_key_pairs: int) -> int:
         """FLOPs for attention scores+values over ``query_key_pairs`` pairs.
@@ -171,5 +279,58 @@ def toy_model(
         param_dtype_bytes=param_dtype_bytes,
         kv_dtype_bytes=kv_dtype_bytes,
         include_lm_head=include_lm_head,
+        name=name,
+    )
+
+
+def toy_moe_model(
+    num_layers: int = 4,
+    hidden_size: int = 256,
+    num_query_heads: int = 8,
+    num_kv_heads: int | None = None,
+    head_dim: int | None = None,
+    intermediate_size: int = 512,
+    vocab_size: int = 2048,
+    num_experts: int = 16,
+    num_experts_per_token: int = 2,
+    num_shared_experts: int = 1,
+    shared_expert_intermediate_size: int | None = None,
+    num_dense_layers: int = 0,
+    expert_persistence_mean: float = 16.0,
+    expert_persistence_variance: float = 4.0,
+    gated: bool = False,
+    param_dtype_bytes: int = 2,
+    kv_dtype_bytes: int = 2,
+    include_lm_head: bool = True,
+    name: str = "toy-moe",
+) -> Model:
+    """Build a small MoE model for development and tests."""
+
+    if head_dim is None:
+        if hidden_size % num_query_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_query_heads")
+        head_dim = hidden_size // num_query_heads
+    if num_kv_heads is None:
+        num_kv_heads = num_query_heads
+    return Model(
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        intermediate_size=intermediate_size,
+        vocab_size=vocab_size,
+        gated=gated,
+        param_dtype_bytes=param_dtype_bytes,
+        kv_dtype_bytes=kv_dtype_bytes,
+        include_lm_head=include_lm_head,
+        ffn_type="moe",
+        num_experts=num_experts,
+        num_experts_per_token=num_experts_per_token,
+        num_shared_experts=num_shared_experts,
+        shared_expert_intermediate_size=shared_expert_intermediate_size,
+        num_dense_layers=num_dense_layers,
+        expert_persistence_mean=expert_persistence_mean,
+        expert_persistence_variance=expert_persistence_variance,
         name=name,
     )

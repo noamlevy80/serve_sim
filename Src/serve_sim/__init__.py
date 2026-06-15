@@ -8,11 +8,18 @@ generation.
 
 from .workload import Message, ToolCall, Turn, Workload, build_workload_from_rows
 from .dataset import HttpRowFetcher, RowFetcher, WorkloadLoader
-from .model import Model, toy_model
+from .model import Model, toy_model, toy_moe_model
 from .hardware import ComputeDevice, MemoryDevice, dtype_compute_scale
 from .tokenizer import Tokenizer, TiktokenTokenizer, WhitespaceTokenizer
 from .tracker import BatchTracker, SequenceTracker, SequenceWork
+from .experts import ExpertUsageModel
 from .shards import WorkShard, WorkShardGenerator
+from .tiering import (
+    ExpertResidencyCache,
+    GroupActivation,
+    build_activation_trace,
+    derive_expert_cache_capacity,
+)
 from .events import ComputeEvent, EventGenerator, EventSchedule
 
 __all__ = [
@@ -28,6 +35,7 @@ __all__ = [
     # model + hardware
     "Model",
     "toy_model",
+    "toy_moe_model",
     "ComputeDevice",
     "MemoryDevice",
     "dtype_compute_scale",
@@ -38,9 +46,14 @@ __all__ = [
     "BatchTracker",
     "SequenceTracker",
     "SequenceWork",
-    # shards + events
+    # experts + shards + events
+    "ExpertUsageModel",
     "WorkShard",
     "WorkShardGenerator",
+    "ExpertResidencyCache",
+    "GroupActivation",
+    "build_activation_trace",
+    "derive_expert_cache_capacity",
     "ComputeEvent",
     "EventGenerator",
     "EventSchedule",

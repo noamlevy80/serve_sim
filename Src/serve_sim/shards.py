@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .experts import ExpertUsageModel
 from .model import Model
 from .tracker import SequenceWork
 
@@ -60,6 +61,28 @@ class WorkShardGenerator:
 
     def __init__(self, model: Model) -> None:
         self.model = model
+        self.expert_usage = (
+            ExpertUsageModel.from_model(model) if model.ffn_type == "moe" else None
+        )
+
+    def _ffn_cost(self, layer_index: int, tokens: int, consecutive: bool) -> tuple[float, float]:
+        """FLOPs and bytes for the FFN of one layer over ``tokens`` tokens.
+
+        For a dense layer this is the single FFN. For a MoE layer it is the
+        always-active shared experts plus the routed experts, whose weight bytes
+        depend on the number of *distinct* experts touched by the group.
+        """
+
+        model = self.model
+        if not model.is_moe_layer(layer_index):
+            return float(model.dense_ffn_flops(tokens)), float(model.dense_ffn_bytes)
+        assert self.expert_usage is not None
+        distinct = self.expert_usage.expected_distinct(tokens, consecutive)
+        routed_flops = model.routed_expert_flops(tokens * model.num_experts_per_token)
+        routed_bytes = distinct * model.routed_expert_bytes
+        shared_flops = model.shared_expert_flops(tokens)
+        shared_bytes = model.shared_expert_bytes
+        return float(routed_flops + shared_flops), float(routed_bytes + shared_bytes)
 
     def generate(
         self,
@@ -105,10 +128,16 @@ class WorkShardGenerator:
                 # KV already materialized before this chunk and read by attention.
                 prior_kv_tokens = seq.cached_tokens + start
                 for layer in range(model.num_layers):
-                    flops = model.linear_flops(tokens) + model.attention_flops(pairs)
+                    ffn_flops, ffn_bytes = self._ffn_cost(layer, tokens, consecutive=True)
+                    flops = (
+                        model.attention_proj_flops(tokens)
+                        + model.attention_flops(pairs)
+                        + ffn_flops
+                    )
                     bytes_read = (
-                        model.layer_weight_bytes
+                        model.attention_weight_bytes
                         + prior_kv_tokens * model.kv_bytes_per_token
+                        + ffn_bytes
                     )
                     shards.append(
                         WorkShard(
@@ -145,10 +174,16 @@ class WorkShardGenerator:
             contexts = [seq.base_tokens + step for seq in active]
             total_context = sum(contexts)
             for layer in range(model.num_layers):
-                flops = model.linear_flops(batch_size) + model.attention_flops(total_context)
+                ffn_flops, ffn_bytes = self._ffn_cost(layer, batch_size, consecutive=False)
+                flops = (
+                    model.attention_proj_flops(batch_size)
+                    + model.attention_flops(total_context)
+                    + ffn_flops
+                )
                 bytes_read = (
-                    model.layer_weight_bytes
+                    model.attention_weight_bytes
                     + total_context * model.kv_bytes_per_token
+                    + ffn_bytes
                 )
                 shards.append(
                     WorkShard(
