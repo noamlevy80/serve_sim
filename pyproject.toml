@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+pythonpath = ["Src"]
+testpaths = ["Tests"]
+markers = [
+    "network: tests that hit the live dataset API (deselect with -m 'not network')",
+]
