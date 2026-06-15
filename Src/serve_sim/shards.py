@@ -5,15 +5,16 @@ phase-unit (a prefill chunk or a single decode step), plus a ``group_index`` so
 the event generator knows which shards belong to the same forward pass and may
 be consolidated when they land on the same device.
 
-Shard sizing is pure model arithmetic; see :mod:`serve_sim.model`.
+Shard sizing is pure model arithmetic; each layer's mixer (attention/Mamba) and
+FFN block size themselves (see :mod:`serve_sim.blocks`).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .blocks import Layer, LayeredModel, MoEFFN
 from .experts import ExpertUsageModel
-from .model import Model
 from .tracker import SequenceWork
 
 
@@ -44,45 +45,35 @@ class WorkShard:
     tokens: int
 
 
-def _causal_pairs(start: int, stop: int, cached: int) -> int:
-    """Query-key pairs for new query positions ``[start, stop)`` over ``cached``.
-
-    Query position ``j`` (0-based within the new prompt tokens) attends to
-    ``cached + j + 1`` keys (the cached prefix, earlier new tokens, and itself).
-    """
-
-    count = stop - start
-    triangular = stop * (stop + 1) // 2 - start * (start + 1) // 2
-    return count * cached + triangular
-
-
 class WorkShardGenerator:
     """Turns per-sequence work into ordered work shards for one turn."""
 
-    def __init__(self, model: Model) -> None:
-        self.model = model
-        self.expert_usage = (
-            ExpertUsageModel.from_model(model) if model.ffn_type == "moe" else None
-        )
+    def __init__(self, model) -> None:
+        self.model: LayeredModel = LayeredModel.from_model(model)
+        self._expert_usage: dict[int, ExpertUsageModel] = {}
 
-    def _ffn_cost(self, layer_index: int, tokens: int, consecutive: bool) -> tuple[float, float]:
-        """FLOPs and bytes for the FFN of one layer over ``tokens`` tokens.
+    def _distinct(self, ffn: MoEFFN, tokens: int, consecutive: bool) -> float:
+        usage = self._expert_usage.get(id(ffn))
+        if usage is None:
+            usage = ExpertUsageModel(
+                num_experts=ffn.num_experts,
+                num_experts_per_token=ffn.num_experts_per_token,
+                persistence_mean=self.model.expert_persistence_mean,
+                persistence_variance=self.model.expert_persistence_variance,
+            )
+            self._expert_usage[id(ffn)] = usage
+        return usage.expected_distinct(tokens, consecutive)
 
-        For a dense layer this is the single FFN. For a MoE layer it is the
-        always-active shared experts plus the routed experts, whose weight bytes
-        depend on the number of *distinct* experts touched by the group.
-        """
+    def _ffn_cost(self, layer: Layer, tokens: int, consecutive: bool) -> tuple[float, float]:
+        """FLOPs and bytes for one layer's FFN (dense or MoE), if any."""
 
-        model = self.model
-        if not model.is_moe_layer(layer_index):
-            return float(model.dense_ffn_flops(tokens)), float(model.dense_ffn_bytes)
-        assert self.expert_usage is not None
-        distinct = self.expert_usage.expected_distinct(tokens, consecutive)
-        routed_flops = model.routed_expert_flops(tokens * model.num_experts_per_token)
-        routed_bytes = distinct * model.routed_expert_bytes
-        shared_flops = model.shared_expert_flops(tokens)
-        shared_bytes = model.shared_expert_bytes
-        return float(routed_flops + shared_flops), float(routed_bytes + shared_bytes)
+        ffn = layer.ffn
+        if ffn is None:
+            return 0.0, 0.0
+        if isinstance(ffn, MoEFFN):
+            distinct = self._distinct(ffn, tokens, consecutive)
+            return ffn.cost(tokens, distinct, self.model.param_dtype_bytes)
+        return ffn.cost(tokens, self.model.param_dtype_bytes)
 
     def generate(
         self,
@@ -101,8 +92,7 @@ class WorkShardGenerator:
             raise ValueError("prefill_chunk_size must be >= 1")
 
         shards: list[WorkShard] = []
-        group_index = 0
-        group_index = self._emit_prefill(shards, batch_work, prefill_chunk_size, group_index)
+        group_index = self._emit_prefill(shards, batch_work, prefill_chunk_size, 0)
         self._emit_decode(shards, batch_work, group_index)
         return shards
 
@@ -116,6 +106,8 @@ class WorkShardGenerator:
         group_index: int,
     ) -> int:
         model = self.model
+        pdb = model.param_dtype_bytes
+        kvdb = model.kv_dtype_bytes
         for seq in batch_work:
             if seq.prefill_tokens == 0:
                 continue
@@ -124,29 +116,26 @@ class WorkShardGenerator:
             while start < seq.prefill_tokens:
                 stop = min(start + chunk, seq.prefill_tokens)
                 tokens = stop - start
-                pairs = _causal_pairs(start, stop, seq.cached_tokens)
-                # KV already materialized before this chunk and read by attention.
-                prior_kv_tokens = seq.cached_tokens + start
-                for layer in range(model.num_layers):
+                for layer_index, layer in enumerate(model.layers):
+                    flops = 0.0
+                    bytes_read = 0.0
+                    if layer.mixer is not None:
+                        m_flops, m_bytes = layer.mixer.prefill_cost(
+                            tokens, seq.cached_tokens, start, pdb, kvdb
+                        )
+                        flops += m_flops
+                        bytes_read += m_bytes
                     ffn_flops, ffn_bytes = self._ffn_cost(layer, tokens, consecutive=True)
-                    flops = (
-                        model.attention_proj_flops(tokens)
-                        + model.attention_flops(pairs)
-                        + ffn_flops
-                    )
-                    bytes_read = (
-                        model.attention_weight_bytes
-                        + prior_kv_tokens * model.kv_bytes_per_token
-                        + ffn_bytes
-                    )
+                    flops += ffn_flops
+                    bytes_read += ffn_bytes
                     shards.append(
                         WorkShard(
                             group_index=group_index,
                             phase="prefill",
-                            layer_index=layer,
+                            layer_index=layer_index,
                             flops=flops,
                             bytes_read=bytes_read,
-                            flops_dtype_bytes=model.param_dtype_bytes,
+                            flops_dtype_bytes=pdb,
                             kind="layer",
                             tokens=tokens,
                         )
@@ -164,35 +153,33 @@ class WorkShardGenerator:
         group_index: int,
     ) -> int:
         model = self.model
+        pdb = model.param_dtype_bytes
+        kvdb = model.kv_dtype_bytes
         max_steps = max(seq.decode_tokens for seq in batch_work)
         for step in range(1, max_steps + 1):
             active = [seq for seq in batch_work if seq.decode_tokens >= step]
             if not active:
                 continue
             batch_size = len(active)
-            # context length seen by each active sequence at this step
             contexts = [seq.base_tokens + step for seq in active]
-            total_context = sum(contexts)
-            for layer in range(model.num_layers):
+            for layer_index, layer in enumerate(model.layers):
+                flops = 0.0
+                bytes_read = 0.0
+                if layer.mixer is not None:
+                    m_flops, m_bytes = layer.mixer.decode_cost(contexts, pdb, kvdb)
+                    flops += m_flops
+                    bytes_read += m_bytes
                 ffn_flops, ffn_bytes = self._ffn_cost(layer, batch_size, consecutive=False)
-                flops = (
-                    model.attention_proj_flops(batch_size)
-                    + model.attention_flops(total_context)
-                    + ffn_flops
-                )
-                bytes_read = (
-                    model.attention_weight_bytes
-                    + total_context * model.kv_bytes_per_token
-                    + ffn_bytes
-                )
+                flops += ffn_flops
+                bytes_read += ffn_bytes
                 shards.append(
                     WorkShard(
                         group_index=group_index,
                         phase="decode",
-                        layer_index=layer,
+                        layer_index=layer_index,
                         flops=flops,
                         bytes_read=bytes_read,
-                        flops_dtype_bytes=model.param_dtype_bytes,
+                        flops_dtype_bytes=pdb,
                         kind="layer",
                         tokens=batch_size,
                     )
@@ -205,7 +192,7 @@ class WorkShardGenerator:
                         layer_index=None,
                         flops=model.lm_head_flops(batch_size),
                         bytes_read=model.lm_head_bytes,
-                        flops_dtype_bytes=model.param_dtype_bytes,
+                        flops_dtype_bytes=pdb,
                         kind="lm_head",
                         tokens=batch_size,
                     )

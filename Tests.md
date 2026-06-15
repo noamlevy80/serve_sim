@@ -22,8 +22,11 @@ Network tests auto-skip if the dataset API is unreachable.
   devices, trackers, work shards, events). 75 offline tests.
 - **Stage 3 — MoE:** expert-usage model, MoE sizing/shards, MoE roofline, and
   two-tier expert movement. 90 offline tests.
+- **Stage 4 — Model mechanisms:** per-layer block model (GQA/MHA + sliding
+  window, MLA + DSA, Mamba-2, dense/MoE incl. shared + LatentMoE) and the three
+  reference model configs loaded from JSON and run end-to-end. 22 offline tests.
 
-Totals: 219 tests (214 offline + 5 live).
+Totals: 241 tests (236 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -233,3 +236,47 @@ activation trace. Tests assert:
 - Validation: capacity smaller than a group's active set raises; two-tier
   execution requires a capacity and rejects pipeline parallelism; a two-tier
   device with no expert trace falls back to the single-tier path.
+
+## Stage 4: Model mechanisms
+
+Stage 4 represents a model as an ordered list of heterogeneous per-layer
+**blocks** (`LayeredModel`) so real architectures can be assembled from a JSON
+config and run through the existing shard/event path. The flat `Model` converts
+to a `LayeredModel`, so every earlier stage keeps passing unchanged. 22 offline
+tests in [Tests/test_models.py](Tests/test_models.py).
+
+### Independent reference — [Tests/reference.py](Tests/reference.py)
+
+`reference_layered` re-derives the makespan from the block fields directly (not
+by calling the block cost methods), covering GQA/MHA + sliding window, MLA + DSA,
+Mamba-2, and dense/MoE (shared experts + LatentMoE). On homogeneous models it
+agrees with the flat `reference_roofline`, anchoring the new path to the old one.
+
+### Building blocks
+
+- **Sliding window:** decode attention is capped to the window; within the
+  window it is identical to full attention.
+- **MLA:** caches a single compressed latent (`kv_lora_rank + qk_rope_head_dim`)
+  rather than per-head K and V.
+- **DSA:** a lightweight indexer scores the windowed candidate set and the main
+  attention is capped to `sparse_topk`; at long context this is far cheaper than
+  dense attention in both FLOPs and bytes, while within top-k it adds only the
+  indexer term.
+- **Mamba-2:** holds no KV cache and its per-step cost is independent of
+  sequence length (fixed-size recurrent state).
+- Synthetic mixed-block models (MLA+DSA, Mamba+LatentMoE+GQA) match
+  `reference_layered` end-to-end.
+
+### Reference models (loaded from `Models/*.json`)
+
+- **Gemma-4-31B** — 60 composite GQA layers alternating sliding/full attention
+  with dense gated FFN and tied embeddings. Loads, generates events matching the
+  reference (plain and chunked), and emits an LM-head shard at decode.
+- **DeepSeek-V3.2** — 61 layers (3 dense + 58 MoE) of MLA + DSA attention.
+  Loads with the expected expert counts and matches the reference.
+- **Nemotron-3-Ultra** — 108 standalone blocks interleaving Mamba, GQA
+  attention, and LatentMoE FFNs. Loads with one mixer-or-FFN per layer and
+  matches the reference.
+
+(Tensor/pipeline/expert parallelism for these models is deferred to the next
+stage; MTP heads are documented but not yet costed.)

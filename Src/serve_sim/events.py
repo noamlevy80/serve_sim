@@ -16,8 +16,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .blocks import LayeredModel
 from .hardware import ComputeDevice
-from .model import Model
 from .shards import WorkShard
 from .tiering import ExpertResidencyCache, GroupActivation
 
@@ -82,11 +82,12 @@ class EventGenerator:
 
     def __init__(
         self,
-        model: Model,
+        model,
         compute_devices: list[ComputeDevice],
         pipeline_parallel: int = 1,
         expert_parallel: int = 1,
     ) -> None:
+        model = LayeredModel.from_model(model)
         if not compute_devices:
             raise ValueError("at least one compute device is required")
         if pipeline_parallel < 1 or expert_parallel < 1:
@@ -111,6 +112,11 @@ class EventGenerator:
         self.pipeline_parallel = pipeline_parallel
         self.expert_parallel = expert_parallel
         self._layers_per_stage = model.num_layers // pipeline_parallel
+        # Bytes moved per expert miss: that expert's routed weights across all
+        # MoE layers (selection is shared, so they move together).
+        self._moe_routed_bytes_per_miss = sum(
+            ffn.routed_expert_params for ffn in model.moe_ffns()
+        ) * model.param_dtype_bytes
 
     def _stage_of_layer(self, layer_index: int | None) -> int:
         """Pipeline stage handling a layer; LM head goes to the last stage."""
@@ -138,7 +144,7 @@ class EventGenerator:
 
         two_tier = (
             expert_trace is not None
-            and self.model.ffn_type == "moe"
+            and self.model.num_moe_layers > 0
             and self.devices[0].second_tier_memory is not None
         )
         cache: ExpertResidencyCache | None = None
@@ -177,16 +183,10 @@ class EventGenerator:
             if two_tier and group_index in trace_by_group:
                 assert cache is not None
                 misses = cache.access(trace_by_group[group_index].active_experts)
-                moe_layers = sum(
-                    1
-                    for s in group_shards
-                    if s.layer_index is not None
-                    and self.model.is_moe_layer(s.layer_index)
-                )
-                if misses > 0 and moe_layers > 0:
+                if misses > 0 and self._moe_routed_bytes_per_miss > 0:
                     transfer = self._build_transfer_event(
                         group_index,
-                        misses * moe_layers * self.model.routed_expert_bytes,
+                        misses * self._moe_routed_bytes_per_miss,
                         transfer_bandwidth,
                         group_shards[0].phase,
                         clock,

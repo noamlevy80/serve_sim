@@ -25,8 +25,8 @@ import random
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from .blocks import LayeredModel
 from .experts import ExpertUsageModel
-from .model import Model
 from .tracker import SequenceWork
 
 
@@ -40,7 +40,7 @@ class GroupActivation:
 
 
 def build_activation_trace(
-    model: Model,
+    model,
     batch_work: list[SequenceWork],
     prefill_chunk_size: int | None = None,
     seed: int = 0,
@@ -51,16 +51,25 @@ def build_activation_trace(
     runs follow the model's persistence distribution; slots advance through the
     sequence's prefill tokens then its decode tokens as a single stream (so
     decode reuses what prefill warmed). Selection is identical across layers, so
-    a single set of expert indices describes every MoE layer of the group.
+    a single set of expert indices describes every MoE layer of the group. When
+    MoE layers share a config (the real models do), the first MoE layer's expert
+    count is representative.
     """
 
-    if model.ffn_type != "moe":
+    model = LayeredModel.from_model(model)
+    if model.num_moe_layers == 0:
         return []
 
-    usage = ExpertUsageModel.from_model(model)
+    ffn = model.moe_ffns()[0]
+    usage = ExpertUsageModel(
+        num_experts=ffn.num_experts,
+        num_experts_per_token=ffn.num_experts_per_token,
+        persistence_mean=model.expert_persistence_mean,
+        persistence_variance=model.expert_persistence_variance,
+    )
     rng = random.Random(seed)
-    k = model.num_experts_per_token
-    e = model.num_experts
+    k = ffn.num_experts_per_token
+    e = ffn.num_experts
     slots: dict[int, list[list[int]]] = {}
 
     def advance_token(seq_id: int) -> set[int]:
@@ -149,42 +158,50 @@ class ExpertResidencyCache:
         return misses
 
 
-def _peak_kv_bytes(model: Model, batch_work: list[SequenceWork]) -> int:
+def _peak_kv_bytes(model: LayeredModel, batch_work: list[SequenceWork]) -> int:
     total_tokens = sum(seq.base_tokens + seq.decode_tokens for seq in batch_work)
-    return total_tokens * model.num_layers * model.kv_bytes_per_token
+    per_token = sum(layer.kv_bytes_per_token(model.kv_dtype_bytes) for layer in model.layers)
+    return total_tokens * per_token
 
 
-def _nonexpert_weight_bytes(model: Model) -> int:
-    moe_layers = model.num_moe_layers
-    dense_layers = model.num_layers - moe_layers
-    return (
-        model.num_layers * model.attention_weight_bytes
-        + dense_layers * model.dense_ffn_bytes
-        + moe_layers * model.shared_expert_bytes
-        + model.lm_head_bytes
-    )
+def _nonexpert_weight_bytes(model: LayeredModel) -> int:
+    pdb = model.param_dtype_bytes
+    total = model.lm_head_bytes
+    for layer in model.layers:
+        if layer.mixer is not None:
+            total += layer.mixer.weight_params * pdb
+        ffn = layer.ffn
+        if ffn is None:
+            continue
+        if ffn.is_moe:
+            total += (ffn.shared_expert_params + ffn.latent_proj_params) * pdb
+        else:
+            total += ffn.weight_params * pdb
+    return total
 
 
 def derive_expert_cache_capacity(
-    model: Model,
+    model,
     first_tier_capacity_bytes: float,
     batch_work: list[SequenceWork],
 ) -> int:
     """First-tier routed-expert capacity, in expert indices.
 
     Reserves space for the peak KV cache and the always-resident non-expert
-    weights; the remainder is divided by the per-index expert footprint
-    (``num_moe_layers * routed_expert_bytes``).
+    weights; the remainder is divided by the per-index expert footprint (that
+    expert's routed weights summed across all MoE layers).
 
     Raises:
         ValueError: If the first tier cannot even hold the reserved bytes plus
             one expert index.
     """
 
-    moe_layers = model.num_moe_layers
-    if moe_layers == 0:
+    model = LayeredModel.from_model(model)
+    if model.num_moe_layers == 0:
         raise ValueError("model has no MoE layers")
-    per_index_bytes = moe_layers * model.routed_expert_bytes
+    per_index_bytes = sum(ffn.routed_expert_params for ffn in model.moe_ffns()) * (
+        model.param_dtype_bytes
+    )
     reserved = _peak_kv_bytes(model, batch_work) + _nonexpert_weight_bytes(model)
     budget = first_tier_capacity_bytes - reserved
     capacity = int(budget // per_index_bytes)

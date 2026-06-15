@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from serve_sim.model import Model, toy_moe_model
+from serve_sim.experts import ExpertUsageModel
 from serve_sim.shards import WorkShardGenerator
 from serve_sim.tracker import SequenceWork
 
@@ -100,7 +101,7 @@ def test_moe_shard_bytes_match_attention_plus_experts():
     shards = gen.generate(work)
     decode = [s for s in shards if s.phase == "decode"]
     shard = decode[0]
-    usage = gen.expert_usage
+    usage = ExpertUsageModel.from_model(model)
     distinct = usage.expected_distinct(1, consecutive=False)
     total_context = 8 + 1
     expected_bytes = (
