@@ -3,5 +3,6 @@
   "source": "Intel announcement, OCP Global Summit Oct 2025 (inference GPU, Xe3P, 160 GB LPDDR5X)",
   "peak_flops_fp16": 1.0e15,
   "first_tier_memory": "intel-crescent-island-lpddr5x",
-  "notes": "ESTIMATE - Intel has NOT publicly disclosed FP16 throughput. 1 PFLOPS is a placeholder; please confirm or replace."
+  "notes": "ESTIMATE - Intel has NOT publicly disclosed FP16 throughput. 1 PFLOPS is a placeholder; please confirm or replace.",
+  "kernel_launch_latency": 5e-6
 }

@@ -138,6 +138,7 @@ Work shards are precursors to compute or data transfer events.
 Example of work shards:
 - Prefilling a chunk of C tokens in a batch of B (in a layer )
 - Decoding a batch of B for decode (in a layer)
+- Launching a new kernel
 
 The work shard contains the total FLOPs (and type of FLOPs) and the total bytes read needed to perform the action, in addition to KV cache dependencies as pointers to the sequence, and model weights dependecies.
 
@@ -192,6 +193,10 @@ Bandwidth is the minimum across both ends of the transfer, and latency is the ma
 Compute events take the maximum of compute-bound time and bandwidth-bound time
 Bandwidth is the bandwidth of the 1st tier memory (using 2nd tier memory requires a transfer event to the 1st tier)
 Compute is defined by the nominal capabilities of the device. If using a different "data type", the compute is scaled so that 8 bits is 2x faster than nominal, 4 bits is 4x faster, and FP32 is 2x slower.
+
+### Kernel launch
+When a new kernel must be launched (as depicted by the approriate work shard), the device must wait the kernel_launch_latency.
+This event models the wait.
 
 ### Tool call
 We do not model the event of computing a tool call, but we do model waiting for the tool call to complete.

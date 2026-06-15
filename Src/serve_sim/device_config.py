@@ -45,6 +45,7 @@ def compute_device_from_config(
         peak_flops_fp16=config["peak_flops_fp16"],
         first_tier_memory=first_tier_memory,
         second_tier_memory=second_tier_memory,
+        kernel_launch_latency=config.get("kernel_launch_latency", 0.0),
     )
 
 

@@ -52,16 +52,22 @@ class ComputeDevice:
         first_tier_memory: Memory whose bandwidth bounds compute events.
         second_tier_memory: Optional slower/larger memory (requires a transfer
             into the first tier before compute can use it).
+        kernel_launch_latency: Fixed wait incurred each time a new kernel is
+            launched on this device (seconds). Zero for devices with no launch
+            overhead (e.g. statically scheduled dataflow chips).
     """
 
     name: str
     peak_flops_fp16: float
     first_tier_memory: MemoryDevice
     second_tier_memory: MemoryDevice | None = None
+    kernel_launch_latency: float = 0.0
 
     def __post_init__(self) -> None:
         if self.peak_flops_fp16 <= 0:
             raise ValueError("peak_flops_fp16 must be positive")
+        if self.kernel_launch_latency < 0:
+            raise ValueError("kernel_launch_latency must be non-negative")
 
     def effective_flops(self, dtype_bytes: float) -> float:
         """Peak FLOP/s adjusted for the operand data type."""

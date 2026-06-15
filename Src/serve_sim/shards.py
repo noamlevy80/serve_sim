@@ -25,13 +25,14 @@ class WorkShard:
     Attributes:
         group_index: Forward-pass group; shards sharing it run "together" and
             may be consolidated per device. Groups execute in ascending order.
-        phase: ``"prefill"`` or ``"decode"``.
+        phase: ``"prefill"``, ``"decode"``, or ``"kernel_launch"`` (a launch
+            marker that precedes a group's compute; carries no FLOPs/bytes).
         layer_index: Transformer layer index, or ``None`` for the LM head
-            (which is placed on the last pipeline stage).
+            (which is placed on the last pipeline stage) and launch markers.
         flops: Floating point operations for this shard.
         bytes_read: Bytes that must be read from first-tier memory.
         flops_dtype_bytes: Operand element size (sets the compute-rate scale).
-        kind: ``"layer"`` or ``"lm_head"`` (informational).
+        kind: ``"layer"``, ``"lm_head"``, or ``"kernel_launch"`` (informational).
         tokens: Number of tokens processed (informational).
     """
 
@@ -51,6 +52,25 @@ class WorkShardGenerator:
     def __init__(self, model) -> None:
         self.model: LayeredModel = LayeredModel.from_model(model)
         self._expert_usage: dict[int, ExpertUsageModel] = {}
+
+    def _kernel_launch_shard(self, group_index: int) -> WorkShard:
+        """A zero-cost marker that a new kernel is launched for this group.
+
+        The event generator charges the launching device's
+        ``kernel_launch_latency`` once per group-stage when such a marker is
+        present.
+        """
+
+        return WorkShard(
+            group_index=group_index,
+            phase="kernel_launch",
+            layer_index=None,
+            flops=0.0,
+            bytes_read=0.0,
+            flops_dtype_bytes=self.model.param_dtype_bytes,
+            kind="kernel_launch",
+            tokens=0,
+        )
 
     def _distinct(self, ffn: MoEFFN, tokens: int, consecutive: bool) -> float:
         usage = self._expert_usage.get(id(ffn))
@@ -116,6 +136,7 @@ class WorkShardGenerator:
             while start < seq.prefill_tokens:
                 stop = min(start + chunk, seq.prefill_tokens)
                 tokens = stop - start
+                shards.append(self._kernel_launch_shard(group_index))
                 for layer_index, layer in enumerate(model.layers):
                     flops = 0.0
                     bytes_read = 0.0
@@ -162,6 +183,7 @@ class WorkShardGenerator:
                 continue
             batch_size = len(active)
             contexts = [seq.base_tokens + step for seq in active]
+            shards.append(self._kernel_launch_shard(group_index))
             for layer_index, layer in enumerate(model.layers):
                 flops = 0.0
                 bytes_read = 0.0

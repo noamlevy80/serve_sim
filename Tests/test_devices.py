@@ -121,3 +121,30 @@ def test_all_named_first_tiers_exist() -> None:
     for path in COMPUTE_FILES:
         config = json.loads(path.read_text(encoding="utf-8"))
         assert (MEMORY_DIR / f"{config['first_tier_memory']}.json").exists()
+
+
+# --- kernel launch latency --------------------------------------------------
+
+def test_kernel_launch_latency_is_parsed() -> None:
+    b200 = load_compute_device(COMPUTE_DIR / "nvidia-b200.json")
+    assert b200.kernel_launch_latency == 5e-6
+
+
+def test_zero_kernel_launch_latency_is_parsed() -> None:
+    wse3 = load_compute_device(COMPUTE_DIR / "cerebras-wse3.json")
+    assert wse3.kernel_launch_latency == 0.0
+
+
+def test_kernel_launch_latency_defaults_to_zero_when_absent() -> None:
+    tier1 = MemoryDevice("T1", capacity_bytes=1e9, bandwidth_bytes_per_s=1e12)
+    device = compute_device_from_config(
+        {"name": "Toy", "peak_flops_fp16": 5e14}, first_tier_memory=tier1
+    )
+    assert device.kernel_launch_latency == 0.0
+
+
+def test_every_compute_config_has_non_negative_launch_latency() -> None:
+    for path in COMPUTE_FILES:
+        device = load_compute_device(path)
+        assert device.kernel_launch_latency >= 0
+

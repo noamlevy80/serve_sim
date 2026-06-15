@@ -20,6 +20,11 @@ Each rank keeps its own LRU residency of the experts it owns; in a two-tier
 system those experts are streamed up from the second tier on demand, and when
 the second tier is a single shared device (a system NVM) its bandwidth bounds
 the aggregate movement. Inter-stage activation transfers are not modeled here.
+
+A group's compute may be preceded by a kernel-launch event: when a work shard
+marks a kernel launch, each participating device waits its
+``kernel_launch_latency`` before computing (devices with zero launch overhead
+emit no such event).
 """
 
 from __future__ import annotations
@@ -191,6 +196,11 @@ class EventGenerator:
 
         for group_index in order:
             group_shards = groups[group_index]
+            launch = any(s.kind == "kernel_launch" for s in group_shards)
+            compute_shards = [s for s in group_shards if s.kind != "kernel_launch"]
+            if not compute_shards:
+                continue
+            phase = compute_shards[0].phase
 
             if two_tier and group_index in trace_by_group:
                 active = trace_by_group[group_index].active_experts
@@ -201,20 +211,32 @@ class EventGenerator:
                 ]
                 if any(rank_bytes):
                     transfer = self._build_transfer_event(
-                        group_index, rank_bytes, shared_tier2,
-                        group_shards[0].phase, clock,
+                        group_index, rank_bytes, shared_tier2, phase, clock,
                     )
                     clock = transfer.end
                     schedule.events.append(transfer)
 
             stage_shards: dict[int, list[WorkShard]] = {}
-            for shard in group_shards:
+            for shard in compute_shards:
                 stage = self._stage_of_layer(shard.layer_index)
                 stage_shards.setdefault(stage, []).append(shard)
 
             # Stages run sequentially; the ep ranks of a stage run concurrently.
             for stage in sorted(stage_shards):
                 bucket = stage_shards[stage]
+                # A new kernel is launched on each rank of this stage; they
+                # launch concurrently, so the slowest rank gates the group.
+                if launch:
+                    latency = max(
+                        self.devices[self._device_index(stage, r)].kernel_launch_latency
+                        for r in range(ep)
+                    )
+                    if latency > 0:
+                        event = self._build_kernel_launch_event(
+                            group_index, self._device_index(stage, 0), latency, clock
+                        )
+                        clock = event.end
+                        schedule.events.append(event)
                 stage_end = clock
                 for ep_rank in range(ep):
                     device_index = self._device_index(stage, ep_rank)
@@ -226,6 +248,29 @@ class EventGenerator:
                 clock = stage_end
 
         return schedule
+
+    def _build_kernel_launch_event(
+        self,
+        group_index: int,
+        device_index: int,
+        latency: float,
+        start: float,
+    ) -> ComputeEvent:
+        """Fixed wait for launching a kernel on a device (no FLOPs/bytes)."""
+
+        return ComputeEvent(
+            group_index=group_index,
+            phase="kernel_launch",
+            device_index=device_index,
+            flops=0.0,
+            bytes_read=0.0,
+            compute_time=0.0,
+            bandwidth_time=0.0,
+            duration=latency,
+            start=start,
+            end=start + latency,
+        )
+
 
     def _build_transfer_event(
         self,

@@ -27,9 +27,9 @@ def test_prefill_chunking_creates_groups():
     shards = gen.generate(work, prefill_chunk_size=4)  # chunks: 4, 4, 2 -> 3 groups
     groups = sorted({s.group_index for s in shards})
     assert len(groups) == 3
-    # each group has one shard per layer
+    # each group has one compute shard per layer
     for g in groups:
-        assert sum(1 for s in shards if s.group_index == g) == 2
+        assert sum(1 for s in shards if s.group_index == g and s.kind == "layer") == 2
 
 
 def test_decode_emits_layers_plus_lm_head_per_step():

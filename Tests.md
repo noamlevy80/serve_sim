@@ -29,8 +29,12 @@ Network tests auto-skip if the dataset API is unreachable.
   compute) composed with pipeline parallelism, and the two memory scenarios
   (every device holds the model; a shared system-NVM second tier). 18 offline
   tests.
+- **Stage 6 — Devices & kernel launch:** compute/memory device JSON configs
+  loaded into hardware objects, and kernel-launch work shards + latency events
+  (one launch per group-stage, concurrent across expert-parallel ranks). 30
+  offline tests.
 
-Totals: 259 tests (254 offline + 5 live).
+Totals: 289 tests (284 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -327,3 +331,33 @@ movement matches `reference_ep_transfer`, and because a shared NVM funnels every
 rank's loads through one pipe it is never faster than an equivalent per-device
 tier. Both the flat toy MoE model and the real DeepSeek config (on a toy system)
 are checked end-to-end.
+
+## Stage 6: Devices & kernel launch
+
+Stage 6 loads hardware from JSON and models kernel-launch overhead.
+
+### Device configs — [Tests/test_devices.py](Tests/test_devices.py)
+
+Compute devices (`Compute_devices/*.json`) and memory devices
+(`Memory_devices/*.json`) load into `ComputeDevice` / `MemoryDevice`. A compute
+config names its first-tier memory by file stem; the loader resolves it from the
+sibling `Memory_devices/` directory. A second tier is never part of a compute
+config — it is a system-configuration choice attached at load time — so devices
+load with no second tier unless one is supplied. Tests cover every shipped
+config, dtype-scaled effective FLOPs, and that named first tiers exist.
+
+### Kernel launch — [Tests/test_kernel_launch.py](Tests/test_kernel_launch.py)
+
+The work-shard generator emits one zero-cost kernel-launch marker per
+forward-pass group (with `phase == "kernel_launch"`, so the prefill/decode
+filters used elsewhere are unaffected). The event generator charges a device its
+`kernel_launch_latency` once per group-stage before that stage's compute:
+
+- A zero-latency device emits no launch events and is byte-identical to the pure
+  roofline (`reference_roofline`).
+- A non-zero device adds exactly one latency per group: makespan equals the
+  roofline plus `groups x kernel_launch_latency`.
+- Under pipeline parallelism there is one launch per group per stage; under
+  expert parallelism the ranks of a stage launch concurrently, so one launch per
+  group. Both are checked by differencing against the zero-latency run.
+
