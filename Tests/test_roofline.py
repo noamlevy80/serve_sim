@@ -198,6 +198,118 @@ def test_ragged_batch_matches_reference():
     assert sched.makespan == pytest.approx(reference_roofline(model, dev, work), rel=1e-9)
 
 
+# --- batch-size scan ------------------------------------------------------------
+# Sweep the batch size and confirm the simulated makespan tracks the independent
+# closed-form roofline at every point, for several workload shapes.
+
+
+BATCH_SIZES = [1, 2, 3, 4, 8, 16, 32, 64]
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+def test_uniform_batch_scan_matches_reference(batch_size):
+    model = toy_model()
+    dev = make_device()
+    work = [SequenceWork(0, 96, 12) for _ in range(batch_size)]
+    sched = simulate(model, [dev], work)
+    assert sched.makespan == pytest.approx(reference_roofline(model, dev, work), rel=1e-9)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+def test_prefill_only_batch_scan_matches_reference(batch_size):
+    # compute-heavy: all prefill, no decode.
+    model = toy_model()
+    dev = make_device()
+    work = [SequenceWork(0, 128, 0) for _ in range(batch_size)]
+    sched = simulate(model, [dev], work)
+    assert sched.makespan == pytest.approx(reference_roofline(model, dev, work), rel=1e-9)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+def test_decode_only_batch_scan_matches_reference(batch_size):
+    # bandwidth-heavy: a warm cache then pure decode (weight reads amortized).
+    model = toy_model()
+    dev = make_device()
+    work = [SequenceWork(cached_tokens=64, prefill_tokens=0, decode_tokens=16)
+            for _ in range(batch_size)]
+    sched = simulate(model, [dev], work)
+    assert sched.makespan == pytest.approx(reference_roofline(model, dev, work), rel=1e-9)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+def test_chunked_prefill_batch_scan_matches_reference(batch_size):
+    model = toy_model()
+    dev = make_device()
+    work = [SequenceWork(0, 100, 8) for _ in range(batch_size)]
+    sched = simulate(model, [dev], work, prefill_chunk_size=32)
+    assert sched.makespan == pytest.approx(
+        reference_roofline(model, dev, work, prefill_chunk_size=32), rel=1e-9
+    )
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+def test_moe_batch_scan_matches_reference(batch_size):
+    # MoE: more sequences touch more distinct experts -> more weight bytes read.
+    model = toy_moe_model()
+    dev = make_device()
+    work = [SequenceWork(0, 64, 8) for _ in range(batch_size)]
+    sched = simulate(model, [dev], work)
+    assert sched.makespan == pytest.approx(reference_roofline(model, dev, work), rel=1e-9)
+
+
+def test_makespan_is_monotonic_in_batch_size():
+    # Adding work can never reduce the makespan.
+    model = toy_model()
+    dev = make_device()
+    prev = 0.0
+    for batch_size in BATCH_SIZES:
+        work = [SequenceWork(0, 96, 12) for _ in range(batch_size)]
+        makespan = simulate(model, [dev], work).makespan
+        assert makespan >= prev - 1e-12
+        prev = makespan
+
+
+def test_compute_bound_prefill_scales_linearly_with_batch_size():
+    # huge bandwidth isolates compute; prefill FLOPs are per-sequence, so the
+    # makespan grows linearly with the number of sequences.
+    model = toy_model()
+    dev = make_device(peak=100e12, bw=1e18)
+    one = simulate(model, [dev], [SequenceWork(0, 128, 0)]).makespan
+    for batch_size in [1, 2, 4, 8]:
+        work = [SequenceWork(0, 128, 0) for _ in range(batch_size)]
+        makespan = simulate(model, [dev], work).makespan
+        assert makespan == pytest.approx(batch_size * one, rel=1e-9)
+
+
+def test_bandwidth_bound_decode_amortizes_weights_across_batch():
+    # huge compute isolates bandwidth. A batched decode step reads the weights
+    # once for the whole batch, so per-sequence cost falls as the batch grows
+    # (makespan grows far slower than linearly).
+    model = toy_model()
+    dev = make_device(peak=1e18, bw=1e12)
+    decode = SequenceWork(cached_tokens=32, prefill_tokens=0, decode_tokens=16)
+    one = simulate(model, [dev], [decode]).makespan
+    eight = simulate(model, [dev], [decode for _ in range(8)]).makespan
+    assert eight < 8 * one
+    # exact match to the independent roofline at the batched point.
+    assert eight == pytest.approx(
+        reference_roofline(model, dev, [decode for _ in range(8)]), rel=1e-9
+    )
+
+
+def test_decode_per_sequence_throughput_improves_with_batching():
+    # In a bandwidth-bound regime the makespan-per-sequence strictly decreases as
+    # the batch grows (the core efficiency win of batching).
+    model = toy_model()
+    dev = make_device(peak=1e18, bw=1e12)
+    decode = SequenceWork(cached_tokens=32, prefill_tokens=0, decode_tokens=16)
+    per_seq = []
+    for batch_size in [1, 2, 4, 8, 16]:
+        work = [decode for _ in range(batch_size)]
+        per_seq.append(simulate(model, [dev], work).makespan / batch_size)
+    assert all(b < a for a, b in zip(per_seq, per_seq[1:]))
+
+
 # --- pipeline parallelism -------------------------------------------------------
 
 
