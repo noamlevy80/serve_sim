@@ -40,6 +40,7 @@ These are the minimal parameters required to size every tensor in a forward pass
 | `qk_rope_head_dim` | $d_h^\text{rope}$ | Per-head dimension carrying rotary position info. | MLA |
 | `qk_nope_head_dim` | $d_h^\text{nope}$ | Per-head dimension without rotary embedding. | MLA |
 | `v_head_dim` | $d_h^v$ | Per-head value dimension. | MLA |
+| `sliding_window` | $W$ | If set, each query attends only to the most recent $W$ tokens (local / sliding-window attention) instead of the full context. Caps KV cache size and attention compute for that layer; `null`/absent means full attention. Overlays any base `attention_type`. | Attention |
 | `sparse_attention` | — | Whether a lightweight indexer selects a sparse subset of past tokens to attend to (DeepSeek Sparse Attention / DSA). Overlays any base `attention_type`. | Attention |
 | `sparse_topk` | $k_\text{attn}$ | Number of past tokens the indexer selects per query (sparse attention budget). | DSA |
 | `index_n_heads` | $h_\text{idx}$ | Number of heads in the indexer that scores tokens for selection. | DSA |
@@ -77,6 +78,9 @@ Optional speculative-decoding head appended after the main stack. Needed to mode
 |---|---|---|---|
 | `num_mtp_layers` | $L_\text{mtp}$ | Number of MTP modules (predicted future tokens per step). | MTP |
 | `mtp_layer_pattern` | — | Block type(s) composing each MTP module (reuses the attention/FFN/Mamba block definitions above). | MTP |
+
+## Batch Tracker
+The batch tracker is responsible for tracking a batch of workloads and instantiating all the sequence trackers for each sequence.
 
 ## Sequence Tracker
 The sequence tracker takes a conversation and tokenizes it. Conversations are tokenized using a standard tokenizer (just to get indices from the conversation string, not to actually use them as tokens) - only one tokenizer is ever used in the simulator, there is no need to model different tokenizers of different models.
@@ -129,7 +133,7 @@ Example of work shards:
 
 The work shard contains the total FLOPs (and type of FLOPs) and the total bytes read needed to perform the action, in addition to KV cache dependencies as pointers to the sequence, and model weights dependecies.
 
-The work shard generator is instantiated in connection to a sequence tracker. It receives the following:
+The work shard generator is instantiated in connection to a batch tracker. Per sequence tracker, it receives the following:
 - Index of the last existing cache token (or None if no existing cache)
 - Index of the last prefill token
 - Index of the last decode token
@@ -157,10 +161,12 @@ A test suite is a list of workloads that the system should simulate, each worklo
 
 ## Event Generator
 The event generator is the heart of the simulation.
-It is tasked with generating simulation events to produce a single output sequence, i.e. to convert one series of work shards to events.
+It is tasked with generating simulation events to produce a single output batch, i.e. to convert one batch of work shards to events.
 The main scope of it is to map the work shards to actual work and calculate the duration of the work.
 
-The event generator gets a list of compute devices and memory devices needed to execute the sequence, as well as the actual sequence tracker with its associated KV trackers. The event generator decides upon initiatization on the division of work (in case more then one compute device is chosen). It supports pipeline and expert parellilism and accepts it as a parameter of the simulation.
+The event generator gets a list of compute devices and memory devices needed to execute the sequence, as well as the actual batch tracker with its associated sequence and KV trackers. The event generator decides upon initiatization on the division of work (in case more then one compute device is chosen). It supports pipeline and expert parellilism and accepts it as a parameter of the simulation.
+
+The number of devices must be devisable by the product of the parallelism options (for simplicity).
 
 The event generator can and should consolidate adjacent work shards if they run on the same device, so as to minimize thrashing of the simulation with events.
 
@@ -176,15 +182,14 @@ Compute events take the maximum of compute-bound time and bandwidth-bound time
 Bandwidth is the bandwidth of the 1st tier memory (using 2nd tier memory requires a transfer event to the 1st tier)
 Compute is defined by the nominal capabilities of the device. If using a different "data type", the compute is scaled so that 8 bits is 2x faster than nominal, 4 bits is 4x faster, and FP32 is 2x slower.
 
-
 # Simluation Flow
 1. Preprocessing:
-Workload -> Sequence + Model -> Work Shards
+Workloads -> Batch + Model -> Work Shards
 (for all workloads and all turns - each turn is a different set of work shards)
 
 2. Running:
 - Choose sequences and map to devices, initiate event generators (Orchestration)
-- Generate events to execute the chosen sequences
+- Generate events to execute the chosen sequences (meaning, find the end time of each event)
 - Repeat
 
 3. Post processing:
@@ -193,28 +198,13 @@ Analyze and create logs and reports
 ## Orchestration
 Orchestration will generally be eager, mapping sequences to the devices which it expects will best execute them according to the information it has at the point in time where the decision is made.
 
+The orchestration eagerly decides on prefill-decode dissagregation if enabled.
+
 Orchestration parameters:
 - Target concurrency
+- Allow PDD
 
 
------ Not implemented yet -------
-
-
-
-In the simulator, we will 'run' several workloads in parallel to simulate a high concurrency system
-
-# Behavior
-## Event based simulation
-The simulation will model events. An event can be: calculating one time step of a batch on a device, transferring a chunk of KV cache between memory tiers
-
-## Orchestration
-As the workloads are traces of a single concurrency, the system must orchestrate concurrency to make the simulation interesting. We will take a greedy approach, where each N conversations are grouped at once, according to the order they appeared in the test suite.
-
-The system should identify common prefixes and attempt to reuse them as much as possible to avoid unneccesary prefill computations.
-In a multi turn conversation, the system should try to fetch the existing KV cache conversation from memory and prefill the previous turns.
-The heart of the simulation will be to capture how efficient this process can be.
-
-## Randomness
 
 
 
