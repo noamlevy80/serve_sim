@@ -36,6 +36,7 @@ from .tiering import (
     derive_expert_cache_capacity,
 )
 from .events import ComputeEvent, EventGenerator, EventSchedule
+from .arbiter import ArbiterResult, ResourceArbiter
 
 __all__ = [
     # workloads
@@ -84,4 +85,6 @@ __all__ = [
     "ComputeEvent",
     "EventGenerator",
     "EventSchedule",
+    "ArbiterResult",
+    "ResourceArbiter",
 ]

@@ -33,8 +33,11 @@ Network tests auto-skip if the dataset API is unreachable.
   loaded into hardware objects, and kernel-launch work shards + latency events
   (one launch per group-stage, concurrent across expert-parallel ranks). 30
   offline tests.
+- **Stage 7 — Event rescaling:** a resource arbiter co-runs several event
+  generators on one timeline, dividing a loaded compute device or memory device
+  equally and prorating in-flight compute and transfer events. 15 offline tests.
 
-Totals: 289 tests (284 offline + 5 live).
+Totals: 348 tests (343 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -360,4 +363,30 @@ filters used elsewhere are unaffected). The event generator charges a device its
 - Under pipeline parallelism there is one launch per group per stage; under
   expert parallelism the ranks of a stage launch concurrently, so one launch per
   group. Both are checked by differencing against the zero-latency run.
+
+## Stage 7: Event rescaling
+
+A single event generator assumes it owns its devices. Stage 7 adds a
+`ResourceArbiter` that co-runs several generators (jobs) on one shared timeline:
+whenever concurrent events demand the same compute device or memory device, that
+resource's rate is split equally and in-flight events are rescaled, prorated for
+the elapsed time. The arbiter is a fluid (processor-sharing) co-simulation —
+rates are recomputed each time an event starts or finishes a demand. Resources
+contend only when the jobs were handed the *same* device/memory instance. 15
+offline tests in [Tests/test_arbiter.py](Tests/test_arbiter.py).
+
+- **Identity:** a single job, or jobs on disjoint resources, reproduce the
+  standalone `EventGenerator.run` timings exactly.
+- **Compute events:** two identical jobs sharing one device take twice as long
+  in both the bandwidth-bound and compute-bound regimes; `N` jobs scale `N x`.
+  Sharing only a memory device (distinct compute pools) does not slow
+  compute-bound work.
+- **Proration (PRD example):** with one shared memory and a second job that
+  starts `tau` late, the closed form gives makespan `2W/R` and the early job's
+  rescaled end at `2W/R - tau` — both matched exactly.
+- **Transfer events:** two MoE jobs streaming experts from the same system NVM
+  each see their transfer time double; separate NVMs do not contend.
+- **Conservation:** rescaling changes only timings — total FLOPs/bytes are
+  preserved and sharing is never faster than isolation.
+
 

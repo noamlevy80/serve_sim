@@ -182,26 +182,31 @@ The number of devices must be devisable by the product of the parallelism option
 
 The event generator can and should consolidate adjacent work shards if they run on the same device, so as to minimize thrashing of the simulation with events.
 
-Events generated:
+### Events generated:
 
-### Data transfer
+#### Data transfer
 Memory to memory data transfers generate data transfer events
 Data transfer events cost latency + transfer time, where transfer time is the volume / bandwidth
 Bandwidth is the minimum across both ends of the transfer, and latency is the maximum 
 
-### Compute
+#### Compute
 Compute events take the maximum of compute-bound time and bandwidth-bound time
 Bandwidth is the bandwidth of the 1st tier memory (using 2nd tier memory requires a transfer event to the 1st tier)
 Compute is defined by the nominal capabilities of the device. If using a different "data type", the compute is scaled so that 8 bits is 2x faster than nominal, 4 bits is 4x faster, and FP32 is 2x slower.
 
-### Kernel launch
+#### Kernel launch
 When a new kernel must be launched (as depicted by the approriate work shard), the device must wait the kernel_launch_latency.
 This event models the wait.
 
-### Tool call
+#### Tool call
 We do not model the event of computing a tool call, but we do model waiting for the tool call to complete.
 Tool call events represents time that the sequence must wait before receiving the tool response.
 Tool call times are provided by the dataset, but they may be globally scaled by the tool_calling_speedup system parameter.
+
+### Event Rescaling
+An event generator shall support rescaling of events in case the associated resource is loaded.
+For example: a memory device that started with supporting a single compute event, which in a time step concurrent to the event needed to support another compute event, will need to be rescaled with half the bandwidth, but prorated for the time already passed.
+Generally speaking, we assume compute and bandwidth is divided equally when devices support more than one workload.
 
 # Simluation Flow
 1. Preprocessing:
