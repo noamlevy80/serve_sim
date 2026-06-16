@@ -1,0 +1,203 @@
+"""Parse a system configuration JSON into live hardware objects.
+
+A *system* config (see ``Systems/*.json``) describes a whole simulated machine:
+a scale-up + CXL :class:`Network`, a designated *input memory* (the shared NVM
+that holds every model's weights at init), and a list of :class:`Node` s. Each
+node owns an optional CPU-managed node memory and some compute devices, each of
+which is an *instance* of a device config in ``Compute_devices/`` (whose
+first-tier memory in turn resolves from ``Memory_devices/``).
+
+Instances matter: the event generator and resource arbiter contend on object
+identity, so a node with ``{"device": "nvidia-b200", "count": 4}`` is expanded
+into four *distinct* :class:`~serve_sim.hardware.ComputeDevice` objects, each with
+its own distinct first-tier memory. The single input memory and each node's node
+memory are one shared instance apiece.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Mapping
+
+from .device_config import load_compute_device, load_memory_device
+from .hardware import ComputeDevice, MemoryDevice
+
+
+@dataclass(frozen=True)
+class Network:
+    """Point-to-point fabric parameters shared by the whole system.
+
+    Attributes:
+        scale_up_bandwidth_bytes_per_s: Cross-device scale-up bandwidth.
+        scale_up_latency_s: Scale-up per-transfer latency.
+        cxl_bandwidth_bytes_per_s: In-node CXL bandwidth (to node memory).
+        cxl_latency_s: In-node CXL per-transfer latency.
+    """
+
+    scale_up_bandwidth_bytes_per_s: float
+    scale_up_latency_s: float
+    cxl_bandwidth_bytes_per_s: float
+    cxl_latency_s: float
+
+    def __post_init__(self) -> None:
+        if self.scale_up_bandwidth_bytes_per_s <= 0:
+            raise ValueError("scale_up_bandwidth_bytes_per_s must be positive")
+        if self.cxl_bandwidth_bytes_per_s <= 0:
+            raise ValueError("cxl_bandwidth_bytes_per_s must be positive")
+        if self.scale_up_latency_s < 0 or self.cxl_latency_s < 0:
+            raise ValueError("network latencies must be non-negative")
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> "Network":
+        return cls(
+            scale_up_bandwidth_bytes_per_s=config["scale_up_bandwidth_bytes_per_s"],
+            scale_up_latency_s=config["scale_up_latency_s"],
+            cxl_bandwidth_bytes_per_s=config["cxl_bandwidth_bytes_per_s"],
+            cxl_latency_s=config["cxl_latency_s"],
+        )
+
+
+@dataclass(frozen=True)
+class Node:
+    """One node: a CPU-managed node memory and its compute devices.
+
+    Attributes:
+        name: Identifier for logs/reports.
+        compute_devices: Distinct compute-device instances in this node.
+        node_memory: Optional CPU-managed memory reached over CXL in-node (or the
+            scale-up network from outside the node). ``None`` if unmodeled.
+    """
+
+    name: str
+    compute_devices: tuple[ComputeDevice, ...]
+    node_memory: MemoryDevice | None = None
+
+    def __len__(self) -> int:
+        return len(self.compute_devices)
+
+
+@dataclass(frozen=True)
+class System:
+    """A fully instantiated simulated machine.
+
+    Attributes:
+        name: Identifier for logs/reports.
+        network: Scale-up + CXL fabric parameters.
+        input_memory: Shared NVM holding all model weights at init.
+        nodes: The system's nodes.
+        description: Optional free-text description from the config.
+    """
+
+    name: str
+    network: Network
+    input_memory: MemoryDevice
+    nodes: tuple[Node, ...]
+    description: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.nodes:
+            raise ValueError("a system must have at least one node")
+
+    @property
+    def compute_devices(self) -> list[ComputeDevice]:
+        """Every compute device across all nodes, in node order."""
+
+        return [d for node in self.nodes for d in node.compute_devices]
+
+    @property
+    def num_compute_devices(self) -> int:
+        return sum(len(node) for node in self.nodes)
+
+    def node_of(self, device: ComputeDevice) -> Node:
+        """The node that owns ``device`` (by identity)."""
+
+        for node in self.nodes:
+            if any(d is device for d in node.compute_devices):
+                return node
+        raise ValueError(f"device {device.name!r} is not part of this system")
+
+
+def system_from_config(
+    config: Mapping[str, Any],
+    compute_dir: str | Path,
+    memory_dir: str | Path,
+) -> System:
+    """Build a :class:`System` from a parsed config and device directories.
+
+    Args:
+        config: Parsed system JSON.
+        compute_dir: Directory holding ``<device>.json`` compute configs.
+        memory_dir: Directory holding ``<memory>.json`` memory configs.
+    """
+
+    compute_dir = Path(compute_dir)
+    memory_dir = Path(memory_dir)
+
+    network = Network.from_config(config["network"])
+    input_memory = load_memory_device(memory_dir / f"{config['input_memory']}.json")
+
+    nodes: list[Node] = []
+    for raw_node in config["nodes"]:
+        node_memory = None
+        node_memory_stem = raw_node.get("node_memory")
+        if node_memory_stem is not None:
+            node_memory = load_memory_device(memory_dir / f"{node_memory_stem}.json")
+
+        devices: list[ComputeDevice] = []
+        for entry in raw_node["compute_devices"]:
+            count = entry.get("count", 1)
+            if count < 1:
+                raise ValueError("compute device 'count' must be >= 1")
+            device_path = compute_dir / f"{entry['device']}.json"
+            # A fresh load per instance gives each device its own first-tier
+            # memory instance (identity matters for resource contention).
+            for _ in range(count):
+                devices.append(load_compute_device(device_path, memory_dir=memory_dir))
+
+        if not devices:
+            raise ValueError(f"node {raw_node['name']!r} has no compute devices")
+
+        nodes.append(
+            Node(
+                name=raw_node["name"],
+                compute_devices=tuple(devices),
+                node_memory=node_memory,
+            )
+        )
+
+    return System(
+        name=config["name"],
+        network=network,
+        input_memory=input_memory,
+        nodes=tuple(nodes),
+        description=config.get("description", ""),
+    )
+
+
+def load_system(
+    path: str | Path,
+    compute_dir: str | Path | None = None,
+    memory_dir: str | Path | None = None,
+) -> System:
+    """Load a :class:`System` from a system JSON file.
+
+    Args:
+        path: Path to the system JSON.
+        compute_dir: Directory of compute configs. Defaults to a sibling
+            ``Compute_devices`` directory next to the system file's parent.
+        memory_dir: Directory of memory configs. Defaults to a sibling
+            ``Memory_devices`` directory next to the system file's parent.
+    """
+
+    path = Path(path)
+    with open(path, "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    if compute_dir is None:
+        compute_dir = path.parent.parent / "Compute_devices"
+    if memory_dir is None:
+        memory_dir = path.parent.parent / "Memory_devices"
+
+    return system_from_config(config, compute_dir=compute_dir, memory_dir=memory_dir)

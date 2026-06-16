@@ -39,8 +39,15 @@ Network tests auto-skip if the dataset API is unreachable.
 - **Stage 8 — Multi-turn conversations:** a conversation driver stitches a
   workload's turns end-to-end on one timeline and inserts tool-call wait events
   (scaled by `tool_calling_speedup`) between turns. 14 offline tests.
+- **Stage 9 — System configs:** a `System` loader expands a `Systems/*.json`
+  (network, input memory, nodes) into live hardware objects, instantiating each
+  `count` device as a distinct instance with its own first-tier memory. 20
+  offline tests.
+- **Stage 10 — Test suites:** a randomized suite draws N random dataset
+  workloads and binds each to a model chosen at random from a configured list,
+  reproducibly from a seed. 15 offline tests.
 
-Totals: 362 tests (357 offline + 5 live).
+Totals: 398 tests (393 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -415,5 +422,46 @@ bytes. 14 offline tests in [Tests/test_conversation.py](Tests/test_conversation.
   the appended tool-call request and tool response become that turn's prefill;
   the compute events reproduce the single-turn runs, and a single-turn
   conversation has no waits.
+
+## Stage 9: System configs
+
+A system config (`Systems/*.json`) describes a whole machine: a scale-up + CXL
+`Network`, a designated *input memory* (the shared NVM holding all weights at
+init), and a list of nodes. `load_system` expands each node's
+`{"device": ..., "count": N}` entries into N **distinct**
+`ComputeDevice` instances — each with its own first-tier memory instance, because
+the event generator and arbiter contend on object identity. 20 offline tests in
+[Tests/test_system.py](Tests/test_system.py).
+
+- **Loading:** every shipped system loads into live objects; the two-node B200
+  system has 8 GPUs across two nodes, the heterogeneous system pairs a B200 node
+  with a Cerebras WSE-3 node, and each device keeps its own first-tier memory.
+- **Network/memory:** the network bandwidth/latency fields parse, the input
+  memory resolves to the datacenter NVM, and each node's node memory resolves to
+  the Grace LPDDR5X device.
+- **Identity:** every compute device and every first-tier memory is a distinct
+  instance; `node_of` finds a device's owning node and rejects foreign devices.
+- **Validation:** `count` expands to distinct instances and defaults to one,
+  omitted node memory is `None`, second tiers are never auto-attached, and zero
+  counts / empty node lists / bad network parameters are rejected.
+
+## Stage 10: Test suites
+
+A suite is what the simulator runs: a list of `SuiteEntry` pairs, each binding a
+multi-turn workload to the name of the model that serves it. A *randomized* suite
+(`Suites/*.json`) draws `num_workloads` random sessions from the dataset and
+assigns each a model chosen uniformly from a configured list. Dataset access is
+injected through a `WorkloadLoader`, so the tests run offline over an in-memory
+fetcher, and randomness comes from a caller-supplied seed. 15 offline tests in
+[Tests/test_suite.py](Tests/test_suite.py).
+
+- **Construction:** the suite has exactly `num_workloads` entries; every entry is
+  a valid whole-session `Workload` bound to a model from the configured list.
+- **Determinism:** a fixed seed reproduces the suite; different seeds (with
+  several sessions and models) produce different draws.
+- **Config dispatch:** the JSON parses its fields, defaults to the randomized
+  type, and rejects the not-yet-implemented `directed` type and unknown types.
+- **Validation:** zero workloads, an empty model list, and an empty suite are
+  rejected; the shipped sample suite loads and builds.
 
 

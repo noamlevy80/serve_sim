@@ -175,6 +175,15 @@ https://huggingface.co/datasets/sammshen/lmcache-agentic-traces
 ## Test Suite
 A test suite is a list of workloads that the system should simulate, each workload is mapped to a model.
 
+### Randomized suite
+A randomized test suite selects random workloads from the dataset and matches them to a random model from the list of models.
+The JSON for configuring a randomized test suite contains:
+1. Number of workloads in the test suite
+2. List of models to choose from
+
+### Directed suite
+TBD - not implemented for now
+
 ## Event Generator
 The event generator is the heart of the simulation.
 It is tasked with generating simulation events to produce a single output batch, i.e. to convert one batch of work shards to events.

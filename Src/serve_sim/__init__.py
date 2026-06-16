@@ -38,6 +38,21 @@ from .tiering import (
 from .events import ComputeEvent, EventGenerator, EventSchedule
 from .arbiter import ArbiterResult, ResourceArbiter
 from .conversation import TOOL_CALL_PHASE, run_conversation
+from .system import (
+    Network,
+    Node,
+    System,
+    load_system,
+    system_from_config,
+)
+from .suite import (
+    RandomizedSuiteConfig,
+    Suite,
+    SuiteEntry,
+    build_randomized_suite,
+    build_suite_from_config,
+    load_suite,
+)
 
 __all__ = [
     # workloads
@@ -90,4 +105,15 @@ __all__ = [
     "ResourceArbiter",
     "TOOL_CALL_PHASE",
     "run_conversation",
+    "Network",
+    "Node",
+    "System",
+    "load_system",
+    "system_from_config",
+    "RandomizedSuiteConfig",
+    "Suite",
+    "SuiteEntry",
+    "build_randomized_suite",
+    "build_suite_from_config",
+    "load_suite",
 ]

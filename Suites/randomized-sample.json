@@ -1,0 +1,11 @@
+{
+  "name": "Randomized sample suite",
+  "description": "Draws 16 random multi-turn workloads from the source dataset and assigns each a model chosen uniformly at random from the listed models.",
+  "type": "randomized",
+  "num_workloads": 16,
+  "models": [
+    "deepseek-v3.2",
+    "gemma-4-31b",
+    "nemotron-3-ultra"
+  ]
+}
