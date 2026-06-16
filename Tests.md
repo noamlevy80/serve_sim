@@ -36,8 +36,11 @@ Network tests auto-skip if the dataset API is unreachable.
 - **Stage 7 — Event rescaling:** a resource arbiter co-runs several event
   generators on one timeline, dividing a loaded compute device or memory device
   equally and prorating in-flight compute and transfer events. 15 offline tests.
+- **Stage 8 — Multi-turn conversations:** a conversation driver stitches a
+  workload's turns end-to-end on one timeline and inserts tool-call wait events
+  (scaled by `tool_calling_speedup`) between turns. 14 offline tests.
 
-Totals: 348 tests (343 offline + 5 live).
+Totals: 362 tests (357 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -388,5 +391,29 @@ offline tests in [Tests/test_arbiter.py](Tests/test_arbiter.py).
   each see their transfer time double; separate NVMs do not contend.
 - **Conservation:** rescaling changes only timings — total FLOPs/bytes are
   preserved and sharing is never faster than isolation.
+
+## Stage 8: Multi-turn conversations
+
+A workload is a multi-turn agentic conversation whose turns are separated by
+tool-call waits — the client-side gap (`pre_gap`) spent waiting for a tool/function
+call to return. `run_conversation` drives the existing single-turn pipeline
+(tokenize a turn → work shards → timed compute events) once per turn and lays the
+per-turn schedules out end-to-end on one clock, inserting a tool-call wait event
+(`phase == "tool_call"`) in front of every turn with a positive `pre_gap`. We
+model only the wait, not the tool computation, so those events carry no FLOPs or
+bytes. 14 offline tests in [Tests/test_conversation.py](Tests/test_conversation.py).
+
+- **Tool-call events:** exactly one wait per non-zero `pre_gap` (the first turn
+  has none); each wait's duration equals its `pre_gap`, the total equals the sum
+  of gaps, and the events carry no compute or bandwidth work.
+- **`tool_calling_speedup`:** divides every wait (a 2x speedup halves total tool
+  time) without changing any compute; a non-positive value is rejected.
+- **Timeline:** the stitched events are contiguous and non-overlapping, a wait
+  sits between the surrounding turns' compute, and the conversation makespan
+  equals the sum of the independently-timed per-turn makespans plus the waits.
+- **Tokenization:** each later turn caches exactly the previous turn's tokens, so
+  the appended tool-call request and tool response become that turn's prefill;
+  the compute events reproduce the single-turn runs, and a single-turn
+  conversation has no waits.
 
 

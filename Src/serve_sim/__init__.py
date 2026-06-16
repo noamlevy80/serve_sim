@@ -37,6 +37,7 @@ from .tiering import (
 )
 from .events import ComputeEvent, EventGenerator, EventSchedule
 from .arbiter import ArbiterResult, ResourceArbiter
+from .conversation import TOOL_CALL_PHASE, run_conversation
 
 __all__ = [
     # workloads
@@ -87,4 +88,6 @@ __all__ = [
     "EventSchedule",
     "ArbiterResult",
     "ResourceArbiter",
+    "TOOL_CALL_PHASE",
+    "run_conversation",
 ]

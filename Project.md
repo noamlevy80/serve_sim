@@ -157,7 +157,7 @@ The node accepts the following parameter:
 - CXL Bandwidth (we will model point to point bandwidth)
 
 ## System Level Definitions
-The system is defined by the following parameter:
+The system is defined by the following parameters:
 - Scale up network bandwidth (we will model point to point, we will not model network congestion at this stage)
 - Scale up network latency
 
