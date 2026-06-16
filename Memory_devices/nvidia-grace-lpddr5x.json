@@ -1,0 +1,7 @@
+{
+  "name": "NVIDIA Grace LPDDR5X (GB200 NVL72)",
+  "source": "https://www.nvidia.com/en-us/data-center/gb200-nvl72/ (GB200 NVL72: 36 Grace CPUs, each up to 480 GB LPDDR5X at up to 512 GB/s)",
+  "capacity_bytes": 4.8e11,
+  "bandwidth_bytes_per_s": 5.12e11,
+  "notes": "Per-Grace-CPU coherent LPDDR5X memory used as the CPU-managed node memory tier (reached over CXL/NVLink-C2C within a node, scale-up across nodes). 480 GB at ~512 GB/s."
+}

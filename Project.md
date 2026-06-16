@@ -148,18 +148,25 @@ The work shard generator is instantiated in connection to a batch tracker. Per s
 - Index of the last decode token
 And outputs all the relevant shards.
 
-## Node
-A node contains a management device (CPU), and a number of inference devices, which could be the identical or different from each other.
-
-The node is characterized by compute devices (with linked memory devices), optionally free-floating memory devices.
-
-The node accepts the following parameter:
-- CXL Bandwidth (we will model point to point bandwidth)
-
 ## System Level Definitions
 The system is defined by the following parameters:
 - Scale up network bandwidth (we will model point to point, we will not model network congestion at this stage)
 - Scale up network latency
+- In-node (CXL) bandwidth
+- In-node (CXL) latency
+
+### System Architecture
+The simulated system architecture is defined by a JSON file which defines all the devices in the system.
+We assume that all devices are connected to each via the scale up network (and we only model point to point connnections, ignoring for now network topology and bissection bandwidth)
+
+Each device must be an instance of the devices defined in the configuration files.
+
+One memory device (typically NVM) will be defined as the input device, where the weights for all models are stored at system init.
+The JSON will have specific designation of this input device.
+
+Data transfers can happen between any memory device and any other memory device via the scale up network (as we assume but do not model that each memory device is connected to a physical device that manages it)
+
+Each device may optionally be linked to a node memory device, representing the memory device managed by the node's CPU. The communication to this memory is via CXL to devices inside the current node, or scale up network to devices outside the node.
 
 ## Workloads
 A workload is a multi turn conversation with or without tool calling
