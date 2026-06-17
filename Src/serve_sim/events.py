@@ -29,6 +29,7 @@ emit no such event).
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 
 from .blocks import LayeredModel
@@ -101,12 +102,16 @@ class EventGenerator:
         compute_devices: list[ComputeDevice],
         pipeline_parallel: int = 1,
         expert_parallel: int = 1,
+        event_random_factor_range: float = 0.0,
+        rng: random.Random | None = None,
     ) -> None:
         model = LayeredModel.from_model(model)
         if not compute_devices:
             raise ValueError("at least one compute device is required")
         if pipeline_parallel < 1 or expert_parallel < 1:
             raise ValueError("parallelism degrees must be >= 1")
+        if not 0.0 <= event_random_factor_range < 1.0:
+            raise ValueError("event_random_factor_range must be in [0, 1)")
         product = pipeline_parallel * expert_parallel
         if len(compute_devices) % product != 0:
             raise ValueError(
@@ -122,6 +127,8 @@ class EventGenerator:
         self.devices = compute_devices
         self.pipeline_parallel = pipeline_parallel
         self.expert_parallel = expert_parallel
+        self.event_random_factor_range = event_random_factor_range
+        self._rng = rng if rng is not None else random.Random()
         self._layers_per_stage = model.num_layers // pipeline_parallel
         # Bytes moved per expert miss: that expert's routed weights across all
         # MoE layers (selection is shared, so they move together).
@@ -140,6 +147,21 @@ class EventGenerator:
         if layer_index is None:
             return self.pipeline_parallel - 1
         return layer_index // self._layers_per_stage
+
+    def _time_scale(self) -> float:
+        """Per-event random time multiplier ``1 + U(-range, range)``.
+
+        Models system randomness: the calculated event time is scaled by one
+        draw per event (``1.0`` when randomization is disabled). The scale is
+        applied to the roofline times, not the FLOPs/bytes, so total work is
+        conserved while the effective rate -- and hence the duration the arbiter
+        rescales under contention -- carries the perturbation.
+        """
+
+        r = self.event_random_factor_range
+        if r <= 0.0:
+            return 1.0
+        return 1.0 + self._rng.uniform(-r, r)
 
     def run(
         self,
@@ -258,6 +280,7 @@ class EventGenerator:
     ) -> ComputeEvent:
         """Fixed wait for launching a kernel on a device (no FLOPs/bytes)."""
 
+        latency = latency * self._time_scale()
         return ComputeEvent(
             group_index=group_index,
             phase="kernel_launch",
@@ -313,6 +336,7 @@ class EventGenerator:
                 ),
                 default=0.0,
             )
+        duration = duration * self._time_scale()
         return ComputeEvent(
             group_index=group_index,
             phase="transfer",
@@ -346,8 +370,9 @@ class EventGenerator:
         total_flops = sum(s.flops for s in shards) / divide
         total_bytes = sum(s.bytes_read for s in shards) / divide
 
-        compute_time = total_flops / device.effective_flops(dtype_bytes)
-        bandwidth_time = total_bytes / device.bandwidth_bytes_per_s
+        scale = self._time_scale()
+        compute_time = total_flops / device.effective_flops(dtype_bytes) * scale
+        bandwidth_time = total_bytes / device.bandwidth_bytes_per_s * scale
         duration = max(compute_time, bandwidth_time)
 
         return ComputeEvent(

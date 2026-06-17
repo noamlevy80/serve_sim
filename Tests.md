@@ -67,8 +67,15 @@ Network tests auto-skip if the dataset API is unreachable.
   batch through the `IncrementalArbiter`; a single request reproduces its solo
   makespan, batching shares the device, and concurrency/window limits gate
   dispatch as configured. 18 offline tests.
+- **Stage 15 — Event-time randomization:** the event generator multiplies each
+  event's roofline time by `1 + U(-range, range)` (one seedable draw per event)
+  to model system jitter; the perturbation rides on the times/rates, not the
+  FLOPs/bytes, so total work is conserved, the long-run mean is the unperturbed
+  duration, and `range == 0` (the default) is byte-identical to the pure
+  roofline. Wired through `StrategyConfig` (`event_random_factor_range`,
+  `random_seed`). 15 offline tests.
 
-Totals: 487 tests (482 offline + 5 live).
+Totals: 502 tests (497 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -603,5 +610,43 @@ tests in [Tests/test_orchestrator.py](Tests/test_orchestrator.py).
 - **Construction & validation:** `Request.from_workload` builds a request from a
   workload turn, and invalid strategy/request parameters or an engine that needs
   more devices than the system has are rejected; an empty run is empty.
+
+
+## Stage 15: Event-time randomization
+
+Real systems jitter, so the event generator optionally perturbs each event's
+calculated time by a per-event factor drawn from `U(-range, range)`: the roofline
+`compute_time`, `bandwidth_time` and `duration` (and a kernel-launch latency, and
+a transfer time) are multiplied by `1 + factor`, while the event's FLOPs and
+bytes are left untouched. Scaling the *times* rather than the work means total
+work is conserved, the effective rate the arbiter divides under contention
+carries the perturbation, and the long-run mean duration is the unperturbed
+value. The draw comes from a caller-supplied `random.Random`, so a fixed
+`random_seed` makes a whole run reproducible; the knobs are surfaced on
+`StrategyConfig` as `event_random_factor_range` and `random_seed`. With the
+default `range == 0` no draw is taken and the path is byte-identical to the pure
+roofline, leaving every other test unaffected. 15 offline tests in
+[Tests/test_event_randomization.py](Tests/test_event_randomization.py).
+
+- **Disabled by default:** `range == 0` reproduces the roofline event-for-event
+  (durations, compute and bandwidth times all identical), even when an rng is
+  supplied.
+- **Bounds & shape:** perturbed durations stay within `[base*(1-range),
+  base*(1+range)]`, at least some actually move, and `duration ==
+  max(compute_time, bandwidth_time)` still holds because both times share the
+  one per-event factor.
+- **Conservation & mean:** total FLOPs/bytes are unchanged, and over thousands
+  of draws the mean perturbed duration sits within a few standard errors of the
+  base (symmetric uniform averages to one).
+- **Reproducibility:** the same seed yields identical durations; different seeds
+  differ.
+- **All event kinds:** kernel-launch latencies and two-tier MoE expert-transfer
+  events are perturbed too (transfer bytes conserved, time within band).
+- **Arbiter & simulator integration:** a single randomized job retimed by the
+  `IncrementalArbiter` keeps its perturbed makespan; a `Simulator` run is
+  unperturbed by default, reproducible under a fixed `random_seed`, and changes
+  with the seed.
+- **Validation:** an `event_random_factor_range` outside `[0, 1)` is rejected by
+  both `EventGenerator` and `StrategyConfig`.
 
 

@@ -27,6 +27,7 @@ deadline or in-flight completion -- never a fixed step.
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 
 from .arbiter import IncrementalArbiter
@@ -50,6 +51,10 @@ class StrategyConfig:
         pipeline_parallel: Fixed pipeline-parallel degree of the engine.
         expert_parallel: Fixed expert-parallel degree of the engine.
         prefill_chunk_size: Optional prefill chunking applied to every batch.
+        event_random_factor_range: Per-event time is multiplied by
+            ``1 + U(-range, range)`` to model system randomness; ``0`` disables it.
+        random_seed: Seed for the run's randomness (event-time perturbation);
+            ``None`` draws a non-deterministic seed.
     """
 
     max_batch_size: int = 1
@@ -58,6 +63,8 @@ class StrategyConfig:
     pipeline_parallel: int = 1
     expert_parallel: int = 1
     prefill_chunk_size: int | None = None
+    event_random_factor_range: float = 0.0
+    random_seed: int | None = None
 
     def __post_init__(self) -> None:
         if self.max_batch_size < 1:
@@ -70,6 +77,8 @@ class StrategyConfig:
             raise ValueError("parallelism degrees must be >= 1")
         if self.prefill_chunk_size is not None and self.prefill_chunk_size < 1:
             raise ValueError("prefill_chunk_size must be >= 1")
+        if not 0.0 <= self.event_random_factor_range < 1.0:
+            raise ValueError("event_random_factor_range must be in [0, 1)")
 
 
 @dataclass(frozen=True)
@@ -200,6 +209,7 @@ class Simulator:
                 f"{degree} (pipeline_parallel x expert_parallel)"
             )
         self._engine_devices = devices[:degree]
+        self._rng = random.Random(self.strategy.random_seed)
 
     def run(self, requests: list[Request]) -> RunResult:
         """Event-driven serving loop over ``requests``; returns per-request timing."""
@@ -359,5 +369,7 @@ class Simulator:
             self._engine_devices,
             pipeline_parallel=self.strategy.pipeline_parallel,
             expert_parallel=self.strategy.expert_parallel,
+            event_random_factor_range=self.strategy.event_random_factor_range,
+            rng=self._rng,
         )
         return arbiter.admit(generator, shards)

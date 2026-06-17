@@ -106,6 +106,7 @@ To allow for sharing KV cache across different sequences, KV cache trackers may 
 The model weights tracker, like the KV cache tracker, divides the model weights into all it's different layers, and for each layers the different expert FFNs, attention or MAMBA matrices, etc. Each of these is a weight shard.
 As in the KV cache tracker, each weight shard may be stored on one or more devices.
 Unlike the KV cache tracker, weight shards cannot have a state of "not generated" yet. They typically start off on an NVM memory device.
+A batch can only run on a device set whose memory holds the relevant weight shards; serving several models concurrently means their weights are resident on different device sets at once, multiplying the weight memory footprint.
 
 ## Compute Devices
 A compute device is a GPU or other inference oriented device.
@@ -227,6 +228,9 @@ An event generator shall support rescaling of events in case the associated reso
 For example: a memory device that started with supporting a single compute event, which in a time step concurrent to the event needed to support another compute event, will need to be rescaled with half the bandwidth, but prorated for the time already passed.
 Generally speaking, we assume compute and bandwidth is divided equally when devices support more than one workload.
 
+### Event time randomization
+In order to model system randomness, the total event time is scaled by a random scaling factor, such that event_time = calculated_time*(1+factor), where factor is distrubted uniformly between (-event_random_factor_range:event_random_factor_range)
+
 # Simluation Flow
 Simulation is performed by running a test suite through a system.
 The simulator class is responsible for making the technical connections between all the different parts of the simulator.
@@ -237,25 +241,55 @@ This includes:
 3. Keeping track of device usage and making sure event generators are correctly aware of one another in order to rescale events.
 4. Executing the orchestrator decision with regards to placement of batches onto hardware, and movement of batches and KV cache between devices.
 
+Multiple batches may be in flight at the same time. Each batch is placed on a *device set* (its engine slot); the simulator tracks which set each in-flight batch occupies. Batches on disjoint device sets run independently, while batches whose sets overlap contend and are rescaled by the arbiter. Because different models cannot be batched together, distinct models always run as separate in-flight batches (on separate device sets, or time-sharing the same one).
+
 The simulation is strictly event driven. The simulator maintains a time-ordered event queue and advances to the next event; there is no fixed time step. The order in which orchestration acts between events derives logically from the events themselves (an arrival, an event completion, or a window timeout is itself an event that may trigger an orchestration decision).
 
 Because event generators come and go and the set of co-running events on a resource changes over time, the rescaling arbiter is not run once over a fixed set of jobs. Instead the simulator keeps the active events and re-solves the equal-share rescaling incrementally: whenever an event starts or finishes (or a generator is added or removed), the rates of all in-flight events sharing the affected resources are recomputed and prorated for the time already elapsed. The existing fluid (processor-sharing) arbiter logic is reused, but driven incrementally from the event queue rather than as a single batch solve.
 
 ## Batching
-Incoming sequences that are ready to run are collected into a concurrency window before dispatch. A batch is dispatched when either the batch fills up (reaches the configured maximum batch size) or the window time elapses, whichever comes first. The window is therefore defined by two knobs: a maximum batch size and a maximum window duration.
+Incoming sequences that are ready to run are collected into a concurrency window before dispatch. Only sequences mapped to the same model can share a batch. A batch is dispatched when either the batch fills up (reaches the configured maximum batch size) or the window time elapses, whichever comes first. The window is therefore defined by two knobs: a maximum batch size and a maximum window duration. These knobs are per batch, not a datacenter-wide limit; several batches (e.g. one per model) may be in flight concurrently.
 
 ## Orchestration
 Orchestration will generally be eager, mapping sequences to the devices which it expects will best execute them according to the information it has at the point in time where the decision is made.
+
+For each batch the orchestrator selects a *device set* (engine slot), not just a parallelism degree. A batch may only be placed where its model's weights are already resident, or can be made resident by a weight-load transfer first; serving several models concurrently therefore replicates their non-expert weights across device sets, which bounds how many engines fit. Different models, since they cannot share a batch, occupy distinct device sets or time-share one.
 
 The orchestration eagerly decides on prefill-decode dissagregation if enabled.
 The orchestration eagerly decides on parallelism using a high-level roofline estimate: for the candidate device sets and parallelism degrees available at the time of issue, it estimates the batch's compute-bound and bandwidth-bound time (as the event generator would) and picks the option with the best expected outcome, subject to the device and memory-capacity constraints it knows about.
 
 ### Strategy
 The orchestration strategy is configured by a few knobs:
-- Target concurrency: how many sequences the simulator tries to keep in flight.
-- Max batch size and max window duration: the batching window (see above).
+- Target concurrency: how many sequences the simulator tries to keep in flight, counted datacenter-wide across all in-flight batches.
+- Max batch size and max window duration: the batching window (see above), applied per batch.
 - Allow PDD: whether prefill-decode disaggregation may be used.
 - Max parallelism degrees: caps on pipeline and expert parallelism the roofline search may choose from.
+
+## List of simulation parameters (to appear in config.JSON)
+- max_concurrency (default 8)
+    max batch formed by orchestration (max batch size)
+- target_concurrency (default null)
+    how many sequences the simulator tries to keep in flight; null means unbounded (admit up to max_concurrency)
+- concurrency_window_sec (default 1)
+    the max time the simulator waits incoming sequences before issuing a batch
+- allow_pdd (default true)
+- max_parallelism (default 32)
+    The maximum parallelism rank the orchestrator should explore
+- prefill_chunk_size (default null)
+    If set, prefill is split into chunks of this many tokens; null means prefill the whole prompt in one shard
+
+- expert_persistance_mean (default 16)    
+- expert_persistance_var (default 4)
+    The mean and variance of the number of tokens an expert persists (before it is replaced by another expert)
+- event_random_factor_range (default 0.05)
+    The maximum deviation factor of calculated event time due to randomization
+- tool_calling_speedup (default 1)
+    Global multiplier applied to every tool-call wait time from the dataset (e.g. 2 makes tool calls return twice as fast)
+- random_seed (default null)
+    Seed for all simulation randomness (expert persistence, suite arrivals, event-time randomization); null draws a non-deterministic seed. A fixed seed makes a run fully reproducible.
+
+Note: `kernel_launch_latency` is a per-device property defined in the device/system architecture JSON, not a global config parameter; likewise the scale-up / CXL bandwidth and latency are system-architecture parameters.
+
 
 # Outputs and Visualization
 The simulator produces a run report aggregated over the test suite. At minimum:
