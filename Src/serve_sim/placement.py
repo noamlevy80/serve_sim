@@ -61,8 +61,16 @@ class EnginePool:
 
     The pool splits ``compute_devices`` into ``len(devices) // degree`` contiguous
     slots of ``degree`` devices each; any remainder devices are left unused. Each
-    slot is either free or busy, and remembers the last model placed on it so a
-    re-acquisition for the same model avoids a weight reload.
+    slot carries an occupancy *load* (how many batches currently run on it) and
+    remembers the model last placed on it so a re-placement for the same model
+    avoids a weight reload.
+
+    Two allocation styles are offered. :meth:`acquire` is *exclusive*: it only
+    takes a free (load-0) slot and returns ``None`` when every slot is busy.
+    :meth:`place` is *time-sharing*: it prefers a free slot but, when none is
+    free, overlays the batch onto the least-loaded slot (the resource arbiter
+    then shares that device set between the co-located batches). Both bump the
+    slot's load by one; :meth:`release` drops it by one.
     """
 
     def __init__(self, compute_devices: list[ComputeDevice], degree: int = 1) -> None:
@@ -80,7 +88,7 @@ class EnginePool:
             EngineSlot(i, tuple(compute_devices[i * degree:(i + 1) * degree]))
             for i in range(num_slots)
         ]
-        self._busy: set[int] = set()
+        self._load: list[int] = [0] * num_slots
         self._resident: dict[int, object] = {}
 
     # --- introspection ------------------------------------------------------
@@ -105,18 +113,24 @@ class EnginePool:
 
     @property
     def free_count(self) -> int:
-        return self.num_slots - len(self._busy)
+        return sum(1 for load in self._load if load == 0)
 
     @property
     def busy_count(self) -> int:
-        return len(self._busy)
+        return sum(1 for load in self._load if load > 0)
 
     def is_busy(self, slot: EngineSlot) -> bool:
         self._check_owned(slot)
-        return slot.index in self._busy
+        return self._load[slot.index] > 0
 
     def is_free(self, slot: EngineSlot) -> bool:
         return not self.is_busy(slot)
+
+    def slot_load(self, slot: EngineSlot) -> int:
+        """Number of batches currently placed on ``slot``."""
+
+        self._check_owned(slot)
+        return self._load[slot.index]
 
     def resident_model(self, slot: EngineSlot) -> object | None:
         """The model whose weights currently sit on ``slot`` (or ``None``)."""
@@ -127,7 +141,7 @@ class EnginePool:
     # --- allocation ---------------------------------------------------------
 
     def acquire(self, model: object | None = None) -> Placement | None:
-        """Reserve a free slot for ``model``; ``None`` if every slot is busy.
+        """Exclusively reserve a free slot for ``model``; ``None`` if all busy.
 
         When ``model`` is given, a free slot that already hosts that model is
         preferred (so its weights need not be reloaded); otherwise the
@@ -135,31 +149,51 @@ class EnginePool:
         Passing ``model=None`` reserves a slot without touching residency.
         """
 
-        free = [s for s in self._slots if s.index not in self._busy]
+        free = [s for s in self._slots if self._load[s.index] == 0]
         if not free:
             return None
+        return self._place_on(self._pick(free, model), model)
 
-        slot = None
+    def place(self, model: object | None = None) -> Placement:
+        """Place ``model`` on a slot, time-sharing when none is free.
+
+        Prefers a free slot (with the same model-affinity rule as
+        :meth:`acquire`); when every slot is busy, overlays onto the least-loaded
+        slot so the batch co-runs with whatever is already there. Always returns
+        a :class:`Placement`.
+        """
+
+        min_load = min(self._load)
+        candidates = [s for s in self._slots if self._load[s.index] == min_load]
+        return self._place_on(self._pick(candidates, model), model)
+
+    def release(self, slot: EngineSlot) -> None:
+        """Drop one batch from a slot (its resident model is kept)."""
+
+        self._check_owned(slot)
+        if self._load[slot.index] == 0:
+            raise ValueError(f"slot {slot.index} is not currently busy")
+        self._load[slot.index] -= 1
+
+    # --- internal -----------------------------------------------------------
+
+    def _pick(self, candidates: list[EngineSlot], model: object | None) -> EngineSlot:
+        """Choose among equal-priority ``candidates``, preferring model affinity."""
+
         if model is not None:
-            slot = next((s for s in free if self._resident.get(s.index) is model), None)
-        if slot is None:
-            slot = free[0]
+            resident = next(
+                (s for s in candidates if self._resident.get(s.index) is model), None
+            )
+            if resident is not None:
+                return resident
+        return candidates[0]
 
+    def _place_on(self, slot: EngineSlot, model: object | None) -> Placement:
         needs_load = model is not None and self._resident.get(slot.index) is not model
         if model is not None:
             self._resident[slot.index] = model
-        self._busy.add(slot.index)
+        self._load[slot.index] += 1
         return Placement(slot=slot, needs_weight_load=needs_load)
-
-    def release(self, slot: EngineSlot) -> None:
-        """Return a busy slot to the pool (its resident model is kept)."""
-
-        self._check_owned(slot)
-        if slot.index not in self._busy:
-            raise ValueError(f"slot {slot.index} is not currently busy")
-        self._busy.discard(slot.index)
-
-    # --- internal -----------------------------------------------------------
 
     def _check_owned(self, slot: EngineSlot) -> None:
         if not (0 <= slot.index < len(self._slots)) or self._slots[slot.index] is not slot:

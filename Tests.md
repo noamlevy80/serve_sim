@@ -81,8 +81,31 @@ Network tests auto-skip if the dataset API is unreachable.
   batches independent in the arbiter), and per-slot weight residency lets the
   pool prefer reusing a slot that already hosts a model and flag when a reload
   is needed. 22 offline tests.
+- **Stage 17 — Engine slots in the orchestrator:** the simulator now places each
+  batch on an engine slot from the pool instead of a fixed device slice, so
+  concurrent batches land on disjoint slots and run independently when slots are
+  free, and time-share the least-loaded slot when every slot is busy; slots are
+  released for reuse on completion. 5 offline tests.
+- **Stage 18 — Parallelism search:** with `auto_parallelism` set, the engine size
+  `pipeline_parallel x expert_parallel` is treated as a fixed device budget and a
+  `ParallelismPlanner` factors it, per batch, into the fastest `(pp, ep)` that
+  fits device memory. A single batch gets no pipeline overlap, so the lightweight
+  roofline estimate `max(compute, bandwidth) / ep` favours expert parallelism;
+  memory uses *pure expert parallelism* (`ep` replicates attention/dense/shared/
+  LM-head weights and KV but shards routed experts, `pp` shards layers), so the
+  search reaches for more pipeline stages only when a batch will not otherwise
+  fit. Default (`auto_parallelism` off) uses fixed `pp`/`ep` verbatim. 23 offline
+  tests (planner) + 5 offline (orchestrator integration).
+- **Stage 19 — Prefill/decode disaggregation (PDD):** with `allow_pdd` set the
+  engine slots are split into a prefill pool and a decode pool over disjoint
+  devices (partition point set by `prefill_engine_fraction`). A request is
+  prefilled on the prefill pool; on completion its KV cache is transferred (a
+  modeled link-bandwidth delay) to the decode pool, where it is decoded. Prefill
+  and decode batch independently; `target_concurrency` counts a sequence as in
+  flight from prefill dispatch until decode completion. 11 offline tests
+  (primitives) + 9 offline (orchestrator integration).
 
-Totals: 524 tests (519 offline + 5 live).
+Totals: 577 tests (572 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -687,4 +710,122 @@ offline tests in [Tests/test_placement.py](Tests/test_placement.py).
 - **Guard rails:** releasing a free slot, double-releasing, or passing a slot
   from another pool all raise.
 
+## Stage 17: Engine slots in the orchestrator
+
+The orchestrator no longer pins every batch to the same fixed device slice;
+instead it draws an engine slot from the pool for each batch. When slots are
+free, concurrent batches land on disjoint device sets and run independently (no
+artificial contention); when every slot is busy, new batches time-share the
+least-loaded slot and the arbiter shares that device set between them. Slots are
+released back to the pool as jobs complete so they can be reused. 5 offline tests
+in [Tests/test_orchestrator.py](Tests/test_orchestrator.py).
+
+- **Disjoint slots, no contention:** on a two-slot system, two concurrent
+  single-sequence batches each finish at the solo time rather than twice it.
+- **More batches than slots:** a third concurrent batch time-shares a slot, so
+  the makespan exceeds one solo run but stays within the contended bound.
+- **Single-device regression:** with one slot, two concurrent batches still
+  co-run and each finishes at twice the solo time, matching the pre-pool model.
+- **Slot reuse:** overlapping batches funneled through a two-slot system all
+  complete, proving slots are released and re-used rather than leaking.
+- **Different models stay disjoint:** two models that cannot batch together run
+  concurrently on separate slots, each at solo speed.
+
+
+## Stage 18: Parallelism search
+
+An engine slot has a fixed device count -- the parallelism degree
+`pipeline_parallel x expert_parallel`. With `auto_parallelism` enabled, the
+orchestrator stops taking those degrees verbatim and instead, for each batch,
+asks a `ParallelismPlanner` how best to *wire* that same device budget: it factors
+the degree into the `(pp, ep)` arrangements (with `pp` dividing the layer count),
+estimates each option's roofline time, and picks the fastest one whose per-device
+footprint fits memory. Two model assumptions make the choice meaningful:
+
+- **Speed.** A single batch has no pipeline overlap, so its stages run
+  sequentially and `pp` does not shorten the critical path; expert parallelism
+  splits each stage across its ranks, so the batch runs ~`ep` times faster. The
+  lightweight estimate is `max(compute_bound, bandwidth_bound) / ep`.
+- **Memory (pure expert parallelism).** `pp` shards the layers across stages, so
+  each device holds `num_layers / pp` layers' weights and KV. `ep` shards *only
+  the routed experts* (`e % ep`); attention, dense, shared-expert, LM-head
+  weights and the KV cache are replicated across the `ep` ranks. So `pp` -- not
+  `ep` -- relieves dense-weight/KV pressure, and the search reaches for more
+  pipeline stages when a batch would not otherwise fit.
+
+23 planner tests in [Tests/test_parallelism.py](Tests/test_parallelism.py) and 5
+integration tests in [Tests/test_orchestrator.py](Tests/test_orchestrator.py).
+
+- **Factorization enumeration:** the degree's `(pp, ep)` pairs are listed
+  fastest-first (descending `ep`), filtered to `pp` values that divide the layer
+  count; degree one yields the trivial pair; a non-positive degree raises.
+- **Footprint partition:** per-device peak bytes match an independent
+  re-derivation for dense and MoE models across arrangements; `ep` leaves a dense
+  footprint unchanged (replication) but shrinks an MoE footprint (expert
+  sharding); `pp` shrinks every footprint; more KV tokens grow it; a `pp` that
+  does not divide the layers raises.
+- **Roofline estimate:** the time scales as `1 / ep`, takes the max of the
+  compute- and bandwidth-bound terms, and honours the dtype compute scale.
+- **Planning:** ample memory picks the maximum `ep` (fastest); a tightened
+  capacity forces a larger `pp`; a batch that cannot fit any arrangement raises;
+  the choice reports the chosen footprint and estimated time.
+- **Orchestrator integration:** with `auto_parallelism` on the simulator runs the
+  planner's chosen arrangement (matching a hand-built event schedule), the EP
+  choice beats the fixed pure-pipeline engine, memory pressure forces the
+  pipeline split, an unplaceable batch raises, and with the flag off the fixed
+  `pp`/`ep` are used unchanged.
+
+## Stage 19: Prefill/decode disaggregation (PDD)
+
+Prefill (the prompt forward pass) is compute-bound while decode (token-by-token
+generation) is bandwidth-bound, so running them on the same engine makes them
+contend for the wrong resource. With `allow_pdd` enabled the orchestrator splits
+the engine slots into two disjoint pools -- a *prefill pool* and a *decode pool*
+-- with the partition point set by `prefill_engine_fraction` (a fixed knob now;
+dynamic repartitioning is future work). A request flows through a two-phase
+pipeline:
+
+1. **Prefill** on the prefill pool, producing the prompt's KV cache.
+2. **KV transfer** -- one modeled delay of the prompt's KV bytes over the link
+   between the prefill and decode engines' memories (derived from link bandwidth
+   and latency; transfer contention is not modeled).
+3. **Decode** on the decode pool, starting only after the transfer completes.
+
+Prefill and decode batch independently, each with its own window/fill policy.
+`target_concurrency` counts a sequence as in flight from prefill dispatch until
+decode completion, so it caps total work across both phases; decode batches are
+never concurrency-gated (their sequences were already counted at prefill), which
+keeps the pipeline from deadlocking.
+
+The standalone primitives live in [Src/serve_sim/pdd.py](Src/serve_sim/pdd.py):
+`split_work` partitions a sequence into prefill-only and decode-only work,
+`context_kv_bytes` sizes a prompt's KV cache, and `kv_transfer_duration` times the
+handoff over the inter-engine link.
+
+11 primitive tests in [Tests/test_pdd.py](Tests/test_pdd.py) and 9 integration
+tests in [Tests/test_orchestrator.py](Tests/test_orchestrator.py).
+
+- **Work split:** `split_work` partitions a sequence into a prefill phase
+  (cached + new prompt tokens, no decode) and a decode phase (full prompt as
+  context, the output tokens as decode); the base context matches the prompt; a
+  zero cache and an over-large cache are handled/rejected.
+- **KV sizing:** `context_kv_bytes` sums the per-layer KV bytes per token over the
+  layered model and scales linearly with context length; negatives raise.
+- **Transfer timing:** `kv_transfer_duration` uses the right link for
+  intra-package, intra-node (CXL) and cross-node (scale-up) handoffs and matches
+  the raw transfer-duration helper.
+- **Pool split:** the prefill and decode pools cover disjoint device sets whose
+  union is the whole system, and `prefill_engine_fraction` controls how many
+  slots fall on each side; PDD on a system with fewer than two slots raises.
+- **Pipeline timing:** a single request's completion equals
+  `prefill + transfer + decode` (each phase timed on its own pool's device), and
+  an arrival offset shifts the whole pipeline.
+- **Parallel pipelining:** with two prefill and two decode slots, two requests run
+  their pipelines fully in parallel, so the makespan is a single pipeline rather
+  than two.
+- **Concurrency across phases:** `target_concurrency=1` keeps one sequence in
+  flight end-to-end, so the second request cannot start prefill until the first
+  has finished decoding.
+- **Flag off:** with `allow_pdd` off the simulator runs the original single-phase
+  loop unchanged.
 

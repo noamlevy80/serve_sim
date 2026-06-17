@@ -46,6 +46,13 @@ from .transfer import (
 )
 from .arbiter import ArbiterResult, IncrementalArbiter, ResourceArbiter
 from .placement import EnginePool, EngineSlot, Placement
+from .parallelism import ParallelismChoice, ParallelismPlanner
+from .pdd import (
+    context_kv_bytes,
+    kv_bytes_per_token,
+    kv_transfer_duration,
+    split_work,
+)
 from .orchestrator import (
     Request,
     RequestRecord,
@@ -130,6 +137,12 @@ __all__ = [
     "EnginePool",
     "EngineSlot",
     "Placement",
+    "ParallelismChoice",
+    "ParallelismPlanner",
+    "context_kv_bytes",
+    "kv_bytes_per_token",
+    "kv_transfer_duration",
+    "split_work",
     "Request",
     "RequestRecord",
     "RunResult",
