@@ -45,6 +45,7 @@ from .transfer import (
     transfer_duration,
 )
 from .arbiter import ArbiterResult, IncrementalArbiter, ResourceArbiter
+from .placement import EnginePool, EngineSlot, Placement
 from .orchestrator import (
     Request,
     RequestRecord,
@@ -126,6 +127,9 @@ __all__ = [
     "ArbiterResult",
     "ResourceArbiter",
     "IncrementalArbiter",
+    "EnginePool",
+    "EngineSlot",
+    "Placement",
     "Request",
     "RequestRecord",
     "RunResult",

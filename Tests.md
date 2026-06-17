@@ -74,8 +74,15 @@ Network tests auto-skip if the dataset API is unreachable.
   duration, and `range == 0` (the default) is byte-identical to the pure
   roofline. Wired through `StrategyConfig` (`event_random_factor_range`,
   `random_seed`). 15 offline tests.
+- **Stage 16 — Engine-slot placement:** an `EnginePool` carves the system's
+  compute devices into fixed device sets (engine slots) of the parallelism
+  degree and tracks which are busy, so several batches can be in flight on
+  disjoint slots at once; slots preserve device identity (keeping concurrent
+  batches independent in the arbiter), and per-slot weight residency lets the
+  pool prefer reusing a slot that already hosts a model and flag when a reload
+  is needed. 22 offline tests.
 
-Totals: 502 tests (497 offline + 5 live).
+Totals: 524 tests (519 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -648,5 +655,36 @@ roofline, leaving every other test unaffected. 15 offline tests in
   with the seed.
 - **Validation:** an `event_random_factor_range` outside `[0, 1)` is rejected by
   both `EventGenerator` and `StrategyConfig`.
+
+
+## Stage 16: Engine-slot placement
+
+A batch runs on a *device set* (an engine slot) sized to the parallelism degree,
+and the datacenter holds several such slots, so multiple batches can be in flight
+at once. An `EnginePool` is the bookkeeping for that placement, independent of the
+orchestrator: it partitions the compute devices into `len(devices) // degree`
+contiguous slots, hands out free slots and takes them back, and -- because
+different models cannot share a batch -- tracks which model's weights are
+resident on each slot so re-acquiring a slot for the same model avoids a reload.
+Slots carry the actual device instances, so the slices handed to concurrent
+batches are disjoint by identity and the arbiter never makes them contend. 22
+offline tests in [Tests/test_placement.py](Tests/test_placement.py).
+
+- **Partition geometry:** degree 1 gives one slot per device; higher degrees
+  group contiguous devices; remainder devices are left unused; slices preserve
+  device identity.
+- **Validation:** a degree below one, empty devices, or too few devices to form
+  a single slot are rejected.
+- **Allocation bookkeeping:** acquiring marks the lowest-index free slot busy and
+  decrements the free count, releasing returns it, a full pool yields `None`, and
+  a released slot can be re-acquired.
+- **Disjoint sets:** two concurrently held slots share no device by identity.
+- **Model affinity:** the first acquire for a model flags a weight load and
+  records residency; re-acquiring the same model reuses its slot with no load;
+  acquiring prefers a free slot already hosting the model over a lower-index one;
+  reusing a slot for a different model flags a load; acquiring without a model
+  leaves residency untracked; different models occupy distinct, disjoint slots.
+- **Guard rails:** releasing a free slot, double-releasing, or passing a slot
+  from another pool all raise.
 
 
