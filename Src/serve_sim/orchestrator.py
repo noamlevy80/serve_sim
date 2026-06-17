@@ -28,7 +28,9 @@ deadline or in-flight completion -- never a fixed step.
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 from .arbiter import IncrementalArbiter
 from .events import EventGenerator
@@ -248,6 +250,24 @@ class JobRecord:
     per_device_bytes: float  # reserved weights + KV per device (0 if unknown)
 
 
+@dataclass(frozen=True)
+class RunProgress:
+    """A progress update emitted as a run retires completed sequences.
+
+    ``sim_time`` is the simulation clock at the moment of the update; ``wall_time``
+    is the real time elapsed since the run started.
+    """
+
+    completed: int
+    total: int
+    sim_time: float
+    wall_time: float
+
+
+# Called with a :class:`RunProgress` whenever the completed-sequence count grows.
+ProgressCallback = Callable[["RunProgress"], None]
+
+
 @dataclass
 class RunResult:
     """Minimal run state: per-request records and the overall makespan.
@@ -327,11 +347,17 @@ class Simulator:
             self._planners[key] = planner
         return planner
 
-    def run(self, requests: list[Request]) -> RunResult:
-        """Event-driven serving loop over ``requests``; returns per-request timing."""
+    def run(
+        self, requests: list[Request], *, progress: ProgressCallback | None = None
+    ) -> RunResult:
+        """Event-driven serving loop over ``requests``; returns per-request timing.
+
+        If ``progress`` is given it is called with a :class:`RunProgress` each time
+        the run retires one or more sequences (and once when it finishes).
+        """
 
         if self.strategy.allow_pdd:
-            return self._run_pdd(requests)
+            return self._run_pdd(requests, progress=progress)
 
         strategy = self.strategy
         arrivals = sorted(requests, key=lambda r: r.arrival_time)
@@ -342,6 +368,14 @@ class Simulator:
         arbiter = IncrementalArbiter()
         in_flight = 0
         batch_index = 0
+        total = len(requests)
+        start_wall = time.perf_counter()
+
+        def report(now: float) -> None:
+            if progress is not None:
+                progress(RunProgress(len(result.records), total, now,
+                                     time.perf_counter() - start_wall))
+
         # job_index -> (requests, dispatch_time, batch_index, slot)
         jobs: dict[int, tuple[list[Request], float, int, EngineSlot]] = {}
         # job_index -> (job_phase, requests, slot, batch_index, pp, ep)
@@ -382,6 +416,7 @@ class Simulator:
                 arbiter.advance_to(now)
 
             # 1) Retire any jobs that have finished by ``now``.
+            completed_before = len(result.records)
             for job_index, (reqs, dispatch_time, b_index, slot) in jobs.items():
                 if job_index in reported or not arbiter.job_is_done(job_index):
                     continue
@@ -401,6 +436,8 @@ class Simulator:
                             batch_index=b_index,
                         )
                     )
+            if len(result.records) != completed_before:
+                report(now)
 
             # 2) Admit arrivals that have occurred by ``now``.
             while arrival_pos < len(arrivals) and arrivals[arrival_pos].arrival_time <= now:
@@ -448,7 +485,9 @@ class Simulator:
         self._collect_outputs(result, arbiter, job_meta)
         return result
 
-    def _run_pdd(self, requests: list[Request]) -> RunResult:
+    def _run_pdd(
+        self, requests: list[Request], *, progress: ProgressCallback | None = None
+    ) -> RunResult:
         """Two-phase PDD loop: prefill pool -> KV transfer -> decode pool.
 
         A request is prefilled on the prefill pool; on completion its KV cache is
@@ -471,6 +510,9 @@ class Simulator:
         arbiter = IncrementalArbiter()
         in_flight = 0  # counted from prefill dispatch to decode completion
         batch_index = 0
+        total = len(requests)
+        start_wall = time.perf_counter()
+
         # job_index -> (kind, requests, slot, pool)
         jobs: dict[int, tuple[str, list[Request], EngineSlot, EnginePool]] = {}
         # job_index -> (job_phase, requests, slot, batch_index, pp, ep)
@@ -482,6 +524,11 @@ class Simulator:
 
         prefill_rep = self._prefill_pool.slots[0].devices[0]
         decode_rep = self._decode_pool.slots[0].devices[0]
+
+        def report(now: float) -> None:
+            if progress is not None:
+                progress(RunProgress(len(result.records), total, now,
+                                     time.perf_counter() - start_wall))
 
         def transfer_ready_time(req: Request, prefill_end: float) -> float:
             kv_bytes = context_kv_bytes(req.model, req.prompt_tokens)
@@ -524,6 +571,7 @@ class Simulator:
                 arbiter.advance_to(now)
 
             # 1) Retire finished jobs.
+            completed_before = len(result.records)
             for job_index, (kind, reqs, slot, pool) in jobs.items():
                 if job_index in reported or not arbiter.job_is_done(job_index):
                     continue
@@ -550,6 +598,8 @@ class Simulator:
                                 batch_index=b_index,
                             )
                         )
+            if len(result.records) != completed_before:
+                report(now)
 
             # 2) Admit arrivals into the prefill queue.
             while arrival_pos < len(arrivals) and arrivals[arrival_pos].arrival_time <= now:

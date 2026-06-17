@@ -67,8 +67,10 @@ from .pdd import (
 from .orchestrator import (
     EventRecord,
     JobRecord,
+    ProgressCallback,
     Request,
     RequestRecord,
+    RunProgress,
     RunResult,
     Simulator,
     StrategyConfig,
@@ -79,7 +81,7 @@ from .report import (
     summarize,
     write_outputs,
 )
-from .runner import run_from_config
+from .runner import ProgressReporter, run_from_config
 from .conversation import TOOL_CALL_PHASE, run_conversation
 from .system import (
     Network,
@@ -174,6 +176,8 @@ __all__ = [
     "JobRecord",
     "Request",
     "RequestRecord",
+    "RunProgress",
+    "ProgressCallback",
     "RunResult",
     "Simulator",
     "StrategyConfig",
@@ -182,6 +186,7 @@ __all__ = [
     "summarize",
     "write_outputs",
     "run_from_config",
+    "ProgressReporter",
     "TOOL_CALL_PHASE",
     "run_conversation",
     "Network",

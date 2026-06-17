@@ -316,6 +316,8 @@ Note: `kernel_launch_latency` is a per-device property defined in the device/sys
 ## Running
 The simulator is driven from a single config JSON: `python run_sim.py Configs/example.json` (or `python -m serve_sim Configs/example.json`). Paths inside the config are resolved relative to the config file. The runner loads the system and models, builds the suite (drawing workloads through the dataset loader), issues one request per conversation turn, runs the simulation, and writes all outputs under `<output_root>/<run_id>/`. `--output-root`, `--run-id` and `--tokenizer` override the config.
 
+As the run progresses it reports — refreshed in place — how many of the suite's sequences have completed, the elapsed simulation time and the elapsed wall-clock time. Pass `--quiet` to suppress these updates.
+
 ## Dataset cache
 To avoid hitting (and being rate-limited by) the live Hugging Face datasets-server on every run, the source dataset is cached locally under `./Dataset/`. Populate it once with `python cache_dataset.py` (use `--max-rows N` for a smaller, faster cache; `--overwrite` to refresh). The cache is a deterministic prefix of the split (`rows.jsonl` + `meta.json`), so running the same command on another machine reproduces the same cache; the data itself is gitignored. A run automatically prefers the cache when present and falls back to the live API otherwise.
 

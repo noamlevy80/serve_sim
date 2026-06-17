@@ -3,10 +3,10 @@
 Usage::
 
     python -m serve_sim CONFIG [--output-root DIR] [--run-id ID]
-                               [--tokenizer {tiktoken,whitespace}]
+                               [--tokenizer {tiktoken,whitespace}] [--quiet]
 
-Writes the raw outputs under ``<output-root>/<run-id>/`` and prints a short
-summary of the run.
+Writes the raw outputs under ``<output-root>/<run-id>/``, reports progress as
+sequences complete, and prints a short summary of the run.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import sys
 from typing import Sequence
 
 from .report import summarize
-from .runner import run_from_config
+from .runner import ProgressReporter, run_from_config
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -41,6 +41,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Override the tokenizer named in the config.",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress the per-progress sequence/time updates.",
+    )
     args = parser.parse_args(argv)
 
     tokenizer = None
@@ -49,11 +54,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         tokenizer = _make_tokenizer(args.tokenizer)
 
+    progress = None if args.quiet else ProgressReporter()
     result, out_dir = run_from_config(
         args.config,
         output_root=args.output_root,
         run_id=args.run_id,
         tokenizer=tokenizer,
+        progress=progress,
     )
 
     report = summarize(result)

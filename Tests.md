@@ -112,9 +112,9 @@ Network tests auto-skip if the dataset API is unreachable.
   `python -m serve_sim`) drives system, suite, models, simulation and outputs
   end-to-end under `<output_root>/<run_id>/`. 8 offline tests (event capture +
   report + output files) + 2 offline (end-to-end runner) + 7 offline (local
-  dataset cache).
+  dataset cache) + 6 offline (progress reporting).
 
-Totals: 594 tests (589 offline + 5 live).
+Totals: 600 tests (595 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -911,4 +911,24 @@ round-trip with the in-memory fake fetcher.
   completes.
 - **Missing cache:** reading a `LocalRowFetcher` with no cache raises a clear
   error pointing at the download script.
+
+### Progress reporting — [Tests/test_progress.py](Tests/test_progress.py)
+
+`Simulator.run(..., progress=cb)` calls back with a `RunProgress` (sequences
+completed out of the suite total, elapsed simulation time and elapsed wall-clock
+time) each time the run retires one or more sequences; the runner's
+`ProgressReporter` formats those updates for the CLI (refreshed in place, with
+`--quiet` to suppress). 6 offline tests.
+
+- **Per-completion updates:** the callback fires as sequences finish, the
+  completed count is monotonic and ends at the suite total (single pool).
+- **Consistent times:** reported simulation and wall-clock times are monotonic
+  and non-negative.
+- **PDD:** under disaggregation only finished sequences are counted (prefill
+  completions are not), ending at the total.
+- **No callback:** a run without a progress callback behaves unchanged.
+- **Reporter output:** the printer emits the count and both times and terminates
+  the line on the final (100%) update.
+- **Throttling:** intermediate updates within `min_interval` are suppressed, but
+  the first and the final updates always print.
 

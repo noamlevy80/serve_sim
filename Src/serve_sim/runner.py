@@ -15,9 +15,11 @@ are injectable so the wiring can be exercised offline.
 from __future__ import annotations
 
 import json
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, TextIO
 
 from .dataset import (
     DEFAULT_CACHE_DIR,
@@ -29,7 +31,14 @@ from .dataset import (
     WorkloadLoader,
 )
 from .model_config import load_model_config
-from .orchestrator import Request, RunResult, Simulator, StrategyConfig
+from .orchestrator import (
+    ProgressCallback,
+    Request,
+    RunProgress,
+    RunResult,
+    Simulator,
+    StrategyConfig,
+)
 from .report import write_outputs
 from .suite import Suite, build_suite_from_config
 from .system import load_system
@@ -39,6 +48,39 @@ from .tokenizer import TiktokenTokenizer, Tokenizer, WhitespaceTokenizer
 def _resolve(base: Path, value: str | Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else base / path
+
+
+class ProgressReporter:
+    """A :data:`ProgressCallback` that prints run progress to a stream.
+
+    Each update reports sequences completed out of the suite total, the elapsed
+    simulation time and the elapsed wall-clock time, refreshed in place. Updates
+    are throttled to at most one per ``min_interval`` seconds (the final, 100%,
+    update is always printed).
+    """
+
+    def __init__(self, stream: TextIO | None = None, min_interval: float = 0.25) -> None:
+        self._stream = stream if stream is not None else sys.stderr
+        self._min_interval = min_interval
+        self._last_wall = -1.0
+
+    def __call__(self, progress: RunProgress) -> None:
+        done = progress.completed >= progress.total
+        first = self._last_wall < 0.0
+        if not done and not first and (
+            progress.wall_time - self._last_wall < self._min_interval
+        ):
+            return
+        self._last_wall = progress.wall_time
+        line = (
+            f"  {progress.completed}/{progress.total} sequences  "
+            f"sim={progress.sim_time:8.3f}s  wall={progress.wall_time:7.3f}s"
+        )
+        self._stream.write("\r" + line.ljust(60))
+        if done:
+            self._stream.write("\n")
+        self._stream.flush()
+
 
 
 def _strategy_from_config(cfg: Mapping[str, Any]) -> StrategyConfig:
@@ -138,8 +180,13 @@ def run_from_config(
     run_id: str | None = None,
     loader: WorkloadLoader | None = None,
     tokenizer: Tokenizer | None = None,
+    progress: ProgressCallback | None = None,
 ) -> tuple[RunResult, Path]:
     """Run a simulation described by ``config_path`` and write its outputs.
+
+    If ``progress`` is given it is called with a
+    :class:`~serve_sim.orchestrator.RunProgress` as sequences complete (see
+    :class:`ProgressReporter` for a printing implementation).
 
     Returns the :class:`RunResult` and the output directory that was written.
     """
@@ -172,7 +219,7 @@ def run_from_config(
         cfg.get("max_turns_per_workload"),
     )
 
-    result = Simulator(system, strategy).run(requests)
+    result = Simulator(system, strategy).run(requests, progress=progress)
 
     run_id = run_id or cfg.get("run_id") or f"run-{datetime.now():%Y%m%d-%H%M%S}"
     root = Path(output_root or cfg.get("output_root", "Outputs"))
