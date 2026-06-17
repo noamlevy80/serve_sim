@@ -177,6 +177,7 @@ class RequestRecord:
     prompt_tokens: int
     output_tokens: int
     batch_index: int
+    first_token_time: float | None = None
 
     @property
     def queue_delay(self) -> float:
@@ -190,17 +191,77 @@ class RequestRecord:
 
         return self.completion_time - self.arrival_time
 
+    @property
+    def ttft(self) -> float | None:
+        """Time-to-first-token: arrival to the first decode step's completion."""
+
+        if self.first_token_time is None:
+            return None
+        return self.first_token_time - self.arrival_time
+
+    @property
+    def tpot(self) -> float | None:
+        """Time-per-output-token after the first (``None`` if not measurable)."""
+
+        if self.first_token_time is None or self.output_tokens <= 1:
+            return None
+        return (self.completion_time - self.first_token_time) / (self.output_tokens - 1)
+
+
+@dataclass(frozen=True)
+class EventRecord:
+    """One simulation event, captured for the raw event log.
+
+    Each event is recorded twice: once as generated in isolation (``rescaled``
+    false) and once after the arbiter re-times it for resource contention
+    (``rescaled`` true).
+    """
+
+    job_index: int
+    batch_index: int
+    job_phase: str  # "full", "prefill" or "decode" (the dispatch kind)
+    request_ids: tuple[int, ...]
+    group_index: int
+    phase: str  # event phase: prefill / decode / transfer / kernel_launch
+    device: str  # device name ("" for the no-device sentinel)
+    flops: float
+    bytes_read: float
+    compute_time: float
+    bandwidth_time: float
+    duration: float
+    start: float
+    end: float
+    rescaled: bool
+
+
+@dataclass(frozen=True)
+class JobRecord:
+    """Per-job placement and reserved-memory footprint, for occupancy reports."""
+
+    job_index: int
+    batch_index: int
+    job_phase: str
+    request_ids: tuple[int, ...]
+    devices: tuple[str, ...]
+    start: float
+    end: float
+    per_device_bytes: float  # reserved weights + KV per device (0 if unknown)
+
 
 @dataclass
 class RunResult:
     """Minimal run state: per-request records and the overall makespan.
 
-    The rich run report (TTFT/TPOT, utilization, occupancy) is a later
-    *outputs* stage; v0 exposes only the raw per-request timings.
+    Beyond the per-request timings, a run also captures the raw event log
+    (``events``, each event recorded before and after rescaling) and per-job
+    placement/footprint records (``jobs``) so the outputs layer can derive
+    utilization and memory-occupancy reports.
     """
 
     records: list[RequestRecord] = field(default_factory=list)
     num_batches: int = 0
+    events: list[EventRecord] = field(default_factory=list)
+    jobs: list[JobRecord] = field(default_factory=list)
 
     @property
     def makespan(self) -> float:
@@ -283,6 +344,8 @@ class Simulator:
         batch_index = 0
         # job_index -> (requests, dispatch_time, batch_index, slot)
         jobs: dict[int, tuple[list[Request], float, int, EngineSlot]] = {}
+        # job_index -> (job_phase, requests, slot, batch_index, pp, ep)
+        job_meta: dict[int, tuple[str, list[Request], EngineSlot, int, int, int]] = {}
         reported: set[int] = set()
         result = RunResult()
 
@@ -360,8 +423,9 @@ class Simulator:
                 if batch is None:
                     break  # concurrency full; wait for a completion
                 in_flight += len(batch)
-                job_index, slot = self._dispatch(arbiter, batch)
+                job_index, slot, pp, ep = self._dispatch(arbiter, batch)
                 jobs[job_index] = (batch, now, batch_index, slot)
+                job_meta[job_index] = ("full", batch, slot, batch_index, pp, ep)
                 batch_index += 1
                 progressed = True
 
@@ -381,6 +445,7 @@ class Simulator:
                 break
 
         result.num_batches = batch_index
+        self._collect_outputs(result, arbiter, job_meta)
         return result
 
     def _run_pdd(self, requests: list[Request]) -> RunResult:
@@ -408,6 +473,8 @@ class Simulator:
         batch_index = 0
         # job_index -> (kind, requests, slot, pool)
         jobs: dict[int, tuple[str, list[Request], EngineSlot, EnginePool]] = {}
+        # job_index -> (job_phase, requests, slot, batch_index, pp, ep)
+        job_meta: dict[int, tuple[str, list[Request], EngineSlot, int, int, int]] = {}
         reported: set[int] = set()
         # id(request) -> (prefill dispatch time, prefill batch index)
         meta: dict[int, tuple[float, int]] = {}
@@ -517,12 +584,13 @@ class Simulator:
                 if batch is None:
                     break  # concurrency full; wait for a decode completion
                 in_flight += len(batch)
-                job_index, slot = self._dispatch(
+                job_index, slot, pp, ep = self._dispatch(
                     arbiter, batch, pool=self._prefill_pool, phase="prefill"
                 )
                 for req in batch:
                     meta[id(req)] = (now, batch_index)
                 jobs[job_index] = ("prefill", batch, slot, self._prefill_pool)
+                job_meta[job_index] = ("prefill", batch, slot, batch_index, pp, ep)
                 batch_index += 1
                 progressed = True
             if not prefill_ready:
@@ -538,10 +606,11 @@ class Simulator:
                 if not (fill or decode_elapsed):
                     break
                 batch = self._take_decode_batch(decode_ready)
-                job_index, slot = self._dispatch(
+                job_index, slot, pp, ep = self._dispatch(
                     arbiter, batch, pool=self._decode_pool, phase="decode"
                 )
                 jobs[job_index] = ("decode", batch, slot, self._decode_pool)
+                job_meta[job_index] = ("decode", batch, slot, batch_index, pp, ep)
                 batch_index += 1
                 progressed = True
             if not decode_ready:
@@ -561,9 +630,98 @@ class Simulator:
                 break
 
         result.num_batches = batch_index
+        self._collect_outputs(result, arbiter, job_meta)
         return result
 
     # --- helpers ------------------------------------------------------------
+
+    def _collect_outputs(
+        self,
+        result: RunResult,
+        arbiter: IncrementalArbiter,
+        job_meta: dict[int, tuple[str, list[Request], EngineSlot, int, int, int]],
+    ) -> None:
+        """Attach the raw event log, per-job footprints and first-token times.
+
+        For every job the events are recorded twice -- as generated in isolation
+        and after the arbiter rescales them for contention -- and the first decode
+        step's completion (from the rescaled events) is the first-token time for
+        every request the job serves.
+        """
+
+        first_token: dict[int, float] = {}
+        for job_index, (job_phase, reqs, slot, b_index, pp, ep) in job_meta.items():
+            request_ids = tuple(req.request_id for req in reqs)
+            devices = slot.devices
+            device_names = tuple(d.name for d in devices)
+            original = arbiter.job_original_events(job_index)
+            rescaled = arbiter.job_rescaled_events(job_index)
+
+            for events, is_rescaled in ((original, False), (rescaled, True)):
+                for ev in events:
+                    if 0 <= ev.device_index < len(device_names):
+                        dev_name = device_names[ev.device_index]
+                    else:
+                        dev_name = ""
+                    result.events.append(
+                        EventRecord(
+                            job_index=job_index,
+                            batch_index=b_index,
+                            job_phase=job_phase,
+                            request_ids=request_ids,
+                            group_index=ev.group_index,
+                            phase=ev.phase,
+                            device=dev_name,
+                            flops=ev.flops,
+                            bytes_read=ev.bytes_read,
+                            compute_time=ev.compute_time,
+                            bandwidth_time=ev.bandwidth_time,
+                            duration=ev.duration,
+                            start=ev.start,
+                            end=ev.end,
+                            rescaled=is_rescaled,
+                        )
+                    )
+
+            # First-token time: completion of the earliest decode step.
+            decode_events = [e for e in rescaled if e.phase == "decode"]
+            if decode_events:
+                first_group = min(e.group_index for e in decode_events)
+                ft = max(e.end for e in decode_events if e.group_index == first_group)
+                for rid in request_ids:
+                    first_token[rid] = ft
+
+            start = min((e.start for e in rescaled), default=0.0)
+            end = max((e.end for e in rescaled), default=start)
+            kv_tokens = sum(req.prompt_tokens + req.output_tokens for req in reqs)
+            per_device_bytes = self._job_footprint(reqs[0].model, pp, ep, kv_tokens)
+            result.jobs.append(
+                JobRecord(
+                    job_index=job_index,
+                    batch_index=b_index,
+                    job_phase=job_phase,
+                    request_ids=request_ids,
+                    devices=device_names,
+                    start=start,
+                    end=end,
+                    per_device_bytes=per_device_bytes,
+                )
+            )
+
+        for record in result.records:
+            if record.request_id in first_token:
+                record.first_token_time = first_token[record.request_id]
+
+        result.events.sort(key=lambda e: (e.rescaled, e.start, e.job_index, e.group_index))
+        result.jobs.sort(key=lambda j: j.job_index)
+
+    def _job_footprint(self, model: object, pp: int, ep: int, kv_tokens: int) -> float:
+        """Reserved per-device bytes (weights + KV) for a job, or 0 if unknown."""
+
+        try:
+            return float(self._planner_for(model).footprint(pp, ep, kv_tokens))
+        except (ValueError, ZeroDivisionError):
+            return 0.0
 
     def _take_batch(self, ready: list[Request], in_flight: int) -> list[Request] | None:
         """Pull up to ``max_batch_size`` same-model requests, honoring concurrency.
@@ -623,14 +781,15 @@ class Simulator:
         *,
         pool: EnginePool | None = None,
         phase: str = "full",
-    ) -> tuple[int, EngineSlot]:
+    ) -> tuple[int, EngineSlot, int, int]:
         """Place a batch on an engine slot and admit its events to the arbiter.
 
         ``phase`` selects the work generated: ``"full"`` (prefill + decode in one
         job, the default), ``"prefill"`` (prompt forward pass only) or
         ``"decode"`` (generation from a fully-cached prompt). ``pool`` defaults to
         the single engine pool; PDD passes the prefill or decode pool. Returns the
-        arbiter job index and the slot the batch occupies (released on completion).
+        arbiter job index, the slot the batch occupies (released on completion),
+        and the ``(pipeline_parallel, expert_parallel)`` arrangement chosen.
         """
 
         model = batch[0].model
@@ -649,7 +808,7 @@ class Simulator:
             event_random_factor_range=self.strategy.event_random_factor_range,
             rng=self._rng,
         )
-        return arbiter.admit(generator, shards), slot
+        return arbiter.admit(generator, shards), slot, pp, ep
 
     @staticmethod
     def _phase_work(req: Request, phase: str) -> SequenceWork:

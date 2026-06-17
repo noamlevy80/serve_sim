@@ -489,3 +489,13 @@ class IncrementalArbiter:
                 schedule.events.append(ResourceArbiter._retime(task))
             schedules.append(schedule)
         return ArbiterResult(schedules)
+
+    def job_original_events(self, job_index: int) -> list[ComputeEvent]:
+        """The job's events as generated in isolation (before rescaling)."""
+
+        return [task.event for task in self._jobs[job_index]]
+
+    def job_rescaled_events(self, job_index: int) -> list[ComputeEvent]:
+        """The job's events re-timed for resource contention (after rescaling)."""
+
+        return [ResourceArbiter._retime(task) for task in self._jobs[job_index]]

@@ -104,8 +104,17 @@ Network tests auto-skip if the dataset API is unreachable.
   and decode batch independently; `target_concurrency` counts a sequence as in
   flight from prefill dispatch until decode completion. 11 offline tests
   (primitives) + 9 offline (orchestrator integration).
+- **Stage 20 — Outputs & CLI:** a run now captures the raw event log (each event
+  before and after rescaling), per-job footprints and per-request first-token
+  times, from which `serve_sim.report` derives the aggregate run report,
+  per-request latency/TTFT/TPOT, per-device utilization and a bucketed
+  memory/utilization timeline. A `config.json` runner (`run_sim.py` /
+  `python -m serve_sim`) drives system, suite, models, simulation and outputs
+  end-to-end under `<output_root>/<run_id>/`. 8 offline tests (event capture +
+  report + output files) + 2 offline (end-to-end runner) + 7 offline (local
+  dataset cache).
 
-Totals: 577 tests (572 offline + 5 live).
+Totals: 594 tests (589 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -828,4 +837,78 @@ tests in [Tests/test_orchestrator.py](Tests/test_orchestrator.py).
   has finished decoding.
 - **Flag off:** with `allow_pdd` off the simulator runs the original single-phase
   loop unchanged.
+
+## Stage 20: Outputs & CLI
+
+The simulator now emits the raw outputs the PRD calls for and is driven from a
+single `config.json`. To make this possible the run captures more than the
+per-request summary: the orchestrator retains every job's event log (both as
+generated in isolation and after the arbiter rescales it for contention), each
+job's reserved device footprint, and — per request — the *first-token time*
+(when the request's first decode step completes). `serve_sim.report` turns a
+`RunResult` into the aggregate report (counts, FLOPs/DMA totals, peak memory,
+throughput, makespan, and latency/TTFT/TPOT distributions), per-request metrics,
+per-device utilization and a bucketed memory/utilization timeline, and writes
+them all (plus the two raw-event CSVs and a config echo) under one run
+directory.
+
+TTFT is the first decode step's completion relative to arrival (after prefill and
+any KV transfer); TPOT is the remaining decode time divided by the remaining
+output tokens. Memory occupancy is a *reservation estimate* — the reserved
+per-device footprint (weights + KV) of the jobs active at each instant, as sized
+by the parallelism planner — not a byte-accurate residency trace.
+
+`serve_sim.runner.run_from_config` ties it together: it loads the system and
+models, builds the suite through the dataset loader, issues one request per
+conversation turn (spaced by `arrival_interval_sec`), runs the simulation and
+writes the outputs under `<output_root>/<run_id>/`. The CLI
+([Src/serve_sim/cli.py](Src/serve_sim/cli.py), `python -m serve_sim` or the root
+[run_sim.py](run_sim.py)) is a thin wrapper over it.
+
+8 tests in [Tests/test_outputs.py](Tests/test_outputs.py) and 2 in
+[Tests/test_runner.py](Tests/test_runner.py).
+
+- **Event capture:** a run records every event both before and after rescaling;
+  for an uncontended single job the two timelines coincide.
+- **First-token / TTFT / TPOT:** the captured first-token time falls between
+  arrival and completion, and the derived TTFT and TPOT match their definitions;
+  a single-output-token request has a first token but no TPOT.
+- **First token under PDD:** the first token only appears after prefill and the
+  KV transfer, i.e. once decode has begun.
+- **Aggregate report:** `summarize` reports the right request/batch counts, total
+  output tokens, makespan and throughput.
+- **Per-device outputs:** `device_summaries` busy fractions stay in `[0, 1]` and
+  the timeline returns one row per `(bucket, device)`.
+- **Output files:** `write_outputs` writes the run report (JSON + text), the
+  per-request CSV, both raw-event CSVs, the per-device summary and timeline and a
+  config echo; an empty run still writes a well-formed (zeroed) report.
+- **End-to-end runner (offline):** `run_from_config` drives a full run from a temp
+  config that loads the real system/model JSONs, with the in-memory fake fetcher
+  and whitespace tokenizer injected, producing two completed requests and all
+  output files; `--output-root`/`run_id` overrides are honoured.
+
+### Dataset cache — [Tests/test_dataset_cache.py](Tests/test_dataset_cache.py)
+
+To avoid live-API rate limits, the source dataset is cached locally under
+`./Dataset/` by `download_dataset`, and `LocalRowFetcher` serves that cache with
+the same page shape as the HTTP fetcher, so runs are offline and reproducible.
+`python cache_dataset.py` populates the cache (a deterministic prefix of the
+split, so it reproduces on other machines); a run prefers the cache when present
+and falls back to the live API otherwise. 7 offline tests drive the whole
+round-trip with the in-memory fake fetcher.
+
+- **Round-trip:** `download_dataset` writes `rows.jsonl` + `meta.json`, and
+  `LocalRowFetcher` reads them back in dataset order with the right total.
+- **Paging parity:** the local fetcher returns the same windows as the source
+  fetcher for assorted `(offset, length)` pairs, including past the end.
+- **Loader offline:** a `WorkloadLoader` over the cache groups the sessions
+  correctly without any network.
+- **Row cap:** `--max-rows` caps the cache and reports that many as the total, so
+  sampling stays inside the cached range.
+- **Skip/refresh:** a second download skips when a cache exists and re-fetches
+  only with `overwrite`.
+- **Retry:** a transient 429 is retried with backoff and the download still
+  completes.
+- **Missing cache:** reading a `LocalRowFetcher` with no cache raises a clear
+  error pointing at the download script.
 

@@ -297,17 +297,40 @@ The orchestration strategy is configured by a few knobs:
     Global multiplier applied to every tool-call wait time from the dataset (e.g. 2 makes tool calls return twice as fast)
 - random_seed (default null)
     Seed for all simulation randomness (expert persistence, suite arrivals, event-time randomization); null draws a non-deterministic seed. A fixed seed makes a run fully reproducible.
+- arrival_interval_sec (default 0)
+    Spacing between successive request arrivals; 0 admits the whole suite at once.
+- max_turns_per_workload (default null)
+    Cap on how many conversation turns of each workload are issued as requests; null issues every turn.
+- report_time_buckets (default 64)
+    Number of time buckets in the per-device timeline output.
+
+The config also names the inputs to load: `system` (system-architecture JSON), `models_dir` (folder of model JSONs, keyed by suite model name), `tokenizer` (`tiktoken` or `whitespace`), `suite` (an inline suite config or a path to one), optional `dataset` (the workload source), `run_id`, and `output_root`.
+
+The optional `dataset` block selects the workload source: `dataset`/`config`/`split` (Hugging Face datasets-server coordinates) and `cache_dir` (a local cache directory, resolved relative to the config; default `Dataset`). If a populated cache exists there the run reads from it (offline and reproducible); otherwise it falls back to the live API. Set `dataset.require_cache` to fail fast instead of going to the network.
 
 Note: `kernel_launch_latency` is a per-device property defined in the device/system architecture JSON, not a global config parameter; likewise the scale-up / CXL bandwidth and latency are system-architecture parameters.
 
 
 # Outputs and Visualization
-The simulator produces a run report aggregated over the test suite. At minimum:
-- Per-request latency, time-to-first-token (TTFT), and time-per-output-token (TPOT).
-- Throughput (requests and tokens per second) and overall makespan.
-- Per-device utilization (compute and bandwidth) and memory occupancy over time.
-Reports are emitted as structured data (e.g. JSON/CSV) for offline analysis; richer visualization is TBD.
 
+## Running
+The simulator is driven from a single config JSON: `python run_sim.py Configs/example.json` (or `python -m serve_sim Configs/example.json`). Paths inside the config are resolved relative to the config file. The runner loads the system and models, builds the suite (drawing workloads through the dataset loader), issues one request per conversation turn, runs the simulation, and writes all outputs under `<output_root>/<run_id>/`. `--output-root`, `--run-id` and `--tokenizer` override the config.
+
+## Dataset cache
+To avoid hitting (and being rate-limited by) the live Hugging Face datasets-server on every run, the source dataset is cached locally under `./Dataset/`. Populate it once with `python cache_dataset.py` (use `--max-rows N` for a smaller, faster cache; `--overwrite` to refresh). The cache is a deterministic prefix of the split (`rows.jsonl` + `meta.json`), so running the same command on another machine reproduces the same cache; the data itself is gitignored. A run automatically prefers the cache when present and falls back to the live API otherwise.
+
+## Raw data and textual analysis
+The simulator produces a run report aggregated over the test suite.
+- Count of requests, batches ran, memory used and total DMA transfers
+- Per-request latency, time-to-first-token (TTFT), and time-per-output-token (TPOT). TTFT is the time the request's first decode step completes (after prefill and any KV transfer) relative to arrival; TPOT is the remaining decode time divided by the remaining output tokens.
+- Throughput (requests and tokens per second) and overall makespan.
+- Per-device utilization (compute and bandwidth) and memory occupancy over time. Memory occupancy is the reserved per-device footprint (weights + KV) of the jobs active at each instant, as sized by the parallelism planner -- a reservation estimate, not a byte-accurate residency trace.
+- Raw list of all simulation events in CSV format. Rescaled events appear seperately before and after rescaling.
+
+These are written as `run_report.json`/`run_report.txt`, `requests.csv`, `device_summary.csv`, `device_timeline.csv`, `events_before_rescaling.csv` and `events_after_rescaling.csv`, alongside an echo of the input `config.json`.
+
+## Visualization tool
+TBD
 
 
 

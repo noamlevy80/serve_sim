@@ -7,7 +7,18 @@ generation.
 """
 
 from .workload import Message, ToolCall, Turn, Workload, build_workload_from_rows
-from .dataset import HttpRowFetcher, RowFetcher, WorkloadLoader
+from .dataset import (
+    DEFAULT_CACHE_DIR,
+    DEFAULT_CONFIG,
+    DEFAULT_DATASET,
+    DEFAULT_SPLIT,
+    HttpRowFetcher,
+    LocalRowFetcher,
+    RowFetcher,
+    WorkloadLoader,
+    cache_subdir,
+    download_dataset,
+)
 from .model import Model, toy_model, toy_moe_model
 from .blocks import (
     Attention,
@@ -54,12 +65,21 @@ from .pdd import (
     split_work,
 )
 from .orchestrator import (
+    EventRecord,
+    JobRecord,
     Request,
     RequestRecord,
     RunResult,
     Simulator,
     StrategyConfig,
 )
+from .report import (
+    device_summaries,
+    device_timeline,
+    summarize,
+    write_outputs,
+)
+from .runner import run_from_config
 from .conversation import TOOL_CALL_PHASE, run_conversation
 from .system import (
     Network,
@@ -87,6 +107,13 @@ __all__ = [
     "HttpRowFetcher",
     "RowFetcher",
     "WorkloadLoader",
+    "LocalRowFetcher",
+    "cache_subdir",
+    "download_dataset",
+    "DEFAULT_CACHE_DIR",
+    "DEFAULT_DATASET",
+    "DEFAULT_CONFIG",
+    "DEFAULT_SPLIT",
     # model + hardware
     "Model",
     "toy_model",
@@ -143,11 +170,18 @@ __all__ = [
     "kv_bytes_per_token",
     "kv_transfer_duration",
     "split_work",
+    "EventRecord",
+    "JobRecord",
     "Request",
     "RequestRecord",
     "RunResult",
     "Simulator",
     "StrategyConfig",
+    "device_summaries",
+    "device_timeline",
+    "summarize",
+    "write_outputs",
+    "run_from_config",
     "TOOL_CALL_PHASE",
     "run_conversation",
     "Network",
