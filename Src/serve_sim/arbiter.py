@@ -299,3 +299,193 @@ class ResourceArbiter:
             start=start,
             end=end,
         )
+
+
+class IncrementalArbiter:
+    """Fluid co-simulation driven incrementally from an event queue.
+
+    :class:`ResourceArbiter` is a one-shot batch solver: every job is known up
+    front and starts at ``t = 0``. The orchestrator instead needs jobs that come
+    and go over time -- a new request *arrives* mid-flight, an old one drains --
+    while the same equal-share rescaling applies to whatever is in flight. This
+    class keeps the active events and clock as mutable state and lets the caller
+    :meth:`admit` jobs at the current time and :meth:`advance_to` later instants;
+    between steps the in-flight events are rescaled and prorated exactly as in the
+    batch solver (the same private fluid helpers are reused).
+
+    Admitting every job at ``t = 0`` and advancing to ``inf`` reproduces
+    :meth:`ResourceArbiter.run` event-for-event.
+    """
+
+    def __init__(self) -> None:
+        self._time = 0.0
+        self._active: list[_Task] = []
+        self._successors: dict[int, list[_Task]] = {}
+        self._jobs: list[list[_Task]] = []
+
+    # --- inspection ---------------------------------------------------------
+
+    @property
+    def time(self) -> float:
+        """Current simulation clock."""
+
+        return self._time
+
+    @property
+    def num_jobs(self) -> int:
+        """Number of jobs admitted so far."""
+
+        return len(self._jobs)
+
+    @property
+    def active_count(self) -> int:
+        """In-flight (released, unfinished) events right now."""
+
+        return len(self._active)
+
+    def is_idle(self) -> bool:
+        """Whether nothing is in flight (all admitted work has drained)."""
+
+        return not self._active
+
+    def job_is_done(self, job_index: int) -> bool:
+        """Whether every event of a job has finished."""
+
+        return all(task.co_end is not None for task in self._jobs[job_index])
+
+    def job_end_time(self, job_index: int) -> float | None:
+        """The job's completion time (max event end), or ``None`` if unfinished."""
+
+        ends = [task.co_end for task in self._jobs[job_index]]
+        if not ends or any(end is None for end in ends):
+            return None
+        return max(ends)
+
+    def job_start_time(self, job_index: int) -> float:
+        """The job's admission time on the shared clock."""
+
+        return min((task.co_start for task in self._jobs[job_index]), default=0.0)
+
+    def next_event_time(self) -> float | None:
+        """Clock time of the next internal completion, or ``None`` if idle."""
+
+        if not self._active:
+            return None
+        sharers = ResourceArbiter._count_sharers(self._active)
+        dt = ResourceArbiter._next_delta(self._active, sharers)
+        if dt == float("inf"):
+            dt = 0.0
+        return self._time + dt
+
+    # --- driving ------------------------------------------------------------
+
+    def admit(
+        self,
+        generator: EventGenerator,
+        shards,
+        expert_trace=None,
+        expert_cache_capacity=None,
+    ) -> int:
+        """Run a generator in isolation and admit its events at the current time."""
+
+        schedule = generator.run(
+            shards,
+            expert_trace=expert_trace,
+            expert_cache_capacity=expert_cache_capacity,
+        )
+        return self.admit_events(schedule.events, generator.devices)
+
+    def admit_events(self, events: list[ComputeEvent], devices: list) -> int:
+        """Admit a pre-computed event list (against ``devices``) at the current time.
+
+        The events are placed on the shared timeline starting now: their relative
+        ordering/dependencies (one job's events lie on a non-decreasing clock) are
+        preserved, but the whole job is shifted so its first events become ready
+        at :attr:`time`.
+        """
+
+        job_index = len(self._jobs)
+        job_tasks: list[_Task] = []
+        for order, event in enumerate(events):
+            demands, latency = ResourceArbiter._demands_for(event, devices)
+            task = _Task(job_index, order, event, demands, latency)
+            task.ready_time = self._time
+            job_tasks.append(task)
+        ResourceArbiter._link_dependencies(job_tasks)
+
+        by_order = {(t.job, t.order): t for t in job_tasks}
+        for task in job_tasks:
+            self._successors[id(task)] = []
+        for task in job_tasks:
+            for pred_order in task.preds:
+                pred = by_order[(task.job, pred_order)]
+                self._successors[id(pred)].append(task)
+
+        for task in job_tasks:
+            if task.pending == 0:
+                task.co_start = self._time
+                self._active.append(task)
+
+        self._jobs.append(job_tasks)
+        # Flush any zero-work roots that complete immediately at the current time.
+        ResourceArbiter._complete(self._active, self._time, self._successors)
+        return job_index
+
+    def advance_to(self, target: float) -> None:
+        """Advance the fluid simulation up to ``target`` (``inf`` runs to idle).
+
+        Completions strictly before ``target`` are processed (and their
+        successors released); the clock stops exactly at ``target`` so the caller
+        may admit a new job there. In-flight events are prorated for the elapsed
+        time at their current shared rate.
+        """
+
+        while self._active:
+            ResourceArbiter._complete(self._active, self._time, self._successors)
+            if not self._active:
+                break
+            sharers = ResourceArbiter._count_sharers(self._active)
+            dt = ResourceArbiter._next_delta(self._active, sharers)
+            if dt == float("inf"):
+                dt = 0.0
+            if self._time + dt > target:
+                # ``target`` falls strictly inside the current interval: prorate
+                # the in-flight events and stop exactly there.
+                dt = target - self._time
+                if dt > 0:
+                    ResourceArbiter._advance(self._active, sharers, dt)
+                    self._time = target
+                ResourceArbiter._complete(
+                    self._active, self._time, self._successors
+                )
+                return
+            # ``target`` is at or beyond the next natural completion: take the
+            # full step so the draining demand is consumed exactly. Clamping to
+            # ``target`` here would lose sub-ULP bits at large absolute times
+            # (e.g. arrival at t=12.5 with microsecond events), leaving an
+            # undrainable residual and an infinite loop.
+            self._time += dt
+            ResourceArbiter._advance(self._active, sharers, dt)
+            ResourceArbiter._complete(self._active, self._time, self._successors)
+        # The machine drained before ``target``; still advance the idle clock so
+        # a job admitted at ``target`` starts there (no-op for ``inf``).
+        if target != float("inf") and target > self._time:
+            self._time = target
+
+    def run_to_idle(self) -> None:
+        """Advance until all admitted work has drained."""
+
+        self.advance_to(float("inf"))
+
+    # --- output -------------------------------------------------------------
+
+    def result(self) -> ArbiterResult:
+        """Per-job rescaled schedules (call once :meth:`is_idle`)."""
+
+        schedules: list[EventSchedule] = []
+        for job_tasks in self._jobs:
+            schedule = EventSchedule()
+            for task in job_tasks:
+                schedule.events.append(ResourceArbiter._retime(task))
+            schedules.append(schedule)
+        return ArbiterResult(schedules)

@@ -23,6 +23,7 @@ from typing import Any, Mapping
 
 from .device_config import load_compute_device, load_memory_device
 from .hardware import ComputeDevice, MemoryDevice
+from .transfer import INTRA_PACKAGE, TransferLink
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,51 @@ class System:
             if any(d is device for d in node.compute_devices):
                 return node
         raise ValueError(f"device {device.name!r} is not part of this system")
+
+    def _node_index_of_memory(self, memory: MemoryDevice) -> int | None:
+        """Index of the node that hosts ``memory`` (by identity), else ``None``.
+
+        Node-local memories are a node's CPU memory and each compute device's
+        first- and second-tier memory. The shared input memory (system NVM) is
+        not node-local and yields ``None``.
+        """
+
+        target = id(memory)
+        for index, node in enumerate(self.nodes):
+            if node.node_memory is not None and id(node.node_memory) == target:
+                return index
+            for device in node.compute_devices:
+                if id(device.first_tier_memory) == target:
+                    return index
+                second = device.second_tier_memory
+                if second is not None and id(second) == target:
+                    return index
+        return None
+
+    def link_between(self, src: MemoryDevice, dst: MemoryDevice) -> TransferLink:
+        """Classify the link a transfer between ``src`` and ``dst`` traverses.
+
+        Same device -> intra-package (own bandwidth, no latency); same node ->
+        CXL; anything else (different nodes, or either end is the system NVM) ->
+        the scale-up network.
+        """
+
+        if src is dst:
+            return INTRA_PACKAGE
+        node_a = self._node_index_of_memory(src)
+        node_b = self._node_index_of_memory(dst)
+        if node_a is not None and node_a == node_b:
+            return TransferLink(
+                "cxl",
+                self.network.cxl_bandwidth_bytes_per_s,
+                self.network.cxl_latency_s,
+            )
+        return TransferLink(
+            "scale_up",
+            self.network.scale_up_bandwidth_bytes_per_s,
+            self.network.scale_up_latency_s,
+        )
+
 
 
 def system_from_config(

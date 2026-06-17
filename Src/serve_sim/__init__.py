@@ -27,6 +27,7 @@ from .device_config import (
 )
 from .tokenizer import Tokenizer, TiktokenTokenizer, WhitespaceTokenizer
 from .tracker import BatchTracker, SequenceTracker, SequenceWork
+from .kv_cache import KVCacheTracker
 from .experts import ExpertUsageModel
 from .shards import WorkShard, WorkShardGenerator
 from .tiering import (
@@ -36,7 +37,21 @@ from .tiering import (
     derive_expert_cache_capacity,
 )
 from .events import ComputeEvent, EventGenerator, EventSchedule
-from .arbiter import ArbiterResult, ResourceArbiter
+from .weights import ModelWeightsTracker, WeightShard
+from .transfer import (
+    INTRA_PACKAGE,
+    TransferLink,
+    make_transfer_event,
+    transfer_duration,
+)
+from .arbiter import ArbiterResult, IncrementalArbiter, ResourceArbiter
+from .orchestrator import (
+    Request,
+    RequestRecord,
+    RunResult,
+    Simulator,
+    StrategyConfig,
+)
 from .conversation import TOOL_CALL_PHASE, run_conversation
 from .system import (
     Network,
@@ -90,6 +105,7 @@ __all__ = [
     "BatchTracker",
     "SequenceTracker",
     "SequenceWork",
+    "KVCacheTracker",
     # experts + shards + events
     "ExpertUsageModel",
     "WorkShard",
@@ -101,8 +117,20 @@ __all__ = [
     "ComputeEvent",
     "EventGenerator",
     "EventSchedule",
+    "ModelWeightsTracker",
+    "WeightShard",
+    "INTRA_PACKAGE",
+    "TransferLink",
+    "make_transfer_event",
+    "transfer_duration",
     "ArbiterResult",
     "ResourceArbiter",
+    "IncrementalArbiter",
+    "Request",
+    "RequestRecord",
+    "RunResult",
+    "Simulator",
+    "StrategyConfig",
     "TOOL_CALL_PHASE",
     "run_conversation",
     "Network",

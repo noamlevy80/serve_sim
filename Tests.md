@@ -46,8 +46,29 @@ Network tests auto-skip if the dataset API is unreachable.
 - **Stage 10 — Test suites:** a randomized suite draws N random dataset
   workloads and binds each to a model chosen at random from a configured list,
   reproducibly from a seed. 15 offline tests.
+- **Stage 11 — KV-cache tracking:** a per-layer `KVCacheTracker` records each
+  token's generated state and device residency (by identity) and supports
+  prefix links to another sequence; `SequenceTracker` finds the message-aligned
+  common prefix and links its KV trackers for reuse. 24 offline tests.
+- **Stage 12 — Model weights & transfers:** a `ModelWeightsTracker` decomposes a
+  model into weight shards (per-layer attention/Mamba, dense FFN or per-expert +
+  shared/latent for MoE, plus the LM head) and records their device residency by
+  identity; a network-aware transfer cost model bounds bandwidth by the slower of
+  the two memories and the link, and `System.link_between` classifies a pair of
+  memories as intra-package, CXL or scale-up. 34 offline tests.
+- **Stage 13 — Incremental arbiter:** an `IncrementalArbiter` drives the same
+  fluid rescaling as the batch `ResourceArbiter`, but jobs are admitted at the
+  current clock and the caller steps time forward; admitting all jobs at t=0 and
+  running to idle reproduces the batch solver, while mid-flight admissions
+  prorate in-flight events for the elapsed time. 13 offline tests.
+- **Stage 14 — Orchestrator v0:** a `Simulator` runs an event-driven serving
+  loop over arriving `Request`s, batching same-model requests under the strategy
+  knobs (max batch size, window timeout, target concurrency) and dispatching each
+  batch through the `IncrementalArbiter`; a single request reproduces its solo
+  makespan, batching shares the device, and concurrency/window limits gate
+  dispatch as configured. 18 offline tests.
 
-Totals: 398 tests (393 offline + 5 live).
+Totals: 487 tests (482 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -463,5 +484,124 @@ fetcher, and randomness comes from a caller-supplied seed. 15 offline tests in
   type, and rejects the not-yet-implemented `directed` type and unknown types.
 - **Validation:** zero workloads, an empty model list, and an empty suite are
   rejected; the shipped sample suite loads and builds.
+
+## Stage 11: KV-cache tracking
+
+A `KVCacheTracker` is the per-`(model, conversation, layer)` bookkeeping the PRD
+calls for: per token index it records whether the KV is generated, which memory
+devices hold it (by identity, so value-equal device instances stay distinct), and
+an optional link to the same index in another tracker for cross-sequence prefix
+reuse. A `SequenceTracker` built from a turn remembers its messages and can find
+the token-length of the message-aligned common prefix with another sequence, then
+link its per-layer KV trackers over that prefix. 24 offline tests in
+[Tests/test_kv_cache.py](Tests/test_kv_cache.py).
+
+- **Residency:** `place` marks a range generated and resident; a token may live
+  on several devices; `evict` removes one and the last eviction leaves the token
+  generated but unavailable; value-equal devices are distinct locations.
+- **Prefix length:** `cached_prefix_length` counts the leading run of available
+  tokens and stops at the first gap.
+- **Linking:** a linked range delegates generated/residency to its source and
+  follows the source's evictions; local tokens may be appended after the link;
+  over-long links are rejected.
+- **Sequence integration:** the common prefix is message-aligned and symmetric,
+  zero when the first message differs, and requires trackers built from a turn;
+  `link_kv_prefix` links every layer and requires matching layer counts.
+
+## Stage 12: Model weights & transfers
+
+The static counterpart of KV tracking. A `ModelWeightsTracker` decomposes a model
+into **weight shards** — per layer the attention or Mamba matrices and either a
+dense FFN shard or one shard per routed expert (plus shared-expert and
+latent-projection shards when present), and the global LM head — and records, per
+shard, the memory devices it resides on (by identity, so value-equal memories
+stay distinct). Weight shards are never "ungenerated": they exist from init,
+typically parked on the system NVM, and are moved up to a device's first tier on
+demand. The transfer cost model bounds a move's bandwidth by the slower of the
+two memories and the connecting link, and adds the link's latency. 34 offline
+tests in [Tests/test_weights.py](Tests/test_weights.py) and
+[Tests/test_transfer.py](Tests/test_transfer.py).
+
+- **Shard enumeration:** a dense model emits one attention + one FFN shard per
+  layer plus a single LM head; total shard bytes match the block arithmetic. A
+  MoE model expands each routed expert into its own shard and adds a shared-expert
+  (and, for LatentMoE, a latent-projection) shard; dense layers in a hybrid stack
+  emit a single FFN shard; a Mamba layer emits a Mamba shard; the LM head is
+  omitted when disabled.
+- **Residency:** `place`/`evict` track copies by identity, so two value-equal
+  memories are distinct locations; `place_all` then `bytes_on` equals the total
+  weight bytes; eviction removes only the named copy; foreign or fabricated
+  shards are rejected; `shard_for` resolves a descriptor and flags missing or
+  ambiguous lookups.
+- **Transfer cost:** an intra-package access is bounded by the slower memory; a
+  link can bound the transfer; latency is added on top of the byte time; zero
+  bytes costs just the latency; negative bytes and non-positive link bandwidth /
+  negative latency are rejected; `make_transfer_event` fills a `phase="transfer"`
+  event.
+- **Link classification:** `System.link_between` returns intra-package for the
+  same device, CXL within a node (including node memory), and scale-up across
+  nodes or to the system NVM, carrying the right bandwidth and latency.
+
+## Stage 13: Incremental arbiter
+
+The batch `ResourceArbiter` is a one-shot solve over a fixed job set that all
+start at t=0. The orchestrator instead needs jobs that arrive and drain over
+time while the same equal-share rescaling applies to whatever is in flight. An
+`IncrementalArbiter` keeps the active events and clock as mutable state: the
+caller `admit`s jobs at the current time and `advance_to`s later instants,
+stopping exactly at each target so a new job can be injected there. The same
+private fluid (processor-sharing) helpers are reused, so admitting every job at
+t=0 and running to idle reproduces the batch solver event-for-event. 13 offline
+tests in [Tests/test_incremental_arbiter.py](Tests/test_incremental_arbiter.py).
+
+- **Batch equivalence:** a single job, two jobs sharing one compute device, two
+  jobs sharing only a memory device, two MoE jobs sharing one NVM (transfer
+  contention), and two jobs on disjoint devices each match the batch
+  `ResourceArbiter` (or the standalone generator) event-for-event when admitted
+  at t=0.
+- **Mid-flight proration:** a job admitted at `tau` into another's single shared
+  compute event splits the rate equally from `tau` on — the running job ends at
+  `2T - tau` and the newcomer at `2T`, matching a closed form derived
+  independently of the simulator. Admission on a disjoint resource leaves the
+  running job untouched; a job admitted after the machine has drained starts at
+  the (advanced) idle clock and runs at full rate.
+- **Stepping API:** `next_event_time` reports the next completion (or `None`
+  when idle), `advance_to` stops exactly at its target (clock jumps to the target
+  even when the machine drains early), `is_idle`/`active_count`/`num_jobs` expose
+  state, and total FLOPs/bytes are conserved while sharing is never faster than
+  isolation.
+
+## Stage 14: Orchestrator v0
+
+The orchestrator closes the loop from a request stream to per-request timing. A
+`Simulator` consumes `Request`s in arrival order and runs a strictly
+event-driven loop: at each step it advances the clock to the nearest of the next
+arrival, the open batch window's deadline, or the arbiter's next completion,
+then retires finished jobs, admits new arrivals, and dispatches batches. A batch
+groups consecutive same-model requests (by instance identity) up to the strategy
+max batch size, dispatching when the batch fills or the concurrency window times
+out; `target_concurrency` caps how many sequences may be in flight so excess
+batches serialize behind completions. Each batch is turned into work shards and
+events and admitted to the shared `IncrementalArbiter`, so concurrent batches
+contend on the engine devices exactly as the fluid solver dictates. 18 offline
+tests in [Tests/test_orchestrator.py](Tests/test_orchestrator.py).
+
+- **Timing fidelity:** a lone request retires at its standalone solo makespan;
+  a non-zero arrival time shifts completion by exactly that offset; strictly
+  sequential arrivals never overlap. A floating-point regression where an
+  arrival at a large absolute time (microsecond events at t=12.5) left an
+  undrainable sub-ULP residual in `advance_to` is covered by these tests.
+- **Batching triggers:** filling the batch dispatches all requests as one batch;
+  a partial batch waits for the window timeout before dispatching; a batched
+  decode is cheaper than two solo runs because the batch shares the device.
+- **Concurrency control:** two concurrent batches share the device, while
+  `target_concurrency` serializes batches behind completions and a concurrency
+  of one with a single arrival reduces to the solo case.
+- **Grouping:** different models dispatch in separate batches, the same model
+  instance batches together, and the batch-size knob caps each group; every
+  request retires exactly once.
+- **Construction & validation:** `Request.from_workload` builds a request from a
+  workload turn, and invalid strategy/request parameters or an engine that needs
+  more devices than the system has are rejected; an empty run is empty.
 
 

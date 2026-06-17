@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .kv_cache import KVCacheTracker
 from .tokenizer import Tokenizer
 from .workload import Workload
 
@@ -46,7 +47,10 @@ class SequenceTracker:
     """Token bookkeeping for one sequence's turn.
 
     Construct directly with token counts, or via :meth:`from_turn` to tokenize a
-    workload turn with a supplied tokenizer.
+    workload turn with a supplied tokenizer. When built from a turn the tracker
+    also remembers the turn's messages and their per-message token counts, which
+    lets two trackers find the token-length of their common (message-aligned)
+    prefix and link their per-layer KV trackers for reuse.
     """
 
     def __init__(
@@ -54,6 +58,8 @@ class SequenceTracker:
         prompt_tokens: int,
         output_tokens: int,
         cached_tokens: int = 0,
+        messages: tuple | None = None,
+        message_token_counts: tuple[int, ...] | None = None,
     ) -> None:
         if prompt_tokens < 0 or output_tokens < 0 or cached_tokens < 0:
             raise ValueError("token counts must be non-negative")
@@ -65,6 +71,9 @@ class SequenceTracker:
         self.prompt_tokens = prompt_tokens
         self.output_tokens = output_tokens
         self.cached_tokens = cached_tokens
+        self.messages = messages
+        self._message_token_counts = message_token_counts
+        self.kv_trackers: list[KVCacheTracker] | None = None
 
     @property
     def prefill_tokens(self) -> int:
@@ -113,7 +122,8 @@ class SequenceTracker:
         """
 
         turn = workload[turn_index]
-        prompt_tokens = _count_messages(turn.messages, tokenizer)
+        counts = tuple(_message_token_count(m, tokenizer) for m in turn.messages)
+        prompt_tokens = sum(counts)
         if turn_index == 0:
             cached = 0
         else:
@@ -122,18 +132,73 @@ class SequenceTracker:
             prompt_tokens=prompt_tokens,
             output_tokens=turn.output_length,
             cached_tokens=cached,
+            messages=turn.messages,
+            message_token_counts=counts,
         )
+
+    # --- cross-sequence prefix sharing --------------------------------------
+
+    def common_prefix_length(self, other: "SequenceTracker") -> int:
+        """Token-length of the leading messages identical to ``other``.
+
+        The prefix is message-aligned (matching how prompts are tokenized): it
+        sums the token counts of the leading messages that are equal between the
+        two sequences, stopping at the first message that differs. Both trackers
+        must have been built from a turn (so they carry messages).
+        """
+
+        if self.messages is None or other.messages is None:
+            raise ValueError(
+                "common_prefix_length requires trackers built from a turn"
+            )
+        total = 0
+        for (m_a, c_a), m_b in zip(
+            zip(self.messages, self._message_token_counts), other.messages
+        ):
+            if m_a == m_b:
+                total += c_a
+            else:
+                break
+        return total
+
+    def attach_kv_trackers(self, num_layers: int) -> list[KVCacheTracker]:
+        """Create one :class:`KVCacheTracker` per layer, owned by this tracker."""
+
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+        self.kv_trackers = [KVCacheTracker() for _ in range(num_layers)]
+        return self.kv_trackers
+
+    def link_kv_prefix(self, other: "SequenceTracker") -> int:
+        """Link this sequence's KV trackers to ``other`` over their common prefix.
+
+        Both trackers must already have the same number of attached KV trackers.
+        Returns the linked prefix length in tokens.
+        """
+
+        if self.kv_trackers is None or other.kv_trackers is None:
+            raise ValueError("both sequences must have attached KV trackers")
+        if len(self.kv_trackers) != len(other.kv_trackers):
+            raise ValueError("trackers have different layer counts")
+        length = self.common_prefix_length(other)
+        for mine, theirs in zip(self.kv_trackers, other.kv_trackers):
+            theirs.ensure_length(length)
+            mine.link_prefix(theirs, length)
+        return length
+
+
+def _message_token_count(message, tokenizer: Tokenizer) -> int:
+    total = 0
+    if message.content:
+        total += tokenizer.count(message.content)
+    for tool_call in message.tool_calls:
+        if tool_call.function_arguments:
+            total += tokenizer.count(tool_call.function_arguments)
+    return total
 
 
 def _count_messages(messages, tokenizer: Tokenizer) -> int:
-    total = 0
-    for message in messages:
-        if message.content:
-            total += tokenizer.count(message.content)
-        for tool_call in message.tool_calls:
-            if tool_call.function_arguments:
-                total += tokenizer.count(tool_call.function_arguments)
-    return total
+    return sum(_message_token_count(m, tokenizer) for m in messages)
 
 
 class BatchTracker:
