@@ -10,14 +10,16 @@ first-tier memory in turn resolves from ``Memory_devices/``).
 Instances matter: the event generator and resource arbiter contend on object
 identity, so a node with ``{"device": "nvidia-b200", "count": 4}`` is expanded
 into four *distinct* :class:`~serve_sim.hardware.ComputeDevice` objects, each with
-its own distinct first-tier memory. The single input memory and each node's node
-memory are one shared instance apiece.
+its own distinct first-tier memory and a unique, node-qualified name (e.g.
+``"NVIDIA B200 [node-0 #2]"``) so the instances stay distinguishable in
+per-device reports. The single input memory and each node's node memory are one
+shared instance apiece.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -165,6 +167,29 @@ class System:
 
 
 
+def _name_instance(
+    device: ComputeDevice, node_name: str, index: int
+) -> ComputeDevice:
+    """Give a freshly-loaded device a unique, node-qualified name.
+
+    Several instances of one device config share the same base name (the type),
+    which makes them indistinguishable in per-device reports. Append the node and
+    a per-node index (e.g. ``"NVIDIA B200 [node-0 #2]"``), and qualify the
+    instance's first-tier memory name to match. Identity is unchanged.
+    """
+
+    suffix = f" [{node_name} #{index}]"
+    first_tier = replace(
+        device.first_tier_memory,
+        name=device.first_tier_memory.name + suffix,
+    )
+    return replace(
+        device,
+        name=device.name + suffix,
+        first_tier_memory=first_tier,
+    )
+
+
 def system_from_config(
     config: Mapping[str, Any],
     compute_dir: str | Path,
@@ -198,9 +223,14 @@ def system_from_config(
                 raise ValueError("compute device 'count' must be >= 1")
             device_path = compute_dir / f"{entry['device']}.json"
             # A fresh load per instance gives each device its own first-tier
-            # memory instance (identity matters for resource contention).
+            # memory instance (identity matters for resource contention). Each
+            # instance is also given a unique, node-qualified name so it is
+            # distinguishable in logs and per-device reports.
             for _ in range(count):
-                devices.append(load_compute_device(device_path, memory_dir=memory_dir))
+                device = load_compute_device(device_path, memory_dir=memory_dir)
+                index = len(devices)
+                device = _name_instance(device, raw_node["name"], index)
+                devices.append(device)
 
         if not devices:
             raise ValueError(f"node {raw_node['name']!r} has no compute devices")

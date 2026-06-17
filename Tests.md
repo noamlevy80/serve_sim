@@ -41,8 +41,9 @@ Network tests auto-skip if the dataset API is unreachable.
   (scaled by `tool_calling_speedup`) between turns. 14 offline tests.
 - **Stage 9 — System configs:** a `System` loader expands a `Systems/*.json`
   (network, input memory, nodes) into live hardware objects, instantiating each
-  `count` device as a distinct instance with its own first-tier memory. 20
-  offline tests.
+  `count` device as a distinct instance with its own first-tier memory and a
+  unique, node-qualified name (so per-device reports keep the instances apart).
+  21 offline tests.
 - **Stage 10 — Test suites:** a randomized suite draws N random dataset
   workloads and binds each to a model chosen at random from a configured list,
   reproducibly from a seed. 15 offline tests.
@@ -114,7 +115,7 @@ Network tests auto-skip if the dataset API is unreachable.
   report + output files) + 2 offline (end-to-end runner) + 7 offline (local
   dataset cache) + 6 offline (progress reporting).
 
-Totals: 600 tests (595 offline + 5 live).
+Totals: 601 tests (596 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -497,7 +498,7 @@ A system config (`Systems/*.json`) describes a whole machine: a scale-up + CXL
 init), and a list of nodes. `load_system` expands each node's
 `{"device": ..., "count": N}` entries into N **distinct**
 `ComputeDevice` instances — each with its own first-tier memory instance, because
-the event generator and arbiter contend on object identity. 20 offline tests in
+the event generator and arbiter contend on object identity. 21 offline tests in
 [Tests/test_system.py](Tests/test_system.py).
 
 - **Loading:** every shipped system loads into live objects; the two-node B200
@@ -508,6 +509,10 @@ the event generator and arbiter contend on object identity. 20 offline tests in
   the Grace LPDDR5X device.
 - **Identity:** every compute device and every first-tier memory is a distinct
   instance; `node_of` finds a device's owning node and rejects foreign devices.
+- **Naming:** each instance gets a unique, node-qualified name (keeping the
+  device type as a prefix, e.g. `"NVIDIA B200 [node-0 #2]"`) with its first-tier
+  memory qualified to match, so per-device reports keep the GPUs distinct instead
+  of collapsing same-type devices into one row.
 - **Validation:** `count` expands to distinct instances and defaults to one,
   omitted node memory is `None`, second tiers are never auto-attached, and zero
   counts / empty node lists / bad network parameters are rejected.

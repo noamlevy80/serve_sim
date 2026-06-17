@@ -55,7 +55,10 @@ def test_dual_node_b200_topology() -> None:
     assert len(system.nodes) == 2
     assert [len(n) for n in system.nodes] == [4, 4]
     assert system.num_compute_devices == 8
-    assert all(d.name == "NVIDIA B200" for d in system.compute_devices)
+    # Each instance keeps the device type as a name prefix but is uniquely named.
+    assert all(d.name.startswith("NVIDIA B200") for d in system.compute_devices)
+    names = [d.name for d in system.compute_devices]
+    assert len(set(names)) == len(names)
 
 
 def test_dual_node_b200_input_memory_is_the_nvm() -> None:
@@ -86,15 +89,17 @@ def test_network_parameters_are_parsed() -> None:
 def test_heterogeneous_system_has_two_device_types() -> None:
     system = load("heterogeneous-b200-cerebras.json")
     node0, node1 = system.nodes
-    assert all(d.name == "NVIDIA B200" for d in node0.compute_devices)
-    assert all(d.name == "Cerebras WSE-3" for d in node1.compute_devices)
+    assert all(d.name.startswith("NVIDIA B200") for d in node0.compute_devices)
+    assert all(d.name.startswith("Cerebras WSE-3") for d in node1.compute_devices)
     assert len(node0) == 4 and len(node1) == 4
 
 
 def test_heterogeneous_devices_keep_their_own_first_tier() -> None:
     system = load("heterogeneous-b200-cerebras.json")
     node0, node1 = system.nodes
-    assert node0.compute_devices[0].first_tier_memory.name == "NVIDIA B200 HBM3e"
+    assert node0.compute_devices[0].first_tier_memory.name.startswith(
+        "NVIDIA B200 HBM3e"
+    )
     assert "SRAM" in node1.compute_devices[0].first_tier_memory.name
 
 
@@ -106,6 +111,19 @@ def test_each_compute_device_is_a_distinct_instance() -> None:
     devices = system.compute_devices
     ids = {id(d) for d in devices}
     assert len(ids) == len(devices)
+
+
+def test_each_compute_device_has_a_unique_node_qualified_name() -> None:
+    system = load("dual-node-b200.json")
+    names = [d.name for d in system.compute_devices]
+    # Distinct names so per-device reports don't collapse the 8 GPUs into one.
+    assert len(set(names)) == len(names)
+    # Names are node-qualified and keep the device type as a prefix.
+    assert "NVIDIA B200 [node-0 #0]" in names
+    assert "NVIDIA B200 [node-1 #3]" in names
+    # The instance's first-tier memory name is qualified to match.
+    for device in system.compute_devices:
+        assert device.first_tier_memory.name.endswith(device.name[len("NVIDIA B200"):])
 
 
 def test_each_device_has_its_own_first_tier_memory_instance() -> None:
