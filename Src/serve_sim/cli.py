@@ -16,7 +16,7 @@ import sys
 from typing import Sequence
 
 from .report import summarize
-from .runner import ProgressReporter, run_from_config
+from .runner import BuildProgressReporter, ProgressReporter, run_from_config
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -55,12 +55,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         tokenizer = _make_tokenizer(args.tokenizer)
 
     progress = None if args.quiet else ProgressReporter()
+    build_progress = None if args.quiet else BuildProgressReporter()
     result, out_dir = run_from_config(
         args.config,
         output_root=args.output_root,
         run_id=args.run_id,
         tokenizer=tokenizer,
         progress=progress,
+        build_progress=build_progress,
     )
 
     report = summarize(result)

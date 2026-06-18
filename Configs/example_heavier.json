@@ -16,12 +16,12 @@
     "name": "Example short randomized suite",
     "description": "Draws a handful of random multi-turn workloads from the cached source dataset and assigns each a model at random, for a quick end-to-end run.",
     "type": "randomized",
-    "num_workloads": 4,
+    "num_workloads": 128,
     "models": ["deepseek-v3.2", "gemma-4-31b", "nemotron-3-ultra"]
   },
 
-  "max_concurrency": 8,
-  "target_concurrency": 4,
+  "max_concurrency": 16,
+  "target_concurrency": 8,
   "concurrency_window_sec": 0.5,
 
   "allow_pdd": true,
@@ -37,7 +37,7 @@
   "prefill_chunk_size": null,
   "event_random_factor_range": 0.05,
   "arrival_interval_sec": 0.25,
-  "max_turns_per_workload": 4,
+  "max_turns_per_workload": 128,
 
   "report_time_buckets": 64,
   "random_seed": 7

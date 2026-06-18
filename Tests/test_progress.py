@@ -17,7 +17,7 @@ import pytest
 from serve_sim.hardware import ComputeDevice, MemoryDevice
 from serve_sim.model import toy_model
 from serve_sim.orchestrator import Request, RunProgress, Simulator, StrategyConfig
-from serve_sim.runner import ProgressReporter
+from serve_sim.runner import BuildProgress, BuildProgressReporter, ProgressReporter
 from serve_sim.system import Network, Node, System
 
 
@@ -130,3 +130,38 @@ def test_progress_reporter_throttles_intermediate_updates():
     # The final update is always printed despite throttling.
     reporter(RunProgress(completed=3, total=3, sim_time=3.0, wall_time=0.3))
     assert "3/3 sequences" in stream.getvalue()
+
+
+def test_build_progress_reporter_prints_final_line():
+    stream = io.StringIO()
+    reporter = BuildProgressReporter(stream=stream, min_interval=0.0)
+
+    reporter(BuildProgress(workloads_done=1, workloads_total=3,
+                           requests_built=2, wall_time=0.2))
+    reporter(BuildProgress(workloads_done=3, workloads_total=3,
+                           requests_built=7, wall_time=0.5))
+
+    out = stream.getvalue()
+    assert "1/3 workloads" in out
+    assert "3/3 workloads" in out
+    assert "2 requests" in out and "7 requests" in out
+    assert "wall=" in out
+    assert out.endswith("\n")  # final (100%) update terminates the line
+
+
+def test_build_progress_reporter_throttles_intermediate_updates():
+    stream = io.StringIO()
+    reporter = BuildProgressReporter(stream=stream, min_interval=10.0)
+
+    # Two non-final updates within the interval: the second is throttled.
+    reporter(BuildProgress(workloads_done=1, workloads_total=3,
+                           requests_built=1, wall_time=0.1))
+    reporter(BuildProgress(workloads_done=2, workloads_total=3,
+                           requests_built=3, wall_time=0.2))
+    assert "1/3 workloads" in stream.getvalue()
+    assert "2/3 workloads" not in stream.getvalue()
+
+    # The final update is always printed despite throttling.
+    reporter(BuildProgress(workloads_done=3, workloads_total=3,
+                           requests_built=5, wall_time=0.3))
+    assert "3/3 workloads" in stream.getvalue()

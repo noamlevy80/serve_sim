@@ -114,8 +114,24 @@ Network tests auto-skip if the dataset API is unreachable.
   end-to-end under `<output_root>/<run_id>/`. 8 offline tests (event capture +
   report + output files) + 2 offline (end-to-end runner) + 7 offline (local
   dataset cache) + 6 offline (progress reporting).
+- **Stage 21 — Weight loading & memory-device reports:** the first time a model
+  lands on an engine slot its weights stream from the system input NVM into each
+  device's first-tier memory as a `transfer` event the batch waits on (a slot
+  already holding the model reuses its resident weights); the loads contend on
+  the shared NVM bandwidth like any other transfer. Reports gained a memory-side
+  view: every event records the memory it streamed from, and `memory_summaries`
+  /`memory_summary.csv` give per-memory bandwidth utilization, bytes moved and
+  occupancy for every memory device (including idle ones), independent of the
+  compute devices. Off by default in `StrategyConfig`; config-driven runs enable
+  it. 4 offline tests (weight loading) + 3 offline (memory report).
+- **Stage 22 — Request-build verbosity:** tokenizing a large suite into requests
+  can be slow, so `run_from_config` accepts a `build_progress` callback (called
+  per workload with a `BuildProgress` of workloads done/total, requests built and
+  elapsed wall time) and the CLI prints it in place via `BuildProgressReporter`
+  (suppressed by `--quiet`, like the run progress). 2 offline tests (reporter) +
+  1 offline (runner callback).
 
-Totals: 601 tests (596 offline + 5 live).
+Totals: 611 tests (606 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -871,7 +887,9 @@ writes the outputs under `<output_root>/<run_id>/`. The CLI
 [run_sim.py](run_sim.py)) is a thin wrapper over it.
 
 8 tests in [Tests/test_outputs.py](Tests/test_outputs.py) and 2 in
-[Tests/test_runner.py](Tests/test_runner.py).
+[Tests/test_runner.py](Tests/test_runner.py). Stage 21 adds 4 weight-loading
+tests in [Tests/test_orchestrator.py](Tests/test_orchestrator.py) and 3
+memory-report tests in [Tests/test_outputs.py](Tests/test_outputs.py).
 
 - **Event capture:** a run records every event both before and after rescaling;
   for an uncontended single job the two timelines coincide.
@@ -884,9 +902,19 @@ writes the outputs under `<output_root>/<run_id>/`. The CLI
   output tokens, makespan and throughput.
 - **Per-device outputs:** `device_summaries` busy fractions stay in `[0, 1]` and
   the timeline returns one row per `(bucket, device)`.
+- **Memory-device outputs:** `memory_summaries` covers every memory in the
+  topology (input NVM, node memory, each device's tiers) with its role; compute
+  bandwidth is attributed to the device's first-tier memory while an idle node
+  memory moves nothing, and an enabled weight load shows bytes moved on the
+  input NVM.
+- **Weight loading:** off by default the run has no transfer events and matches
+  the solo timing; enabled, a `transfer` from the input NVM precedes (and delays)
+  each first-placed model's compute, is charged once while the model stays
+  resident, and is re-charged when a slot is repurposed for another model.
 - **Output files:** `write_outputs` writes the run report (JSON + text), the
-  per-request CSV, both raw-event CSVs, the per-device summary and timeline and a
-  config echo; an empty run still writes a well-formed (zeroed) report.
+  per-request CSV, both raw-event CSVs, the per-device summary, the per-memory
+  summary and the timeline and a config echo; an empty run still writes a
+  well-formed (zeroed) report.
 - **End-to-end runner (offline):** `run_from_config` drives a full run from a temp
   config that loads the real system/model JSONs, with the in-memory fake fetcher
   and whitespace tokenizer injected, producing two completed requests and all

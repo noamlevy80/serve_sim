@@ -20,8 +20,9 @@ result is identical to running each generator on its own.
 Resources are identified by object identity: two jobs contend only when they
 were handed the *same* :class:`ComputeDevice` / :class:`MemoryDevice` instance.
 A compute event loads its device's compute pool (for FLOPs) and its first-tier
-memory's bandwidth (for bytes); a transfer event loads the second-tier memory it
-streams from; a kernel-launch event is a fixed, unshared wait.
+memory's bandwidth (for bytes); a transfer event loads the memory it streams from
+(its ``source_memory`` when set -- e.g. the input NVM for a weight load -- else
+the device's second-tier memory); a kernel-launch event is a fixed, unshared wait.
 """
 
 from __future__ import annotations
@@ -140,7 +141,9 @@ class ResourceArbiter:
             rate = event.flops / event.compute_time
             demands.append(_Demand(("compute", id(device)), event.flops, rate))
         if event.bandwidth_time > 0 and event.bytes_read > 0:
-            if event.phase == "transfer":
+            if event.source_memory is not None:
+                memory = event.source_memory
+            elif event.phase == "transfer":
                 memory = device.second_tier_memory or device.first_tier_memory
             else:
                 memory = device.first_tier_memory
@@ -298,6 +301,7 @@ class ResourceArbiter:
             duration=end - start,
             start=start,
             end=end,
+            source_memory=event.source_memory,
         )
 
 

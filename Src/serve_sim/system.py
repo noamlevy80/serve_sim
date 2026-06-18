@@ -121,6 +121,56 @@ class System:
                 return node
         raise ValueError(f"device {device.name!r} is not part of this system")
 
+    def memory_inventory(self) -> list[dict[str, Any]]:
+        """Every distinct memory device with its role, node and attached devices.
+
+        Returns one entry per memory *instance* (deduplicated by identity, so a
+        memory shared by several compute devices -- or by a whole node -- appears
+        once with all the compute devices it serves listed in
+        ``attached_devices``). This is the memory-side view of the topology the
+        reports key utilization on, independent of the compute devices, so it
+        stays correct if the one-compute-to-one-memory assumption is broken.
+
+        Each entry has: ``name``, ``capacity_bytes``, ``bandwidth_bytes_per_s``,
+        ``role`` (``"input"``, ``"node"``, ``"first_tier"`` or ``"second_tier"``),
+        ``node`` (owning node name, or ``""`` for the system-level input NVM) and
+        ``attached_devices`` (compute devices that use it as a tier, in order).
+        """
+
+        order: list[int] = []
+        by_id: dict[int, dict[str, Any]] = {}
+
+        def record(memory: MemoryDevice, role: str, node: str) -> dict[str, Any]:
+            key = id(memory)
+            if key not in by_id:
+                by_id[key] = {
+                    "name": memory.name,
+                    "capacity_bytes": memory.capacity_bytes,
+                    "bandwidth_bytes_per_s": memory.bandwidth_bytes_per_s,
+                    "role": role,
+                    "node": node,
+                    "attached_devices": [],
+                }
+                order.append(key)
+            return by_id[key]
+
+        record(self.input_memory, "input", "")
+        for node in self.nodes:
+            if node.node_memory is not None:
+                record(node.node_memory, "node", node.name)
+            for device in node.compute_devices:
+                first = record(device.first_tier_memory, "first_tier", node.name)
+                first["attached_devices"].append(device.name)
+                second = device.second_tier_memory
+                if second is not None:
+                    entry = record(second, "second_tier", node.name)
+                    entry["attached_devices"].append(device.name)
+
+        return [
+            {**by_id[key], "attached_devices": tuple(by_id[key]["attached_devices"])}
+            for key in order
+        ]
+
     def _node_index_of_memory(self, memory: MemoryDevice) -> int | None:
         """Index of the node that hosts ``memory`` (by identity), else ``None``.
 

@@ -20,6 +20,7 @@ from serve_sim.orchestrator import Request, Simulator, StrategyConfig
 from serve_sim.report import (
     device_summaries,
     device_timeline,
+    memory_summaries,
     summarize,
     write_outputs,
 )
@@ -157,6 +158,64 @@ def test_device_summaries_and_timeline_shapes():
     assert {row["device"] for row in timeline} == {d["device"] for d in devices}
 
 
+# --- memory-device report ------------------------------------------------------
+
+
+def test_memory_summaries_cover_every_memory_device():
+    model = toy_model()
+    system = make_system(2)
+    reqs = [Request(i, model, 32, 4) for i in range(2)]
+
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run(reqs)
+    memories = memory_summaries(result)
+
+    # Every memory in the topology appears: input NVM, node memory, two HBMs.
+    names = {m["memory"] for m in memories}
+    assert "nvm" in names
+    assert "node" in names
+    assert {"g0-mem", "g1-mem"} <= names
+    roles = {m["memory"]: m["role"] for m in memories}
+    assert roles["nvm"] == "input"
+    assert roles["node"] == "node"
+    assert roles["g0-mem"] == "first_tier"
+    for m in memories:
+        assert 0.0 <= m["busy_fraction"] <= 1.0 + 1e-9
+        assert m["capacity_bytes"] > 0
+        assert m["bytes_moved"] >= 0.0
+
+
+def test_memory_summary_attributes_compute_bandwidth_to_first_tier():
+    model = toy_model()
+    system = make_system(1)
+    req = Request(0, model, 64, 8)
+
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run([req])
+    by_name = {m["memory"]: m for m in memory_summaries(result)}
+
+    # Compute reads land on the device's first-tier memory, which therefore moves
+    # bytes and shows attached to the compute device.
+    first_tier = by_name["g0-mem"]
+    assert first_tier["bytes_moved"] > 0
+    assert first_tier["attached_devices"] == "g0"
+    # The idle node memory backs no compute and moves nothing.
+    assert by_name["node"]["bytes_moved"] == 0.0
+
+
+def test_memory_summary_captures_weight_load_on_input_nvm():
+    model = toy_model()
+    system = make_system(1)
+    req = Request(0, model, 64, 8)
+    strat = StrategyConfig(max_batch_size=1, model_weight_loading=True)
+
+    result = Simulator(system, strat).run([req])
+    by_name = {m["memory"]: m for m in memory_summaries(result)}
+
+    # The weight load streams from the input NVM, so it now moves bytes.
+    assert by_name["nvm"]["bytes_moved"] > 0
+    assert by_name["nvm"]["num_events"] >= 1
+
+
+
 # --- output files ---------------------------------------------------------------
 
 
@@ -172,7 +231,8 @@ def test_write_outputs_creates_all_files(tmp_path):
     expected = [
         "run_report.json", "run_report.txt", "requests.csv",
         "events_before_rescaling.csv", "events_after_rescaling.csv",
-        "device_summary.csv", "device_timeline.csv", "config.json",
+        "device_summary.csv", "memory_summary.csv", "device_timeline.csv",
+        "config.json",
     ]
     for name in expected:
         assert (out / name).exists(), name
@@ -190,6 +250,12 @@ def test_write_outputs_creates_all_files(tmp_path):
         after = list(csv.DictReader(handle))
     assert after
     assert all(row["device"] is not None for row in after)
+    assert all("memory" in row for row in after)
+
+    with open(out / "memory_summary.csv", newline="") as handle:
+        mem_rows = list(csv.DictReader(handle))
+    assert mem_rows
+    assert {"nvm", "node"} <= {row["memory"] for row in mem_rows}
 
     echoed = json.loads((out / "config.json").read_text())
     assert echoed == {"hello": "world"}

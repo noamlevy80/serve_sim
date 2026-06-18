@@ -89,3 +89,25 @@ def test_run_id_override_and_default_output_root(tmp_path, fake_fetcher):
 
     assert out_dir == tmp_path / "elsewhere" / "override-id"
     assert (out_dir / "run_report.json").exists()
+
+
+def test_run_from_config_reports_build_progress(tmp_path, fake_fetcher):
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+
+    updates = []
+    result, _ = run_from_config(
+        config_path,
+        output_root=tmp_path / "Outputs",
+        loader=WorkloadLoader(fake_fetcher),
+        tokenizer=WhitespaceTokenizer(),
+        build_progress=updates.append,
+    )
+
+    assert updates, "expected build-progress callbacks"
+    # One update per suite workload, ending at the full count.
+    assert updates[-1].workloads_done == updates[-1].workloads_total == 2
+    assert updates[-1].requests_built == len(result.records)
+    # workloads_done is monotonic non-decreasing and wall time non-negative.
+    assert [u.workloads_done for u in updates] == sorted(u.workloads_done for u in updates)
+    assert all(u.wall_time >= 0.0 for u in updates)

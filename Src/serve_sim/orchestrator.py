@@ -29,11 +29,11 @@ from __future__ import annotations
 
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from .arbiter import IncrementalArbiter
-from .events import EventGenerator
+from .events import ComputeEvent, EventGenerator
 from .parallelism import ParallelismPlanner
 from .pdd import context_kv_bytes, kv_transfer_duration, split_work
 from .placement import EnginePool, EngineSlot
@@ -41,6 +41,7 @@ from .shards import WorkShardGenerator
 from .system import System
 from .tokenizer import Tokenizer
 from .tracker import SequenceWork
+from .transfer import transfer_duration
 from .workload import Workload
 
 
@@ -68,6 +69,13 @@ class StrategyConfig:
             pool when ``allow_pdd`` is set (the rest serve decode). A single
             swappable partition point -- dynamic repartitioning is future work.
         prefill_chunk_size: Optional prefill chunking applied to every batch.
+        model_weight_loading: When ``True``, the first time a model is placed on
+            an engine slot its weights are streamed from the system input NVM
+            into each device's first-tier memory as a ``transfer`` event that the
+            batch's compute waits on; a slot already holding the model reuses its
+            resident weights (no reload). When ``False`` (default) weights are
+            assumed pre-resident and no load is charged. Config-driven runs turn
+            this on (see :func:`serve_sim.runner.run_from_config`).
         event_random_factor_range: Per-event time is multiplied by
             ``1 + U(-range, range)`` to model system randomness; ``0`` disables it.
         random_seed: Seed for the run's randomness (event-time perturbation);
@@ -83,6 +91,7 @@ class StrategyConfig:
     allow_pdd: bool = False
     prefill_engine_fraction: float = 0.5
     prefill_chunk_size: int | None = None
+    model_weight_loading: bool = False
     event_random_factor_range: float = 0.0
     random_seed: int | None = None
 
@@ -226,6 +235,7 @@ class EventRecord:
     group_index: int
     phase: str  # event phase: prefill / decode / transfer / kernel_launch
     device: str  # device name ("" for the no-device sentinel)
+    memory: str  # name of the memory whose bandwidth this event consumed ("" if none)
     flops: float
     bytes_read: float
     compute_time: float
@@ -251,6 +261,31 @@ class JobRecord:
 
 
 @dataclass(frozen=True)
+class MemoryRecord:
+    """A memory device in the system, for the per-memory utilization report.
+
+    Captured from the system topology (not from events) so the report can list
+    every memory -- including idle ones -- with its static spec and the compute
+    devices it serves, independent of the compute-device view.
+
+    Attributes:
+        name: Identifier for logs/reports.
+        capacity_bytes: Total capacity.
+        bandwidth_bytes_per_s: Intrinsic (unconstrained) bandwidth ceiling.
+        role: ``"input"``, ``"node"``, ``"first_tier"`` or ``"second_tier"``.
+        node: Owning node name, or ``""`` for the system-level input NVM.
+        attached_devices: Compute devices that use this memory as a tier.
+    """
+
+    name: str
+    capacity_bytes: float
+    bandwidth_bytes_per_s: float
+    role: str
+    node: str
+    attached_devices: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RunProgress:
     """A progress update emitted as a run retires completed sequences.
 
@@ -273,15 +308,17 @@ class RunResult:
     """Minimal run state: per-request records and the overall makespan.
 
     Beyond the per-request timings, a run also captures the raw event log
-    (``events``, each event recorded before and after rescaling) and per-job
-    placement/footprint records (``jobs``) so the outputs layer can derive
-    utilization and memory-occupancy reports.
+    (``events``, each event recorded before and after rescaling), per-job
+    placement/footprint records (``jobs``) and the system's memory-device
+    inventory (``memories``) so the outputs layer can derive utilization and
+    memory-occupancy reports for both compute and memory devices.
     """
 
     records: list[RequestRecord] = field(default_factory=list)
     num_batches: int = 0
     events: list[EventRecord] = field(default_factory=list)
     jobs: list[JobRecord] = field(default_factory=list)
+    memories: list[MemoryRecord] = field(default_factory=list)
 
     @property
     def makespan(self) -> float:
@@ -711,8 +748,10 @@ class Simulator:
                 for ev in events:
                     if 0 <= ev.device_index < len(device_names):
                         dev_name = device_names[ev.device_index]
+                        mem_name = self._event_memory_name(devices[ev.device_index], ev)
                     else:
                         dev_name = ""
+                        mem_name = ""
                     result.events.append(
                         EventRecord(
                             job_index=job_index,
@@ -722,6 +761,7 @@ class Simulator:
                             group_index=ev.group_index,
                             phase=ev.phase,
                             device=dev_name,
+                            memory=mem_name,
                             flops=ev.flops,
                             bytes_read=ev.bytes_read,
                             compute_time=ev.compute_time,
@@ -764,6 +804,36 @@ class Simulator:
 
         result.events.sort(key=lambda e: (e.rescaled, e.start, e.job_index, e.group_index))
         result.jobs.sort(key=lambda j: j.job_index)
+        result.memories = [
+            MemoryRecord(
+                name=entry["name"],
+                capacity_bytes=entry["capacity_bytes"],
+                bandwidth_bytes_per_s=entry["bandwidth_bytes_per_s"],
+                role=entry["role"],
+                node=entry["node"],
+                attached_devices=entry["attached_devices"],
+            )
+            for entry in self.system.memory_inventory()
+        ]
+
+    @staticmethod
+    def _event_memory_name(device: ComputeDevice, event: ComputeEvent) -> str:
+        """Name of the memory whose bandwidth ``event`` consumed on ``device``.
+
+        Mirrors the arbiter's bandwidth attribution: a transfer streams from its
+        explicit ``source_memory`` when set (e.g. a weight load from the input
+        NVM) else the device's second tier (falling back to the first); compute
+        reads the device's first-tier memory; a kernel launch touches no memory.
+        """
+
+        if event.phase == "kernel_launch":
+            return ""
+        if event.phase == "transfer":
+            if event.source_memory is not None:
+                return event.source_memory.name
+            memory = device.second_tier_memory or device.first_tier_memory
+            return memory.name
+        return device.first_tier_memory.name
 
     def _job_footprint(self, model: object, pp: int, ep: int, kv_tokens: int) -> float:
         """Reserved per-device bytes (weights + KV) for a job, or 0 if unknown."""
@@ -844,7 +914,8 @@ class Simulator:
 
         model = batch[0].model
         pool = pool or self._pool
-        slot = pool.place(model).slot
+        placement = pool.place(model)
+        slot = placement.slot
         work = [self._phase_work(req, phase) for req in batch]
         shards = WorkShardGenerator(model).generate(
             work, prefill_chunk_size=self.strategy.prefill_chunk_size
@@ -858,7 +929,74 @@ class Simulator:
             event_random_factor_range=self.strategy.event_random_factor_range,
             rng=self._rng,
         )
+        if self.strategy.model_weight_loading and placement.needs_weight_load:
+            events = self._with_weight_load(
+                model, slot, pp, ep, generator.run(shards).events
+            )
+            return arbiter.admit_events(events, list(slot.devices)), slot, pp, ep
         return arbiter.admit(generator, shards), slot, pp, ep
+
+    def _with_weight_load(
+        self,
+        model: object,
+        slot: EngineSlot,
+        pp: int,
+        ep: int,
+        compute_events: list[ComputeEvent],
+    ) -> list[ComputeEvent]:
+        """Prepend the model's weight-load transfers ahead of its compute events.
+
+        Each device in the slot streams its weight shards from the system input
+        NVM into its first-tier memory; the compute events are shifted to start
+        once the loads finish so the batch waits for its weights (the arbiter then
+        contends the loads on the shared NVM bandwidth).
+        """
+
+        loads = self._weight_load_events(model, slot, pp, ep)
+        if not loads:
+            return list(compute_events)
+        offset = max(event.end for event in loads)
+        shifted = [
+            replace(event, start=event.start + offset, end=event.end + offset)
+            for event in compute_events
+        ]
+        return loads + shifted
+
+    def _weight_load_events(
+        self, model: object, slot: EngineSlot, pp: int, ep: int
+    ) -> list[ComputeEvent]:
+        """One ``transfer`` event per device: input NVM -> first-tier weights.
+
+        The link latency is folded into ``bandwidth_time`` (as the expert-movement
+        transfers do) so the arbiter reproduces the load's duration exactly while
+        still contending its bytes on the shared input-NVM bandwidth.
+        """
+
+        weight_bytes = float(self._planner_for(model).footprint(pp, ep, 0))
+        if weight_bytes <= 0:
+            return []
+        source = self.system.input_memory
+        events: list[ComputeEvent] = []
+        for index, device in enumerate(slot.devices):
+            destination = device.first_tier_memory
+            link = self.system.link_between(source, destination)
+            duration = transfer_duration(weight_bytes, source, destination, link)
+            events.append(
+                ComputeEvent(
+                    group_index=-1,
+                    phase="transfer",
+                    device_index=index,
+                    flops=0.0,
+                    bytes_read=weight_bytes,
+                    compute_time=0.0,
+                    bandwidth_time=duration,
+                    duration=duration,
+                    start=0.0,
+                    end=duration,
+                    source_memory=source,
+                )
+            )
+        return events
 
     @staticmethod
     def _phase_work(req: Request, phase: str) -> SequenceWork:

@@ -17,9 +17,10 @@ from __future__ import annotations
 import json
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, TextIO
+from typing import Any, Callable, Mapping, TextIO
 
 from .dataset import (
     DEFAULT_CACHE_DIR,
@@ -82,6 +83,61 @@ class ProgressReporter:
         self._stream.flush()
 
 
+@dataclass(frozen=True)
+class BuildProgress:
+    """A progress update emitted while turning suite turns into requests.
+
+    Attributes:
+        workloads_done: Suite workloads (conversations) processed so far.
+        workloads_total: Total workloads in the suite.
+        requests_built: Requests produced so far (turns may be skipped).
+        wall_time: Real seconds elapsed since request building started.
+    """
+
+    workloads_done: int
+    workloads_total: int
+    requests_built: int
+    wall_time: float
+
+
+# Called with a :class:`BuildProgress` as each suite workload is turned to requests.
+BuildProgressCallback = Callable[["BuildProgress"], None]
+
+
+class BuildProgressReporter:
+    """A :data:`BuildProgressCallback` that prints request-building progress.
+
+    Tokenizing every conversation turn of a large suite can take a while; this
+    reports workloads processed out of the suite total, requests built so far and
+    the elapsed wall-clock time, refreshed in place. Updates are throttled to at
+    most one per ``min_interval`` seconds (the final, 100%, update always prints).
+    """
+
+    def __init__(self, stream: TextIO | None = None, min_interval: float = 0.25) -> None:
+        self._stream = stream if stream is not None else sys.stderr
+        self._min_interval = min_interval
+        self._last_wall = -1.0
+
+    def __call__(self, progress: BuildProgress) -> None:
+        done = progress.workloads_done >= progress.workloads_total
+        first = self._last_wall < 0.0
+        if not done and not first and (
+            progress.wall_time - self._last_wall < self._min_interval
+        ):
+            return
+        self._last_wall = progress.wall_time
+        line = (
+            f"  building requests: {progress.workloads_done}/"
+            f"{progress.workloads_total} workloads  "
+            f"{progress.requests_built} requests  "
+            f"wall={progress.wall_time:7.3f}s"
+        )
+        self._stream.write("\r" + line.ljust(60))
+        if done:
+            self._stream.write("\n")
+        self._stream.flush()
+
+
 
 def _strategy_from_config(cfg: Mapping[str, Any]) -> StrategyConfig:
     """Map the PRD config parameters onto a :class:`StrategyConfig`."""
@@ -96,6 +152,7 @@ def _strategy_from_config(cfg: Mapping[str, Any]) -> StrategyConfig:
         allow_pdd=bool(cfg.get("allow_pdd", True)),
         prefill_engine_fraction=float(cfg.get("prefill_engine_fraction", 0.5)),
         prefill_chunk_size=cfg.get("prefill_chunk_size"),
+        model_weight_loading=bool(cfg.get("model_weight_loading", True)),
         event_random_factor_range=float(cfg.get("event_random_factor_range", 0.05)),
         random_seed=cfg.get("random_seed"),
     )
@@ -143,16 +200,21 @@ def _build_requests(
     tokenizer: Tokenizer,
     arrival_interval: float,
     max_turns: int | None,
+    progress: BuildProgressCallback | None = None,
 ) -> list[Request]:
     """Turn each suite conversation's turns into single-sequence requests.
 
     Requests are spaced ``arrival_interval`` seconds apart (0 admits them all at
     once). A turn with no work at all (empty prompt and no output) is skipped.
+    If ``progress`` is given it is called with a :class:`BuildProgress` after each
+    workload is processed (tokenizing a large suite can be slow).
     """
 
     requests: list[Request] = []
     rid = 0
-    for entry in suite:
+    total = len(suite)
+    start_wall = time.perf_counter()
+    for index, entry in enumerate(suite):
         model = models[entry.model]
         num_turns = len(entry.workload)
         if max_turns is not None:
@@ -170,6 +232,13 @@ def _build_requests(
                 continue
             requests.append(req)
             rid += 1
+        if progress is not None:
+            progress(BuildProgress(
+                workloads_done=index + 1,
+                workloads_total=total,
+                requests_built=len(requests),
+                wall_time=time.perf_counter() - start_wall,
+            ))
     return requests
 
 
@@ -181,12 +250,15 @@ def run_from_config(
     loader: WorkloadLoader | None = None,
     tokenizer: Tokenizer | None = None,
     progress: ProgressCallback | None = None,
+    build_progress: BuildProgressCallback | None = None,
 ) -> tuple[RunResult, Path]:
     """Run a simulation described by ``config_path`` and write its outputs.
 
     If ``progress`` is given it is called with a
     :class:`~serve_sim.orchestrator.RunProgress` as sequences complete (see
-    :class:`ProgressReporter` for a printing implementation).
+    :class:`ProgressReporter` for a printing implementation). If ``build_progress``
+    is given it is called with a :class:`BuildProgress` as the suite's turns are
+    tokenized into requests (see :class:`BuildProgressReporter`).
 
     Returns the :class:`RunResult` and the output directory that was written.
     """
@@ -217,6 +289,7 @@ def run_from_config(
         tokenizer,
         float(cfg.get("arrival_interval_sec", 0.0)),
         cfg.get("max_turns_per_workload"),
+        progress=build_progress,
     )
 
     result = Simulator(system, strategy).run(requests, progress=progress)

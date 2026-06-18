@@ -13,6 +13,10 @@ PRD calls for and writes them under one run directory:
   resource contention.
 - ``device_summary.csv`` -- per-device compute/bandwidth utilization, busy
   fraction, peak memory occupancy and DMA transfer totals.
+- ``memory_summary.csv`` -- per-memory-device bandwidth utilization, busy
+  fraction, bytes moved, peak occupancy and the compute devices it serves; this
+  is the memory-side view of the topology, independent of the compute devices,
+  so it stays meaningful if a memory is shared across compute devices.
 - ``device_timeline.csv`` -- per-device busy fraction and memory occupancy over
   time (bucketed).
 
@@ -30,7 +34,6 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from .orchestrator import EventRecord, JobRecord, RequestRecord, RunResult
-
 
 # --- statistics -----------------------------------------------------------------
 
@@ -181,6 +184,75 @@ def device_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, 
     return rows
 
 
+def _memory_peak_occupancy(result: RunResult, attached_devices: Sequence[str]) -> float:
+    """Peak reserved bytes held in a memory, summed over the devices it serves.
+
+    The footprint model reserves ``per_device_bytes`` (weights + KV) on each
+    compute device's first-tier memory; a memory shared by several devices holds
+    the sum. Evaluated at every job boundary to find the peak.
+    """
+
+    attached = set(attached_devices)
+    jobs = [
+        j for j in result.jobs
+        if j.per_device_bytes and any(d in attached for d in j.devices)
+    ]
+    if not jobs:
+        return 0.0
+    breakpoints = sorted({j.start for j in jobs} | {j.end for j in jobs})
+    peak = 0.0
+    for t in breakpoints:
+        occ = sum(
+            j.per_device_bytes * sum(1 for d in j.devices if d in attached)
+            for j in jobs
+            if j.start <= t < j.end
+        )
+        peak = max(peak, occ)
+    return peak
+
+
+def memory_summaries(result: RunResult) -> list[dict[str, Any]]:
+    """Per-memory-device bandwidth utilization, busy fraction and occupancy.
+
+    Keyed off the memory devices in the system inventory (so idle memories such
+    as a node's CPU memory still appear), with bandwidth attributed to whichever
+    memory each event actually streamed from -- not assumed from its compute
+    device -- so the view stays correct when a memory backs several devices.
+    """
+
+    makespan = result.makespan or 0.0
+    rescaled = _rescaled(result.events)
+    by_memory: dict[str, list[EventRecord]] = {}
+    for event in rescaled:
+        if event.memory and event.bandwidth_time > 0:
+            by_memory.setdefault(event.memory, []).append(event)
+
+    summaries: list[dict[str, Any]] = []
+    for mem in result.memories:
+        mem_events = by_memory.get(mem.name, [])
+        bandwidth_seconds = sum(e.bandwidth_time for e in mem_events)
+        bytes_moved = sum(e.bytes_read for e in mem_events)
+        busy = _union_length([(e.start, e.end) for e in mem_events])
+        peak_mem = _memory_peak_occupancy(result, mem.attached_devices)
+        summaries.append({
+            "memory": mem.name,
+            "role": mem.role,
+            "node": mem.node,
+            "attached_devices": " ".join(mem.attached_devices),
+            "capacity_bytes": mem.capacity_bytes,
+            "bandwidth_bytes_per_s": mem.bandwidth_bytes_per_s,
+            "busy_fraction": busy / makespan if makespan else 0.0,
+            "bandwidth_util": bandwidth_seconds / makespan if makespan else 0.0,
+            "num_events": len(mem_events),
+            "bytes_moved": bytes_moved,
+            "peak_memory_bytes": peak_mem,
+            "occupancy_fraction": (
+                peak_mem / mem.capacity_bytes if mem.capacity_bytes else 0.0
+            ),
+        })
+    return summaries
+
+
 def summarize(result: RunResult) -> dict[str, Any]:
     """Aggregate run report over the whole suite."""
 
@@ -189,6 +261,7 @@ def summarize(result: RunResult) -> dict[str, Any]:
     isolated = _isolated(result.events)
     transfers = [e for e in isolated if e.phase == "transfer"]
     devices = device_summaries(result)
+    memories = memory_summaries(result)
 
     total_output = sum(r.output_tokens for r in records)
     total_prompt = sum(r.prompt_tokens for r in records)
@@ -204,6 +277,8 @@ def summarize(result: RunResult) -> dict[str, Any]:
         "dma_transfer_bytes": sum(e.bytes_read for e in transfers),
         "peak_memory_bytes": max((d["peak_memory_bytes"] for d in devices),
                                  default=0.0),
+        "num_memory_devices": len(memories),
+        "total_memory_capacity_bytes": sum(m["capacity_bytes"] for m in memories),
         "total_prompt_tokens": total_prompt,
         "total_output_tokens": total_output,
         "throughput_requests_per_s": len(records) / makespan if makespan else 0.0,
@@ -250,8 +325,8 @@ def _request_rows(records: Sequence[RequestRecord]) -> list[dict[str, Any]]:
 
 _EVENT_FIELDS = (
     "job_index", "batch_index", "job_phase", "request_ids", "group_index",
-    "phase", "device", "flops", "bytes_read", "compute_time", "bandwidth_time",
-    "duration", "start", "end",
+    "phase", "device", "memory", "flops", "bytes_read", "compute_time",
+    "bandwidth_time", "duration", "start", "end",
 )
 
 
@@ -272,7 +347,7 @@ def _format_distribution(name: str, dist: Mapping[str, Any]) -> str:
 
 
 def _report_text(report: Mapping[str, Any], devices: Sequence[Mapping[str, Any]],
-                 run_id: str) -> str:
+                 memories: Sequence[Mapping[str, Any]], run_id: str) -> str:
     lines = [
         f"serve_sim run report: {run_id}",
         "=" * 48,
@@ -303,6 +378,15 @@ def _report_text(report: Mapping[str, Any], devices: Sequence[Mapping[str, Any]]
             f"peak_mem={d['peak_memory_bytes']:.6g} "
             f"transfers={d['num_transfers']}"
         )
+    lines.append("")
+    lines.append("Per-memory:")
+    for m in memories:
+        lines.append(
+            f"  {m['memory']:<20} [{m['role']:<11}] busy={m['busy_fraction']:.3f} "
+            f"bw={m['bandwidth_util']:.3f} moved={m['bytes_moved']:.6g} "
+            f"peak_mem={m['peak_memory_bytes']:.6g}/{m['capacity_bytes']:.6g} "
+            f"({m['occupancy_fraction']:.3f})"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -321,13 +405,16 @@ def write_outputs(
 
     report = summarize(result)
     devices = device_summaries(result)
+    memories = memory_summaries(result)
     timeline = device_timeline(result, time_buckets)
 
     with open(out / "run_report.json", "w", encoding="utf-8") as handle:
-        json.dump({"run_id": run_id, "report": report, "devices": devices},
-                  handle, indent=2)
+        json.dump(
+            {"run_id": run_id, "report": report, "devices": devices,
+             "memories": memories},
+            handle, indent=2)
     with open(out / "run_report.txt", "w", encoding="utf-8") as handle:
-        handle.write(_report_text(report, devices, run_id))
+        handle.write(_report_text(report, devices, memories, run_id))
 
     _write_csv(
         out / "requests.csv",
@@ -345,6 +432,13 @@ def write_outputs(
         ["device", "busy_fraction", "compute_util", "bandwidth_util",
          "peak_memory_bytes", "num_transfers", "transfer_bytes"],
         devices,
+    )
+    _write_csv(
+        out / "memory_summary.csv",
+        ["memory", "role", "node", "attached_devices", "capacity_bytes",
+         "bandwidth_bytes_per_s", "busy_fraction", "bandwidth_util",
+         "num_events", "bytes_moved", "peak_memory_bytes", "occupancy_fraction"],
+        memories,
     )
     _write_csv(
         out / "device_timeline.csv",

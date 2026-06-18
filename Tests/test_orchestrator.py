@@ -509,6 +509,93 @@ def test_empty_run_is_empty():
     assert result.num_batches == 0
 
 
+# --- model weight loading ------------------------------------------------------
+
+
+def _weight_load_seconds(system, model, device, pp=1, ep=1):
+    from serve_sim.transfer import transfer_duration
+
+    weight_bytes = ParallelismPlanner(model, device).footprint(pp, ep, 0)
+    source = system.input_memory
+    dst = device.first_tier_memory
+    return transfer_duration(weight_bytes, source, dst, system.link_between(source, dst))
+
+
+def test_weight_loading_off_by_default_matches_solo():
+    model = toy_model()
+    system = make_system(1)
+    device = system.compute_devices[0]
+    req = Request(0, model, 64, 8, 0.0)
+
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run([req])
+
+    # Default strategy assumes weights resident: no transfer events, solo timing.
+    assert not [e for e in result.events if e.phase == "transfer"]
+    assert result.record_for(0).completion_time == pytest.approx(
+        solo_makespan(model, device, 64, 8)
+    )
+
+
+def test_weight_loading_prepends_transfer_and_delays_compute():
+    model = toy_model()
+    system = make_system(1)
+    device = system.compute_devices[0]
+    req = Request(0, model, 64, 8, 0.0)
+    strat = StrategyConfig(max_batch_size=1, model_weight_loading=True)
+
+    result = Simulator(system, strat).run([req])
+
+    loads = [e for e in result.events if e.phase == "transfer" and e.rescaled]
+    assert loads, "expected a weight-load transfer"
+    load = loads[0]
+    assert load.start == pytest.approx(0.0)
+    assert load.group_index == -1
+    assert load.memory == system.input_memory.name
+    assert load.bytes_read > 0
+    load_seconds = _weight_load_seconds(system, model, device)
+    assert load.end == pytest.approx(load_seconds)
+    # Compute waits for the load, so the request finishes a solo run later.
+    assert result.record_for(0).completion_time == pytest.approx(
+        load_seconds + solo_makespan(model, device, 64, 8)
+    )
+
+
+def test_weight_loading_charged_once_for_resident_model():
+    # Two same-model requests serialized on one slot: only the first pays the
+    # load; the second reuses the resident weights.
+    model = toy_model()
+    system = make_system(1)
+    strat = StrategyConfig(
+        max_batch_size=1, target_concurrency=1, model_weight_loading=True
+    )
+    reqs = [Request(0, model, 64, 8, 0.0), Request(1, model, 64, 8, 0.0)]
+
+    result = Simulator(system, strat).run(reqs)
+
+    loads = [e for e in result.events if e.phase == "transfer" and not e.rescaled]
+    assert len(loads) == 1
+
+
+def test_weight_loading_reloads_when_slot_repurposed():
+    # Two different models on a single slot, served one after the other: each is
+    # loaded when it lands on the slot (the second evicts the first).
+    from serve_sim.model import toy_moe_model
+
+    model_a = toy_model()
+    model_b = toy_moe_model()
+    system = make_system(1)
+    strat = StrategyConfig(
+        max_batch_size=1, target_concurrency=1, model_weight_loading=True
+    )
+    reqs = [Request(0, model_a, 64, 8, 0.0), Request(1, model_b, 64, 8, 0.0)]
+
+    result = Simulator(system, strat).run(reqs)
+
+    loads = [e for e in result.events if e.phase == "transfer" and not e.rescaled]
+    assert len(loads) == 2
+
+
+
 # --- prefill/decode disaggregation (PDD) ---------------------------------------
 
 

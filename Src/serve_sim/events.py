@@ -33,7 +33,7 @@ import random
 from dataclasses import dataclass, field
 
 from .blocks import LayeredModel
-from .hardware import ComputeDevice
+from .hardware import ComputeDevice, MemoryDevice
 from .shards import WorkShard
 from .tiering import ExpertResidencyCache, GroupActivation
 
@@ -53,6 +53,11 @@ class ComputeEvent:
         duration: ``max(compute_time, bandwidth_time)``.
         start: Start time on the global clock.
         end: End time on the global clock.
+        source_memory: For a transfer that streams from a memory not derivable
+            from ``device_index`` (e.g. a weight load from the system input NVM),
+            the source memory the arbiter should contend the bandwidth on; left
+            ``None`` for compute and for transfers whose source is the device's
+            own second/first tier.
     """
 
     group_index: int
@@ -65,6 +70,7 @@ class ComputeEvent:
     duration: float
     start: float
     end: float
+    source_memory: MemoryDevice | None = None
 
 
 @dataclass
