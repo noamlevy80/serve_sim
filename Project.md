@@ -237,7 +237,7 @@ The simulator class is responsible for making the technical connections between 
 The class uses abstraction and methods from the other classes to perform its work.
 This includes:
 1. Keeping track of inflight sequences. Instantiating and deleting event generators
-2. Prefix comparisons between incoming sequences and in flight sequences. Keeping track of simulated KV cache to allow prefix actual reuse.
+2. Prefix comparisons between every incoming sequence and the KV of every sequence that has not yet been evicted (not only the previous turn of the same conversation, and not only sequences currently in flight). Keeping track of simulated KV cache, system-wide, to allow actual prefix reuse across conversations. See "Global KV cache" below.
 3. Keeping track of device usage and making sure event generators are correctly aware of one another in order to rescale events.
 4. Executing the orchestrator decision with regards to placement of batches onto hardware, and movement of batches and KV cache between devices.
 
@@ -262,6 +262,19 @@ When prefill-decode disaggregation is enabled (`allow_pdd`), the engine slots ar
 
 Concretely, an engine slot is a *fixed device budget* (the parallelism degree); the search only chooses how to wire it into a `pipeline x expert` arrangement. Since a single batch has no pipeline overlap, the speed estimate favours expert parallelism (`time ~ max(compute, bandwidth) / expert_parallel`), while pipeline parallelism is what relieves memory: pipeline stages shard the layers, whereas expert parallelism shards only the routed experts and replicates the attention/dense/shared/LM-head weights and the KV cache across ranks. The search therefore takes the most expert-parallel arrangement that still fits each device's memory, reaching for more pipeline stages only when a batch would otherwise not fit. This search is opt-in (`auto_parallelism`); by default the configured pipeline/expert degrees are used as-is.
 
+### Global KV cache
+The orchestrator keeps a single, system-wide record of every sequence's KV cache that has not yet been evicted, so prefixes can be reused across conversations (not merely between consecutive turns of one conversation) and the KV may live anywhere in the memory hierarchy (not only on the device that last served the sequence). This is enabled by `global_kv_cache` (default true); when off, the only reuse is the previous-turn-of-the-same-conversation heuristic.
+
+**Where KV lives.** A compute device's first-tier memory (e.g. HBM) holds a sequence's KV only while that device is actively computing the sequence. Once a turn completes, its KV is moved off the device into a *floating* memory — any node's CPU-managed node memory — where it persists for later reuse. The system NVM (the weight input device) is never used to hold KV. The floating pool therefore spans every node memory in the system; an entry may be placed on, or migrated to, a node memory on a *different* node than the one that served it.
+
+**Admission (prefix comparison).** When a sequence is about to be dispatched, the orchestrator compares it against every non-evicted entry of the same model and takes the longest message-aligned common prefix. That prefix length becomes the sequence's cached-token count (its prefill skips those tokens), and the matched entry is recorded as the reuse source (its conversation, turn and the floating memory holding it). The cached prefix is fetched from that floating memory into the serving device's first-tier memory as a modeled transfer over the appropriate link (in-node CXL, or the scale-up network across nodes); the prefill waits on that fetch, and the arbiter contends its bytes against all other in-flight work, so a slow KV link shows up as added time-to-first-token. This produces a `kv_reuse` decision (the logical reuse) and a `kv_transfer` decision (the physical fetch).
+
+**Completion (offload/migration).** When a turn completes, its full context KV (prompt + generated tokens) is moved from the serving device into a floating memory as a modeled, arbiter-accounted transfer (a `kv_transfer` decision), freeing the device's first-tier memory for the next batch. The orchestrator places the entry on any floating memory that has room, migrating across nodes if necessary to avoid evicting a still-useful entry.
+
+**Capacity and eviction.** Stored KV competes for floating-memory capacity with everything else resident there. As long as some floating memory has room the entry is kept; only when the whole floating pool is full does the orchestrator evict, choosing victims by least-recently-used at the granularity of a whole stored sequence (sequence-level resolution, for simplicity). Each eviction is a `kv_eviction` decision. A reuse refreshes an entry's recency, so hot prefixes survive while cold ones are reclaimed first.
+
+
+
 ### Strategy
 The orchestration strategy is configured by a few knobs:
 - Target concurrency: how many sequences the simulator tries to keep in flight, counted datacenter-wide across all in-flight batches.
@@ -269,6 +282,7 @@ The orchestration strategy is configured by a few knobs:
 - Allow PDD: whether prefill-decode disaggregation may be used.
 - Prefill engine fraction: when PDD is enabled, the share of engine slots devoted to prefill (the rest serve decode).
 - Max parallelism degrees: caps on pipeline and expert parallelism the roofline search may choose from.
+- Global KV cache: whether the system-wide, cross-conversation KV cache (with LRU eviction and KV migration across floating memories) is active.
 
 ## List of simulation parameters (to appear in config.JSON)
 - max_concurrency (default 8)
@@ -287,6 +301,8 @@ The orchestration strategy is configured by a few knobs:
     The maximum parallelism rank the orchestrator should explore
 - prefill_chunk_size (default null)
     If set, prefill is split into chunks of this many tokens; null means prefill the whole prompt in one shard
+- global_kv_cache (default true)
+    If true, the orchestrator keeps a system-wide record of non-evicted KV, reuses the longest message-aligned prefix across conversations, offloads completed KV to floating (node) memories with arbiter-accounted transfers, and evicts by LRU at sequence granularity when the floating pool is full. If false, only the previous-turn-of-the-same-conversation reuse applies.
 
 - expert_persistance_mean (default 16)    
 - expert_persistance_var (default 4)

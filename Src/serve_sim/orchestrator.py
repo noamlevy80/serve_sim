@@ -37,6 +37,7 @@ from .events import ComputeEvent, EventGenerator
 from .parallelism import ParallelismPlanner
 from .pdd import context_kv_bytes, kv_transfer_duration, split_work
 from .placement import EnginePool, EngineSlot
+from .kv_store import KVCacheManager, Match
 from .shards import WorkShardGenerator
 from .system import System
 from .tokenizer import Tokenizer
@@ -80,6 +81,13 @@ class StrategyConfig:
             ``1 + U(-range, range)`` to model system randomness; ``0`` disables it.
         random_seed: Seed for the run's randomness (event-time perturbation);
             ``None`` draws a non-deterministic seed.
+        global_kv_cache: When ``True`` (default) the orchestrator keeps a
+            system-wide record of every non-evicted sequence's KV, reuses the
+            longest message-aligned prefix across conversations, offloads
+            completed KV to floating (node) memories as arbiter-accounted
+            transfers, and evicts least-recently-used whole sequences when the
+            floating pool is full. When ``False`` only the previous-turn reuse of
+            the same conversation applies. Inert on systems with no node memory.
     """
 
     max_batch_size: int = 1
@@ -94,6 +102,7 @@ class StrategyConfig:
     model_weight_loading: bool = False
     event_random_factor_range: float = 0.0
     random_seed: int | None = None
+    global_kv_cache: bool = True
 
     def __post_init__(self) -> None:
         if self.max_batch_size < 1:
@@ -127,6 +136,10 @@ class Request:
         workload_id: Source conversation/workload identifier (``-1`` if the
             request was not built from a workload).
         turn_index: Turn within the workload that produced this request.
+        tracker: The :class:`~serve_sim.tracker.SequenceTracker` this request was
+            built from, carried so the global KV cache can compare message-aligned
+            prefixes across conversations. ``None`` for requests built directly
+            from token counts (no cross-sequence reuse is possible for those).
     """
 
     request_id: int
@@ -137,6 +150,7 @@ class Request:
     cached_tokens: int = 0
     workload_id: int = -1
     turn_index: int = 0
+    tracker: object | None = None
 
     def __post_init__(self) -> None:
         if self.prompt_tokens < 0 or self.output_tokens < 0 or self.cached_tokens < 0:
@@ -182,6 +196,7 @@ class Request:
             cached_tokens=tracker.cached_tokens,
             workload_id=workload_id,
             turn_index=turn_index,
+            tracker=tracker,
         )
 
 
@@ -532,6 +547,10 @@ class Simulator:
         # model instance since the layout depends only on the model and device.
         self._planners: dict[int, ParallelismPlanner] = {}
         self._rng = random.Random(self.strategy.random_seed)
+        # System-wide persistent KV cache (cross-conversation prefix reuse, LRU
+        # eviction, migration across floating memories). Inert when disabled or
+        # when the system has no floating (node) memory to offload KV into.
+        self._kv = KVCacheManager(system) if self.strategy.global_kv_cache else None
 
     def _planner_for(self, model: object) -> ParallelismPlanner:
         key = id(model)
@@ -636,6 +655,13 @@ class Simulator:
                             first_token_time=first_token_time,
                         )
                     )
+                    # Offload this turn's KV to floating memory so a later
+                    # sequence can reuse its prefix (evicting LRU if the floating
+                    # pool is full).
+                    if self._kv_active:
+                        self._store_completed_kv(
+                            arbiter, req, slot, end, result, b_index
+                        )
                     # Release this workload's next turn now that this one is
                     # done (it arrives the instant its predecessor completes).
                     follow_on = next_of.get((req.workload_id, req.turn_index))
@@ -667,7 +693,13 @@ class Simulator:
                 if batch is None:
                     break  # concurrency full; wait for a completion
                 in_flight += len(batch)
-                job_index, slot, pp, ep = self._dispatch(arbiter, batch)
+                matches: dict[int, Match] = {}
+                kv_fetches: list[tuple[object, float]] | None = None
+                if self._kv_active:
+                    batch, matches = self._resolve_kv(batch, now)
+                    kv_fetches = self._kv_fetches(batch, matches)
+                job_index, slot, pp, ep = self._dispatch(
+                    arbiter, batch, kv_fetches=kv_fetches)
                 device_names = tuple(d.name for d in slot.devices)
                 members = tuple((r.workload_id, r.turn_index) for r in batch)
                 for req in batch:
@@ -675,7 +707,11 @@ class Simulator:
                         now, "prefill", req, device_names, batch_index,
                         tokens=req.prompt_tokens - req.cached_tokens,
                         batch_members=members))
-                    if req.cached_tokens > 0:
+                    match = matches.get(id(req))
+                    if match is not None:
+                        self._emit_kv_reuse(
+                            result, req, match, device_names, batch_index, now)
+                    elif req.cached_tokens > 0:
                         result.decisions.append(_decision(
                             now, "kv_reuse", req, device_names, batch_index,
                             tokens=req.cached_tokens,
@@ -830,6 +866,12 @@ class Simulator:
                                 first_token_time=first_token_time,
                             )
                         )
+                        # Offload this turn's KV to floating memory for later
+                        # cross-conversation prefix reuse (evicting LRU if full).
+                        if self._kv_active:
+                            self._store_completed_kv(
+                                arbiter, req, slot, end, result, b_index
+                            )
                         # Release this workload's next turn now that this one
                         # is done; it enters the prefill queue for its turn.
                         follow_on = next_of.get((req.workload_id, req.turn_index))
@@ -873,8 +915,14 @@ class Simulator:
                 if batch is None:
                     break  # concurrency full; wait for a decode completion
                 in_flight += len(batch)
+                matches: dict[int, Match] = {}
+                kv_fetches: list[tuple[object, float]] | None = None
+                if self._kv_active:
+                    batch, matches = self._resolve_kv(batch, now)
+                    kv_fetches = self._kv_fetches(batch, matches)
                 job_index, slot, pp, ep = self._dispatch(
-                    arbiter, batch, pool=self._prefill_pool, phase="prefill"
+                    arbiter, batch, pool=self._prefill_pool, phase="prefill",
+                    kv_fetches=kv_fetches,
                 )
                 device_names = tuple(d.name for d in slot.devices)
                 members = tuple((r.workload_id, r.turn_index) for r in batch)
@@ -884,7 +932,11 @@ class Simulator:
                         now, "prefill", req, device_names, batch_index,
                         tokens=req.prompt_tokens - req.cached_tokens,
                         batch_members=members))
-                    if req.cached_tokens > 0:
+                    match = matches.get(id(req))
+                    if match is not None:
+                        self._emit_kv_reuse(
+                            result, req, match, device_names, batch_index, now)
+                    elif req.cached_tokens > 0:
                         result.decisions.append(_decision(
                             now, "kv_reuse", req, device_names, batch_index,
                             tokens=req.cached_tokens,
@@ -1131,15 +1183,18 @@ class Simulator:
         *,
         pool: EnginePool | None = None,
         phase: str = "full",
+        kv_fetches: list[tuple[object, float]] | None = None,
     ) -> tuple[int, EngineSlot, int, int]:
         """Place a batch on an engine slot and admit its events to the arbiter.
 
         ``phase`` selects the work generated: ``"full"`` (prefill + decode in one
         job, the default), ``"prefill"`` (prompt forward pass only) or
         ``"decode"`` (generation from a fully-cached prompt). ``pool`` defaults to
-        the single engine pool; PDD passes the prefill or decode pool. Returns the
-        arbiter job index, the slot the batch occupies (released on completion),
-        and the ``(pipeline_parallel, expert_parallel)`` arrangement chosen.
+        the single engine pool; PDD passes the prefill or decode pool.
+        ``kv_fetches`` lists ``(floating_memory, bytes)`` prefixes to fetch from
+        the global KV cache before compute. Returns the arbiter job index, the
+        slot the batch occupies (released on completion), and the
+        ``(pipeline_parallel, expert_parallel)`` arrangement chosen.
         """
 
         model = batch[0].model
@@ -1159,38 +1214,35 @@ class Simulator:
             event_random_factor_range=self.strategy.event_random_factor_range,
             rng=self._rng,
         )
+        loads: list[ComputeEvent] = []
         if self.strategy.model_weight_loading and placement.needs_weight_load:
-            events = self._with_weight_load(
-                model, slot, pp, ep, generator.run(shards).events
-            )
+            loads = self._weight_load_events(model, slot, pp, ep)
+        fetches = self._kv_fetch_events(slot, kv_fetches) if kv_fetches else []
+        prelude = loads + fetches
+        if prelude:
+            events = self._prepend_transfers(prelude, generator.run(shards).events)
             return arbiter.admit_events(events, list(slot.devices)), slot, pp, ep
         return arbiter.admit(generator, shards), slot, pp, ep
 
-    def _with_weight_load(
-        self,
-        model: object,
-        slot: EngineSlot,
-        pp: int,
-        ep: int,
-        compute_events: list[ComputeEvent],
+    @staticmethod
+    def _prepend_transfers(
+        prelude: list[ComputeEvent], compute_events: list[ComputeEvent]
     ) -> list[ComputeEvent]:
-        """Prepend the model's weight-load transfers ahead of its compute events.
+        """Prepend transfer events (weight loads / KV fetches) ahead of compute.
 
-        Each device in the slot streams its weight shards from the system input
-        NVM into its first-tier memory; the compute events are shifted to start
-        once the loads finish so the batch waits for its weights (the arbiter then
-        contends the loads on the shared NVM bandwidth).
+        The compute events are shifted to start once every prelude transfer has
+        finished, so the batch waits for its weights and reused prefixes; the
+        arbiter then contends the transfers' bytes on their shared memories.
         """
 
-        loads = self._weight_load_events(model, slot, pp, ep)
-        if not loads:
+        if not prelude:
             return list(compute_events)
-        offset = max(event.end for event in loads)
+        offset = max(event.end for event in prelude)
         shifted = [
             replace(event, start=event.start + offset, end=event.end + offset)
             for event in compute_events
         ]
-        return loads + shifted
+        return prelude + shifted
 
     def _weight_load_events(
         self, model: object, slot: EngineSlot, pp: int, ep: int
@@ -1227,6 +1279,211 @@ class Simulator:
                 )
             )
         return events
+
+    # --- global KV cache ----------------------------------------------------
+
+    @property
+    def _kv_active(self) -> bool:
+        """Whether the system-wide KV cache is on and has somewhere to store KV."""
+
+        return self._kv is not None and self._kv.enabled
+
+    def _resolve_kv(
+        self, batch: list[Request], now: float
+    ) -> tuple[list[Request], dict[int, Match]]:
+        """Set each request's cached prefix from the global KV cache.
+
+        Replaces every request's cached-token count with the longest message
+        aligned prefix found among non-evicted entries of the same model (zero
+        when nothing matches -- the previous turn, if still resident, is itself an
+        entry, so a miss means it was evicted or no prefix is shared). Returns the
+        replaced batch and a map from each replaced request's ``id`` to its reuse
+        match, for decision emission and the prefix fetch.
+        """
+
+        resolved: list[Request] = []
+        matches: dict[int, Match] = {}
+        for req in batch:
+            if req.tracker is None:
+                # No message structure to prefix-match: leave the request's own
+                # cached-token count (e.g. a directly-built request) untouched.
+                resolved.append(req)
+                continue
+            match = self._kv.lookup(req.model, req.tracker, now)
+            cached = min(match.prefix_tokens, req.prompt_tokens) if match else 0
+            req = replace(req, cached_tokens=cached)
+            if match is not None and cached > 0:
+                matches[id(req)] = match
+            resolved.append(req)
+        return resolved, matches
+
+    def _kv_fetches(
+        self, batch: list[Request], matches: dict[int, Match]
+    ) -> list[tuple[object, float]]:
+        """``(floating_memory, bytes)`` to fetch for each reused prefix in a batch."""
+
+        fetches: list[tuple[object, float]] = []
+        for req in batch:
+            match = matches.get(id(req))
+            if match is not None and req.cached_tokens > 0:
+                num_bytes = float(context_kv_bytes(req.model, req.cached_tokens))
+                fetches.append((match.entry.memory, num_bytes))
+        return fetches
+
+    def _kv_fetch_events(
+        self, slot: EngineSlot, fetches: list[tuple[object, float]]
+    ) -> list[ComputeEvent]:
+        """Transfer events that fetch reused prefixes from floating memory.
+
+        Each ``(floating_memory, bytes)`` becomes one ``transfer`` event reading
+        the cached prefix into a slot device's first-tier memory (round-robined
+        across the slot so several fetches parallelise). The link latency is
+        folded into ``bandwidth_time`` so the arbiter reproduces the duration
+        while contending the floating memory's bandwidth against all other
+        in-flight transfers; the batch's compute waits on the fetch.
+        """
+
+        events: list[ComputeEvent] = []
+        num_devices = len(slot.devices)
+        for index, (source, num_bytes) in enumerate(fetches):
+            slot_index = index % num_devices
+            destination = slot.devices[slot_index].first_tier_memory
+            link = self.system.link_between(source, destination)
+            duration = transfer_duration(num_bytes, source, destination, link)
+            events.append(
+                ComputeEvent(
+                    group_index=-1,
+                    phase="transfer",
+                    device_index=slot_index,
+                    flops=0.0,
+                    bytes_read=num_bytes,
+                    compute_time=0.0,
+                    bandwidth_time=duration,
+                    duration=duration,
+                    start=0.0,
+                    end=duration,
+                    source_memory=source,
+                )
+            )
+        return events
+
+    def _emit_kv_reuse(
+        self,
+        result: RunResult,
+        req: Request,
+        match: Match,
+        device_names: tuple[str, ...],
+        batch_index: int,
+        now: float,
+    ) -> None:
+        """Record the ``kv_reuse`` + ``kv_transfer`` decisions for a prefix hit.
+
+        The reuse names the source sequence (its conversation/turn) and the
+        floating memory holding the prefix; the transfer is the physical fetch of
+        that prefix into the serving devices.
+        """
+
+        source_memory = (match.entry.memory.name,)
+        result.decisions.append(_decision(
+            now, "kv_reuse", req, source_memory, batch_index,
+            tokens=req.cached_tokens,
+            source_workload_id=match.entry.workload_id,
+            source_turn_index=match.entry.turn_index,
+            source_devices=device_names))
+        result.decisions.append(_decision(
+            now, "kv_transfer", req, device_names, batch_index,
+            tokens=req.cached_tokens,
+            source_workload_id=match.entry.workload_id,
+            source_turn_index=match.entry.turn_index,
+            source_devices=source_memory))
+
+    def _store_completed_kv(
+        self,
+        arbiter: IncrementalArbiter,
+        req: Request,
+        slot: EngineSlot,
+        now: float,
+        result: RunResult,
+        batch_index: int,
+    ) -> None:
+        """Offload a finished sequence's KV to floating memory; record decisions.
+
+        Stores the full context (prompt + generated) KV in the global cache,
+        evicting LRU entries if the floating pool is full, and admits an
+        arbiter-accounted ``transfer`` for the device->floating move (so its
+        bandwidth contends with concurrent work). Emits a ``kv_eviction`` decision
+        per evicted entry and a ``kv_transfer`` decision for the offload.
+        """
+
+        context_tokens = req.prompt_tokens + req.output_tokens
+        store = self._kv.store(
+            req.model, req.tracker, req.workload_id, req.turn_index,
+            context_tokens, now,
+        )
+        for victim in store.evicted:
+            result.decisions.append(self._eviction_decision(now, victim))
+        if store.memory is None:
+            return
+        device_names = tuple(d.name for d in slot.devices)
+        self._admit_kv_move(arbiter, slot.devices[0], store.memory, store.num_bytes)
+        result.decisions.append(_decision(
+            now, "kv_transfer", req, (store.memory.name,), batch_index,
+            tokens=context_tokens, source_request_id=req.request_id,
+            source_workload_id=req.workload_id, source_turn_index=req.turn_index,
+            source_devices=device_names))
+
+    def _admit_kv_move(
+        self,
+        arbiter: IncrementalArbiter,
+        device,
+        floating,
+        num_bytes: float,
+    ) -> None:
+        """Admit a standalone, arbiter-accounted KV offload transfer.
+
+        Moves ``num_bytes`` of KV from ``device``'s first-tier memory to the
+        ``floating`` memory. The transfer contends the floating memory's bandwidth
+        (the binding resource for offload), so a slow floating tier surfaces as
+        contention on concurrent work; it holds no engine slot and does not delay
+        the served request, which has already retired.
+        """
+
+        if num_bytes <= 0:
+            return
+        link = self.system.link_between(device.first_tier_memory, floating)
+        duration = transfer_duration(
+            num_bytes, device.first_tier_memory, floating, link
+        )
+        event = ComputeEvent(
+            group_index=-1,
+            phase="transfer",
+            device_index=0,
+            flops=0.0,
+            bytes_read=num_bytes,
+            compute_time=0.0,
+            bandwidth_time=duration,
+            duration=duration,
+            start=0.0,
+            end=duration,
+            source_memory=floating,
+        )
+        arbiter.admit_events([event], [device])
+
+    @staticmethod
+    def _eviction_decision(now: float, entry) -> DecisionRecord:
+        """A ``kv_eviction`` decision for an LRU-evicted stored sequence."""
+
+        return DecisionRecord(
+            time=now,
+            kind="kv_eviction",
+            request_id=-1,
+            workload_id=entry.workload_id,
+            turn_index=entry.turn_index,
+            model=getattr(entry.model, "name", "model"),
+            devices=(entry.memory.name,),
+            batch_index=-1,
+            tokens=entry.context_tokens,
+        )
 
     @staticmethod
     def _phase_work(req: Request, phase: str) -> SequenceWork:
