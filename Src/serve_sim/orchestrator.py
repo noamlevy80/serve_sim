@@ -30,7 +30,7 @@ from __future__ import annotations
 import random
 import time
 from dataclasses import dataclass, field, replace
-from typing import Callable
+from typing import Callable, Sequence
 
 from .arbiter import IncrementalArbiter
 from .events import ComputeEvent, EventGenerator
@@ -218,6 +218,15 @@ class RequestRecord:
             return None
         return (self.completion_time - self.first_token_time) / (self.output_tokens - 1)
 
+    @property
+    def tps(self) -> float | None:
+        """Decode tokens-per-second (the reciprocal of ``tpot``)."""
+
+        tpot = self.tpot
+        if tpot is None or tpot <= 0:
+            return None
+        return 1.0 / tpot
+
 
 @dataclass(frozen=True)
 class EventRecord:
@@ -290,17 +299,41 @@ class RunProgress:
     """A progress update emitted as a run retires completed sequences.
 
     ``sim_time`` is the simulation clock at the moment of the update; ``wall_time``
-    is the real time elapsed since the run started.
+    is the real time elapsed since the run started. ``avg_tps`` and ``avg_ttft``
+    are the running mean decode tokens-per-second and time-to-first-token over the
+    sequences retired so far (``None`` until at least one is measurable).
     """
 
     completed: int
     total: int
     sim_time: float
     wall_time: float
+    avg_tps: float | None = None
+    avg_ttft: float | None = None
 
 
 # Called with a :class:`RunProgress` whenever the completed-sequence count grows.
 ProgressCallback = Callable[["RunProgress"], None]
+
+
+def _running_averages(records: Sequence["RequestRecord"]) -> tuple[float | None, float | None]:
+    """Running mean decode TPS and TTFT over the retired records (skip ``None``)."""
+
+    tpss = [r.tps for r in records if r.tps is not None]
+    ttfts = [r.ttft for r in records if r.ttft is not None]
+    avg_tps = sum(tpss) / len(tpss) if tpss else None
+    avg_ttft = sum(ttfts) / len(ttfts) if ttfts else None
+    return avg_tps, avg_ttft
+
+
+def _first_token_end(events: Sequence[object]) -> float | None:
+    """Completion time of the earliest decode group in a finished job's events."""
+
+    decode = [e for e in events if getattr(e, "phase", None) == "decode"]
+    if not decode:
+        return None
+    first_group = min(e.group_index for e in decode)
+    return max(e.end for e in decode if e.group_index == first_group)
 
 
 @dataclass
@@ -410,8 +443,10 @@ class Simulator:
 
         def report(now: float) -> None:
             if progress is not None:
+                avg_tps, avg_ttft = _running_averages(result.records)
                 progress(RunProgress(len(result.records), total, now,
-                                     time.perf_counter() - start_wall))
+                                     time.perf_counter() - start_wall,
+                                     avg_tps, avg_ttft))
 
         # job_index -> (requests, dispatch_time, batch_index, slot)
         jobs: dict[int, tuple[list[Request], float, int, EngineSlot]] = {}
@@ -461,6 +496,9 @@ class Simulator:
                 end = arbiter.job_end_time(job_index)
                 in_flight -= len(reqs)
                 self._pool.release(slot)
+                first_token_time = _first_token_end(
+                    arbiter.job_rescaled_events(job_index)
+                )
                 for req in reqs:
                     result.records.append(
                         RequestRecord(
@@ -471,6 +509,7 @@ class Simulator:
                             prompt_tokens=req.prompt_tokens,
                             output_tokens=req.output_tokens,
                             batch_index=b_index,
+                            first_token_time=first_token_time,
                         )
                     )
             if len(result.records) != completed_before:
@@ -564,8 +603,10 @@ class Simulator:
 
         def report(now: float) -> None:
             if progress is not None:
+                avg_tps, avg_ttft = _running_averages(result.records)
                 progress(RunProgress(len(result.records), total, now,
-                                     time.perf_counter() - start_wall))
+                                     time.perf_counter() - start_wall,
+                                     avg_tps, avg_ttft))
 
         def transfer_ready_time(req: Request, prefill_end: float) -> float:
             kv_bytes = context_kv_bytes(req.model, req.prompt_tokens)
@@ -622,6 +663,9 @@ class Simulator:
                         pending.append((req, transfer_ready_time(req, end)))
                 else:  # decode complete -> request done
                     in_flight -= len(reqs)
+                    first_token_time = _first_token_end(
+                        arbiter.job_rescaled_events(job_index)
+                    )
                     for req in reqs:
                         dispatch_time, b_index = meta[id(req)]
                         result.records.append(
@@ -633,6 +677,7 @@ class Simulator:
                                 prompt_tokens=req.prompt_tokens,
                                 output_tokens=req.output_tokens,
                                 batch_index=b_index,
+                                first_token_time=first_token_time,
                             )
                         )
             if len(result.records) != completed_before:
@@ -1020,11 +1065,29 @@ class Simulator:
 
         Fixed from the strategy unless ``auto_parallelism`` is set, in which case
         the planner searches the factorizations of the engine size for the
-        fastest memory-feasible arrangement of this batch.
+        fastest memory-feasible arrangement of this batch. Either way the chosen
+        arrangement must fit in device memory; a batch that cannot be placed
+        raises rather than producing a physically impossible (over-capacity)
+        schedule.
         """
 
+        planner = self._planner_for(model)
+        kv_tokens = sum(req.prompt_tokens + req.output_tokens for req in batch)
+
         if not self.strategy.auto_parallelism:
-            return self.strategy.pipeline_parallel, self.strategy.expert_parallel
+            pp = self.strategy.pipeline_parallel
+            ep = self.strategy.expert_parallel
+            per_device = planner.footprint(pp, ep, kv_tokens)
+            if per_device > planner.capacity:
+                raise ValueError(
+                    f"fixed parallelism pp={pp}, ep={ep} cannot serve a batch of "
+                    f"{kv_tokens} KV tokens: the per-device footprint is "
+                    f"{per_device:.0f} bytes but device memory holds only "
+                    f"{planner.capacity:.0f} bytes. Raise pipeline_parallel/"
+                    f"expert_parallel, enable auto_parallelism, or use a device "
+                    f"with more memory."
+                )
+            return pp, ep
 
         flops_by_dtype: dict[int, float] = {}
         total_bytes = 0.0
@@ -1033,8 +1096,7 @@ class Simulator:
                 flops_by_dtype.get(shard.flops_dtype_bytes, 0.0) + shard.flops
             )
             total_bytes += shard.bytes_read
-        kv_tokens = sum(req.prompt_tokens + req.output_tokens for req in batch)
-        choice = self._planner_for(model).plan(
+        choice = planner.plan(
             self._degree,
             kv_tokens=kv_tokens,
             flops_by_dtype=flops_by_dtype,

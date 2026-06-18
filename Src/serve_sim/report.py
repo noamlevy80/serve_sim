@@ -289,6 +289,7 @@ def summarize(result: RunResult) -> dict[str, Any]:
         "queue_delay_s": _distribution(r.queue_delay for r in records),
         "ttft_s": _distribution(r.ttft for r in records),
         "tpot_s": _distribution(r.tpot for r in records),
+        "tps_tokens_per_s": _distribution(r.tps for r in records),
     }
 
 
@@ -319,6 +320,7 @@ def _request_rows(records: Sequence[RequestRecord]) -> list[dict[str, Any]]:
             "latency": r.latency,
             "ttft": r.ttft,
             "tpot": r.tpot,
+            "tps": r.tps,
         })
     return rows
 
@@ -362,12 +364,15 @@ def _report_text(report: Mapping[str, Any], devices: Sequence[Mapping[str, Any]]
         f"  peak memory     {report['peak_memory_bytes']:.6g} bytes",
         f"  req throughput  {report['throughput_requests_per_s']:.6g} req/s",
         f"  tok throughput  {report['throughput_output_tokens_per_s']:.6g} out-tok/s",
+        f"  avg TPS         {report['tps_tokens_per_s']['mean']:.6g} tok/s",
+        f"  avg TTFT        {report['ttft_s']['mean']:.6g} s",
         "",
         "Distributions (seconds):",
         _format_distribution("latency", report["latency_s"]),
         _format_distribution("queue_delay", report["queue_delay_s"]),
         _format_distribution("ttft", report["ttft_s"]),
         _format_distribution("tpot", report["tpot_s"]),
+        _format_distribution("tps", report["tps_tokens_per_s"]),
         "",
         "Per-device:",
     ]
@@ -420,7 +425,7 @@ def write_outputs(
         out / "requests.csv",
         ["request_id", "arrival_time", "dispatch_time", "first_token_time",
          "completion_time", "prompt_tokens", "output_tokens", "batch_index",
-         "queue_delay", "latency", "ttft", "tpot"],
+         "queue_delay", "latency", "ttft", "tpot", "tps"],
         _request_rows(result.records),
     )
     _write_csv(out / "events_before_rescaling.csv", _EVENT_FIELDS,

@@ -180,26 +180,62 @@ class ResourceArbiter:
 
     @staticmethod
     def _link_dependencies(job_tasks: list[_Task]) -> None:
-        """Within a job, an event depends on every earlier event on the clock.
+        """Within a job, link each event to the *frontier* of its predecessors.
 
         ``EventGenerator`` lays a job's events on one non-decreasing clock, so an
         event's predecessors are exactly those that have already ended when it
         starts; concurrent events (e.g. expert-parallel ranks sharing a start)
-        do not depend on one another. Taking the latest predecessor end as the
-        earliest start reproduces the isolated schedule when uncontended.
+        do not depend on one another. Under contention an event starts at the
+        latest predecessor end, so it is enough to keep the predecessors that are
+        not already implied by a later-starting one: if predecessor ``p`` ends at
+        or before another predecessor ``q`` starts, then ``q`` depends on ``p``
+        and so waiting for ``q`` already waits for ``p``. Dropping such dominated
+        predecessors keeps the dependency graph linear in the event count (the
+        frontier is the width of the last concurrent barrier) instead of
+        quadratic, which is what makes long-decode jobs explode in memory.
         """
 
-        iso_makespan = max((t.event.end for t in job_tasks), default=0.0)
+        n = len(job_tasks)
+        if n == 0:
+            return
+        iso_makespan = max(t.event.end for t in job_tasks)
         eps = iso_makespan * 1e-12 if iso_makespan > 0 else 1e-15
-        for task in job_tasks:
-            start = task.event.start
-            preds = [
-                other.order
-                for other in job_tasks
-                if other is not task and other.event.end <= start + eps
-            ]
-            task.preds = preds
-            task.pending = len(preds)
+
+        by_end = sorted(job_tasks, key=lambda t: t.event.end)
+        by_start = sorted(job_tasks, key=lambda t: t.event.start)
+
+        end_ptr = 0
+        max_start = float("-inf")
+        latest: _Task | None = None  # pooled predecessor with the greatest start
+        frontier: list[_Task] = []   # pooled preds ending beyond ``max_start``
+
+        for task in by_start:
+            limit = task.event.start + eps
+            # Grow the predecessor pool with every event finished by this start.
+            while end_ptr < n and by_end[end_ptr].event.end <= limit:
+                other = by_end[end_ptr]
+                end_ptr += 1
+                if other.event.start > max_start:
+                    # A later-starting predecessor dominates anything ending by
+                    # its start, so the surviving frontier shrinks.
+                    max_start = other.event.start
+                    latest = other
+                    frontier = [c for c in frontier
+                                if c.event.end > max_start + eps]
+                if other.event.end > max_start + eps:
+                    frontier.append(other)
+
+            orders: list[int] = []
+            seen: set[int] = set()
+            for cand in frontier:
+                if cand is task or cand.order in seen:
+                    continue
+                seen.add(cand.order)
+                orders.append(cand.order)
+            if latest is not None and latest is not task and latest.order not in seen:
+                orders.append(latest.order)
+            task.preds = orders
+            task.pending = len(orders)
 
     def _simulate(self, tasks: list[_Task]) -> None:
         by_order: dict[tuple[int, int], _Task] = {

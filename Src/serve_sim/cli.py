@@ -71,6 +71,8 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"makespan={report['makespan_s']:.6g}s")
     print(f"  throughput={report['throughput_requests_per_s']:.6g} req/s, "
           f"{report['throughput_output_tokens_per_s']:.6g} out-tok/s")
+    print(f"  avg TPS={report['tps_tokens_per_s']['mean']:.6g} tok/s, "
+          f"avg TTFT={report['ttft_s']['mean']:.6g}s")
     print(f"  latency p50={report['latency_s']['p50']:.6g}s "
           f"p99={report['latency_s']['p99']:.6g}s; "
           f"ttft p50={report['ttft_s']['p50']:.6g}s")

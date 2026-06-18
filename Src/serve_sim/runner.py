@@ -73,11 +73,14 @@ class ProgressReporter:
         ):
             return
         self._last_wall = progress.wall_time
+        tps = f"{progress.avg_tps:7.1f}" if progress.avg_tps is not None else "      -"
+        ttft = f"{progress.avg_ttft:.4g}s" if progress.avg_ttft is not None else "-"
         line = (
             f"  {progress.completed}/{progress.total} sequences  "
-            f"sim={progress.sim_time:8.3f}s  wall={progress.wall_time:7.3f}s"
+            f"sim={progress.sim_time:8.3f}s  wall={progress.wall_time:7.3f}s  "
+            f"avg TPS={tps}  avg TTFT={ttft}"
         )
-        self._stream.write("\r" + line.ljust(60))
+        self._stream.write("\r" + line.ljust(80))
         if done:
             self._stream.write("\n")
         self._stream.flush()

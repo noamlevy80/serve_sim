@@ -394,6 +394,18 @@ def test_auto_parallelism_raises_when_batch_cannot_fit():
         Simulator(system, strat).run([req])
 
 
+def test_fixed_parallelism_raises_when_batch_cannot_fit():
+    # With auto-parallelism off the engine must still refuse a batch whose
+    # per-device footprint exceeds device memory, rather than emitting a
+    # physically impossible (over-capacity) schedule.
+    model = toy_model()
+    system = make_system(1, cap=1.0)  # 1-byte HBM: nothing fits
+    req = Request(0, model, 64, 8, 0.0)
+    strat = StrategyConfig(max_batch_size=1)  # auto_parallelism off by default
+    with pytest.raises(ValueError, match="fixed parallelism"):
+        Simulator(system, strat).run([req])
+
+
 # --- model grouping ------------------------------------------------------------
 
 

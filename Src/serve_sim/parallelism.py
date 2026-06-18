@@ -100,6 +100,12 @@ class ParallelismPlanner:
             )
         self._lm_head_bytes = self.model.lm_head_bytes
 
+    @property
+    def capacity(self) -> float:
+        """First-tier memory capacity (bytes) of the engine's device."""
+
+        return self._capacity
+
     # --- candidate enumeration ----------------------------------------------
 
     def factorizations(self, degree: int) -> list[tuple[int, int]]:
