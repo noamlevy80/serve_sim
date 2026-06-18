@@ -18,6 +18,7 @@ from serve_sim.hardware import ComputeDevice, MemoryDevice
 from serve_sim.model import toy_model
 from serve_sim.orchestrator import Request, Simulator, StrategyConfig
 from serve_sim.report import (
+    _decision_rows,
     device_summaries,
     device_timeline,
     memory_summaries,
@@ -215,9 +216,150 @@ def test_memory_summary_captures_weight_load_on_input_nvm():
     assert by_name["nvm"]["num_events"] >= 1
 
 
+# --- orchestration decisions ----------------------------------------------------
+
+
+def test_decisions_capture_prefill_and_decode():
+    model = toy_model()
+    system = make_system(1)
+    req = Request(0, model, prompt_tokens=32, output_tokens=4)
+
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run([req])
+
+    kinds = [d.kind for d in result.decisions]
+    assert "prefill" in kinds
+    assert "decode" in kinds
+    assert "kv_transfer" not in kinds  # no PDD, no cross-device transfer
+
+    prefill = next(d for d in result.decisions if d.kind == "prefill")
+    assert prefill.request_id == 0
+    assert prefill.tokens == 32
+    assert prefill.devices  # mapped to at least one device
+    decode = next(d for d in result.decisions if d.kind == "decode")
+    assert decode.tokens == 4
+
+
+def test_decisions_record_kv_reuse_with_source_sequence():
+    model = toy_model()
+    system = make_system(1)
+    # A second-turn request whose first 16 prompt tokens are already cached.
+    req = Request(0, model, prompt_tokens=48, output_tokens=4,
+                  cached_tokens=16, workload_id=7, turn_index=1)
+
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run([req])
+
+    reuse = [d for d in result.decisions if d.kind == "kv_reuse"]
+    assert reuse, "expected a KV reuse decision for a cached prefix"
+    r = reuse[0]
+    assert r.workload_id == 7
+    assert r.turn_index == 1
+    assert r.source_workload_id == 7
+    assert r.source_turn_index == 0
+    # Prefill only covers the uncached suffix.
+    prefill = next(d for d in result.decisions if d.kind == "prefill")
+    assert prefill.tokens == 32
+
+
+def test_decisions_list_batch_tenants_in_sequence():
+    model = toy_model()
+    system = make_system(1)
+    reqs = [Request(i, model, 32, 4, workload_id=i, turn_index=0) for i in range(3)]
+
+    result = Simulator(system, StrategyConfig(max_batch_size=3)).run(reqs)
+
+    # The three sequences share one batch, so each prefill/decode decision lists
+    # every tenant in its ``batch_members``.
+    expected = ((0, 0), (1, 0), (2, 0))
+    for kind in ("prefill", "decode"):
+        decisions = [d for d in result.decisions if d.kind == kind]
+        assert decisions
+        for d in decisions:
+            assert d.batch_members == expected
+    # kv-movement acts stay per-sequence (no batch tenant list).
+    for d in result.decisions:
+        if d.kind in ("kv_reuse", "kv_transfer"):
+            assert d.batch_members == ()
+
+    rows = _decision_rows(result.decisions)
+    prefill_rows = [r for r in rows if r["kind"] == "prefill"]
+    assert prefill_rows
+    for r in prefill_rows:
+        assert r["sequence"] == "w0t0 w1t0 w2t0"
+
+
+def test_workload_turns_are_serialized():
+    model = toy_model()
+    system = make_system(1)
+    # Three turns of the SAME conversation, all nominally arriving at t=0.
+    reqs = [Request(i, model, 32, 4, workload_id=0, turn_index=i) for i in range(3)]
+
+    result = Simulator(system, StrategyConfig(max_batch_size=8)).run(reqs)
+
+    # A later turn cannot start before its predecessor completes, so no two
+    # turns of the workload may share a batch.
+    by_batch: dict[int, set[int]] = {}
+    for rec in result.records:
+        by_batch.setdefault(rec.batch_index, set()).add(rec.request_id)
+    for members in by_batch.values():
+        assert len(members) == 1, "same-workload turns must not batch together"
+
+    # Each turn dispatches only after the previous one has completed.
+    by_id = {rec.request_id: rec for rec in result.records}
+    for i in range(1, 3):
+        assert by_id[i].dispatch_time >= by_id[i - 1].completion_time - 1e-9
+
+
+def test_distinct_workloads_still_batch_together():
+    model = toy_model()
+    system = make_system(1)
+    # First turns of three different conversations can batch together.
+    reqs = [Request(i, model, 32, 4, workload_id=i, turn_index=0) for i in range(3)]
+
+    result = Simulator(system, StrategyConfig(max_batch_size=3)).run(reqs)
+
+    batch_indices = {rec.batch_index for rec in result.records}
+    assert len(batch_indices) == 1
+
+
+def test_decisions_record_kv_transfer_under_pdd():
+    model = toy_model()
+    system = make_system(2)
+    req = Request(0, model, prompt_tokens=48, output_tokens=4)
+
+    result = Simulator(system, StrategyConfig(allow_pdd=True, max_batch_size=1)).run([req])
+
+    transfers = [d for d in result.decisions if d.kind == "kv_transfer"]
+    assert transfers, "expected a KV transfer between prefill and decode devices"
+    t = transfers[0]
+    assert t.request_id == 0
+    assert t.source_devices  # prefill devices recorded as the source
+    assert t.devices  # decode devices recorded as the destination
+
+
+def test_decision_summary_in_report_and_csv(tmp_path):
+    model = toy_model()
+    system = make_system(2)
+    reqs = [Request(i, model, 32, 4) for i in range(2)]
+    result = Simulator(system, StrategyConfig(allow_pdd=True, max_batch_size=1)).run(reqs)
+
+    report = summarize(result)
+    assert report["num_decisions"] == len(result.decisions)
+    assert sum(report["decision_counts"].values()) == len(result.decisions)
+    assert report["decision_counts"]["prefill"] >= 2
+    assert report["decision_counts"]["decode"] >= 2
+
+    out = write_outputs(result, tmp_path / "dec", run_id="dec", time_buckets=4)
+    with open(out / "orchestration_decisions.csv", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == len(result.decisions)
+    assert {"time", "kind", "request_id", "sequence", "devices",
+            "source_devices"} <= set(rows[0].keys())
+    # Rows are ordered by time.
+    times = [float(r["time"]) for r in rows]
+    assert times == sorted(times)
+
 
 # --- output files ---------------------------------------------------------------
-
 
 def test_write_outputs_creates_all_files(tmp_path):
     model = toy_model()
@@ -230,6 +372,7 @@ def test_write_outputs_creates_all_files(tmp_path):
 
     expected = [
         "run_report.json", "run_report.txt", "requests.csv",
+        "orchestration_decisions.csv",
         "events_before_rescaling.csv", "events_after_rescaling.csv",
         "device_summary.csv", "memory_summary.csv", "device_timeline.csv",
         "config.json",

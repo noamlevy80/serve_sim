@@ -207,10 +207,13 @@ def _build_requests(
 ) -> list[Request]:
     """Turn each suite conversation's turns into single-sequence requests.
 
-    Requests are spaced ``arrival_interval`` seconds apart (0 admits them all at
-    once). A turn with no work at all (empty prompt and no output) is skipped.
-    If ``progress`` is given it is called with a :class:`BuildProgress` after each
-    workload is processed (tokenizing a large suite can be slow).
+    Each workload's *first* turn arrives ``arrival_interval`` seconds after the
+    previous workload's (0 admits every workload at once); its later turns are
+    follow-ups the simulator releases only once the prior turn completes, so they
+    carry the same base arrival time here. A turn with no work at all (empty
+    prompt and no output) is skipped. If ``progress`` is given it is called with a
+    :class:`BuildProgress` after each workload is processed (tokenizing a large
+    suite can be slow).
     """
 
     requests: list[Request] = []
@@ -228,8 +231,9 @@ def _build_requests(
                 entry.workload,
                 model,
                 tokenizer,
-                arrival_time=rid * arrival_interval,
+                arrival_time=index * arrival_interval,
                 turn_index=turn_index,
+                workload_id=index,
             )
             if req.prompt_tokens == 0 and req.output_tokens == 0:
                 continue

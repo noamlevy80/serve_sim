@@ -8,6 +8,9 @@ PRD calls for and writes them under one run directory:
   makespan, and latency / TTFT / TPOT distributions.
 - ``requests.csv`` -- per-request arrival, dispatch, first-token and completion
   times plus latency, TTFT and TPOT.
+- ``orchestration_decisions.csv`` -- the ordered log of orchestration decisions
+  (prefill, decode, KV reuse and KV transfer) with the sequence, serving
+  devices, token counts and source sequence/devices for KV movements.
 - ``events_before_rescaling.csv`` / ``events_after_rescaling.csv`` -- the raw
   event log, as generated in isolation and after the arbiter rescales events for
   resource contention.
@@ -33,7 +36,13 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .orchestrator import EventRecord, JobRecord, RequestRecord, RunResult
+from .orchestrator import (
+    DecisionRecord,
+    EventRecord,
+    JobRecord,
+    RequestRecord,
+    RunResult,
+)
 
 # --- statistics -----------------------------------------------------------------
 
@@ -92,6 +101,18 @@ def _union_length(intervals: Sequence[tuple[float, float]]) -> float:
 # --- aggregation ----------------------------------------------------------------
 
 _COMPUTE_PHASES = ("prefill", "decode")
+
+# Orchestration-decision kinds, in report order.
+_DECISION_KINDS = ("prefill", "kv_reuse", "kv_transfer", "decode", "kv_eviction")
+
+
+def _decision_counts(decisions: Sequence[DecisionRecord]) -> dict[str, int]:
+    """Count of each orchestration-decision kind (all kinds, including zeros)."""
+
+    counts = {kind: 0 for kind in _DECISION_KINDS}
+    for d in decisions:
+        counts[d.kind] = counts.get(d.kind, 0) + 1
+    return counts
 
 
 def _rescaled(events: Sequence[EventRecord]) -> list[EventRecord]:
@@ -290,6 +311,8 @@ def summarize(result: RunResult) -> dict[str, Any]:
         "ttft_s": _distribution(r.ttft for r in records),
         "tpot_s": _distribution(r.tpot for r in records),
         "tps_tokens_per_s": _distribution(r.tps for r in records),
+        "num_decisions": len(result.decisions),
+        "decision_counts": _decision_counts(result.decisions),
     }
 
 
@@ -321,6 +344,55 @@ def _request_rows(records: Sequence[RequestRecord]) -> list[dict[str, Any]]:
             "ttft": r.ttft,
             "tpot": r.tpot,
             "tps": r.tps,
+        })
+    return rows
+
+
+def _sequence_id(workload_id: int | None, turn_index: int | None) -> str:
+    """Human-readable sequence id (``w<workload>t<turn>``), or empty if unknown."""
+
+    if workload_id is None or turn_index is None or workload_id < 0:
+        return ""
+    return f"w{workload_id}t{turn_index}"
+
+
+def _batch_sequence_ids(members: Sequence[tuple[int, int]]) -> str:
+    """Space-joined sequence ids for every tenant of a batch (skips synthetic)."""
+
+    ids = [s for (w, t) in members if (s := _sequence_id(w, t))]
+    return " ".join(ids)
+
+
+_DECISION_FIELDS = (
+    "time", "kind", "request_id", "sequence", "model", "devices", "batch_index",
+    "tokens", "source_sequence", "source_request_id", "source_devices",
+)
+
+
+def _decision_rows(decisions: Sequence[DecisionRecord]) -> list[dict[str, Any]]:
+    """Flatten orchestration decisions into CSV rows, ordered by time."""
+
+    rows = []
+    for d in sorted(decisions, key=lambda x: (x.time, x.request_id, x.kind)):
+        # Batched acts (prefill/decode) list every batch tenant in ``sequence``.
+        sequence = (
+            _batch_sequence_ids(d.batch_members) if d.batch_members
+            else _sequence_id(d.workload_id, d.turn_index)
+        )
+        rows.append({
+            "time": d.time,
+            "kind": d.kind,
+            "request_id": d.request_id,
+            "sequence": sequence,
+            "model": d.model,
+            "devices": " ".join(d.devices),
+            "batch_index": d.batch_index,
+            "tokens": d.tokens,
+            "source_sequence": _sequence_id(d.source_workload_id, d.source_turn_index),
+            "source_request_id": (
+                "" if d.source_request_id is None else d.source_request_id
+            ),
+            "source_devices": " ".join(d.source_devices),
         })
     return rows
 
@@ -373,6 +445,13 @@ def _report_text(report: Mapping[str, Any], devices: Sequence[Mapping[str, Any]]
         _format_distribution("ttft", report["ttft_s"]),
         _format_distribution("tpot", report["tpot_s"]),
         _format_distribution("tps", report["tps_tokens_per_s"]),
+        "",
+        "Orchestration decisions:",
+        f"  total           {report['num_decisions']}",
+    ]
+    for kind in _DECISION_KINDS:
+        lines.append(f"  {kind:<14} {report['decision_counts'].get(kind, 0)}")
+    lines += [
         "",
         "Per-device:",
     ]
@@ -428,6 +507,8 @@ def write_outputs(
          "queue_delay", "latency", "ttft", "tpot", "tps"],
         _request_rows(result.records),
     )
+    _write_csv(out / "orchestration_decisions.csv", _DECISION_FIELDS,
+               _decision_rows(result.decisions))
     _write_csv(out / "events_before_rescaling.csv", _EVENT_FIELDS,
                _event_rows(_isolated(result.events)))
     _write_csv(out / "events_after_rescaling.csv", _EVENT_FIELDS,

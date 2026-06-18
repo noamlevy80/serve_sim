@@ -328,8 +328,9 @@ The simulator produces a run report aggregated over the test suite.
 - Throughput (requests and tokens per second) and overall makespan.
 - Per-device utilization (compute and bandwidth) and memory occupancy over time. Memory occupancy is the reserved per-device footprint (weights + KV) of the jobs active at each instant, as sized by the parallelism planner -- a reservation estimate, not a byte-accurate residency trace.
 - Raw list of all simulation events in CSV format. Rescaled events appear seperately before and after rescaling.
+- A high level list of all orchestration decisions: prefill, KV reuse, KV transfer, decode, KV eviction. Each decision is described with the mapped to device(s), the model,  the sequence identifier (unique workload ID and turn number), the second sequence ID and device(s) (in case of KV reuse or KV transfer)
 
-These are written as `run_report.json`/`run_report.txt`, `requests.csv`, `device_summary.csv`, `device_timeline.csv`, `events_before_rescaling.csv` and `events_after_rescaling.csv`, alongside an echo of the input `config.json`.
+These are written as `run_report.json`/`run_report.txt`, `requests.csv`, `orchestration_decisions.csv`, `device_summary.csv`, `device_timeline.csv`, `events_before_rescaling.csv` and `events_after_rescaling.csv`, alongside an echo of the input `config.json`.
 
 ## Visualization tool
 TBD

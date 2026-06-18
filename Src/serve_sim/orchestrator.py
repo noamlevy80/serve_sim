@@ -124,6 +124,9 @@ class Request:
         output_tokens: Tokens to generate.
         arrival_time: When the request enters the system.
         cached_tokens: Prompt tokens already in cache (prefill skips these).
+        workload_id: Source conversation/workload identifier (``-1`` if the
+            request was not built from a workload).
+        turn_index: Turn within the workload that produced this request.
     """
 
     request_id: int
@@ -132,6 +135,8 @@ class Request:
     output_tokens: int
     arrival_time: float = 0.0
     cached_tokens: int = 0
+    workload_id: int = -1
+    turn_index: int = 0
 
     def __post_init__(self) -> None:
         if self.prompt_tokens < 0 or self.output_tokens < 0 or self.cached_tokens < 0:
@@ -161,6 +166,7 @@ class Request:
         *,
         arrival_time: float = 0.0,
         turn_index: int = 0,
+        workload_id: int = -1,
     ) -> "Request":
         """Build a single-sequence request from one turn of a workload."""
 
@@ -174,6 +180,8 @@ class Request:
             output_tokens=tracker.output_tokens,
             arrival_time=arrival_time,
             cached_tokens=tracker.cached_tokens,
+            workload_id=workload_id,
+            turn_index=turn_index,
         )
 
 
@@ -270,6 +278,55 @@ class JobRecord:
 
 
 @dataclass(frozen=True)
+class DecisionRecord:
+    """One high-level orchestration decision, for the decisions report.
+
+    Covers the orchestration acts the PRD calls out -- ``prefill``, ``decode``,
+    ``kv_reuse``, ``kv_transfer`` and ``kv_eviction`` -- each tagged with the
+    device(s) it mapped to, the model, and the sequence it served (the workload
+    id and turn number). KV reuse and KV transfer additionally name the second
+    sequence and the device(s) it involves: for reuse, the earlier turn whose
+    cached prefix is reused (in place, on the serving devices); for transfer, the
+    same sequence's prefill devices the KV is moved from.
+
+    Attributes:
+        time: Simulation clock when the decision was taken.
+        kind: One of ``prefill``/``decode``/``kv_reuse``/``kv_transfer``/
+            ``kv_eviction``.
+        request_id: The served request's run-unique id.
+        workload_id: The served sequence's workload id (``-1`` if synthetic).
+        turn_index: The served sequence's turn within its workload.
+        model: Name of the model serving the request.
+        devices: Compute device(s) the decision mapped to.
+        batch_index: Dispatch batch the decision belongs to.
+        tokens: Token count the act concerns (prefilled / decoded / reused /
+            transferred context).
+        source_request_id: The second sequence's request id, if any.
+        source_workload_id: The second sequence's workload id, if any.
+        source_turn_index: The second sequence's turn, if any.
+        source_devices: The second sequence's device(s), if any.
+        batch_members: For batched acts (prefill/decode), the ``(workload_id,
+            turn_index)`` of every sequence sharing the batch, in dispatch order;
+            empty for per-sequence acts (KV reuse/transfer).
+    """
+
+    time: float
+    kind: str
+    request_id: int
+    workload_id: int
+    turn_index: int
+    model: str
+    devices: tuple[str, ...]
+    batch_index: int
+    tokens: int = 0
+    source_request_id: int | None = None
+    source_workload_id: int | None = None
+    source_turn_index: int | None = None
+    source_devices: tuple[str, ...] = ()
+    batch_members: tuple[tuple[int, int], ...] = ()
+
+
+@dataclass(frozen=True)
 class MemoryRecord:
     """A memory device in the system, for the per-memory utilization report.
 
@@ -336,6 +393,72 @@ def _first_token_end(events: Sequence[object]) -> float | None:
     return max(e.end for e in decode if e.group_index == first_group)
 
 
+def _decision(
+    time: float,
+    kind: str,
+    request: "Request",
+    devices: Sequence[str],
+    batch_index: int,
+    *,
+    tokens: int = 0,
+    source_request_id: int | None = None,
+    source_workload_id: int | None = None,
+    source_turn_index: int | None = None,
+    source_devices: Sequence[str] = (),
+    batch_members: Sequence[tuple[int, int]] = (),
+) -> "DecisionRecord":
+    """Build a :class:`DecisionRecord` for ``request`` from the dispatch context."""
+
+    return DecisionRecord(
+        time=time,
+        kind=kind,
+        request_id=request.request_id,
+        workload_id=request.workload_id,
+        turn_index=request.turn_index,
+        model=getattr(request.model, "name", "model"),
+        devices=tuple(devices),
+        batch_index=batch_index,
+        tokens=tokens,
+        source_request_id=source_request_id,
+        source_workload_id=source_workload_id,
+        source_turn_index=source_turn_index,
+        source_devices=tuple(source_devices),
+        batch_members=tuple(batch_members),
+    )
+
+
+def _turn_chains(
+    requests: Sequence["Request"],
+) -> tuple[list["Request"], dict[tuple[int, int], "Request"]]:
+    """Split requests into initial arrivals and a per-workload follow-on map.
+
+    A workload is a multi-turn conversation: turn ``t+1`` is a follow-up that
+    cannot be submitted before turn ``t`` has completed. So only a workload's
+    first (lowest-``turn_index``) turn arrives externally; every later turn is
+    held back and released when its predecessor finishes. Requests with no
+    workload (``workload_id < 0``) are independent and all arrive externally.
+
+    Returns the list of externally-arriving requests and a map from a turn's
+    ``(workload_id, turn_index)`` to the next turn of the same workload.
+    """
+
+    by_workload: dict[int, list["Request"]] = {}
+    initial: list["Request"] = []
+    for req in requests:
+        if req.workload_id < 0:
+            initial.append(req)
+        else:
+            by_workload.setdefault(req.workload_id, []).append(req)
+
+    next_of: dict[tuple[int, int], "Request"] = {}
+    for workload_id, turns in by_workload.items():
+        turns.sort(key=lambda r: r.turn_index)
+        initial.append(turns[0])
+        for cur, nxt in zip(turns, turns[1:]):
+            next_of[(workload_id, cur.turn_index)] = nxt
+    return initial, next_of
+
+
 @dataclass
 class RunResult:
     """Minimal run state: per-request records and the overall makespan.
@@ -352,6 +475,7 @@ class RunResult:
     events: list[EventRecord] = field(default_factory=list)
     jobs: list[JobRecord] = field(default_factory=list)
     memories: list[MemoryRecord] = field(default_factory=list)
+    decisions: list[DecisionRecord] = field(default_factory=list)
 
     @property
     def makespan(self) -> float:
@@ -430,7 +554,8 @@ class Simulator:
             return self._run_pdd(requests, progress=progress)
 
         strategy = self.strategy
-        arrivals = sorted(requests, key=lambda r: r.arrival_time)
+        initial, next_of = _turn_chains(requests)
+        arrivals = sorted(initial, key=lambda r: r.arrival_time)
         arrival_pos = 0
         ready: list[Request] = []
         window_open: float | None = None
@@ -440,7 +565,6 @@ class Simulator:
         batch_index = 0
         total = len(requests)
         start_wall = time.perf_counter()
-
         def report(now: float) -> None:
             if progress is not None:
                 avg_tps, avg_ttft = _running_averages(result.records)
@@ -512,6 +636,13 @@ class Simulator:
                             first_token_time=first_token_time,
                         )
                     )
+                    # Release this workload's next turn now that this one is
+                    # done (it arrives the instant its predecessor completes).
+                    follow_on = next_of.get((req.workload_id, req.turn_index))
+                    if follow_on is not None:
+                        ready.append(replace(follow_on, arrival_time=end))
+                        if window_open is None:
+                            window_open = now
             if len(result.records) != completed_before:
                 report(now)
 
@@ -537,6 +668,24 @@ class Simulator:
                     break  # concurrency full; wait for a completion
                 in_flight += len(batch)
                 job_index, slot, pp, ep = self._dispatch(arbiter, batch)
+                device_names = tuple(d.name for d in slot.devices)
+                members = tuple((r.workload_id, r.turn_index) for r in batch)
+                for req in batch:
+                    result.decisions.append(_decision(
+                        now, "prefill", req, device_names, batch_index,
+                        tokens=req.prompt_tokens - req.cached_tokens,
+                        batch_members=members))
+                    if req.cached_tokens > 0:
+                        result.decisions.append(_decision(
+                            now, "kv_reuse", req, device_names, batch_index,
+                            tokens=req.cached_tokens,
+                            source_workload_id=req.workload_id,
+                            source_turn_index=req.turn_index - 1,
+                            source_devices=device_names))
+                    result.decisions.append(_decision(
+                        now, "decode", req, device_names, batch_index,
+                        tokens=req.output_tokens,
+                        batch_members=members))
                 jobs[job_index] = (batch, now, batch_index, slot)
                 job_meta[job_index] = ("full", batch, slot, batch_index, pp, ep)
                 batch_index += 1
@@ -574,7 +723,8 @@ class Simulator:
         """
 
         strategy = self.strategy
-        arrivals = sorted(requests, key=lambda r: r.arrival_time)
+        initial, next_of = _turn_chains(requests)
+        arrivals = sorted(initial, key=lambda r: r.arrival_time)
         arrival_pos = 0
         prefill_ready: list[Request] = []
         decode_ready: list[Request] = []
@@ -594,8 +744,8 @@ class Simulator:
         # job_index -> (job_phase, requests, slot, batch_index, pp, ep)
         job_meta: dict[int, tuple[str, list[Request], EngineSlot, int, int, int]] = {}
         reported: set[int] = set()
-        # id(request) -> (prefill dispatch time, prefill batch index)
-        meta: dict[int, tuple[float, int]] = {}
+        # id(request) -> (prefill dispatch time, prefill batch index, prefill devices)
+        meta: dict[int, tuple[float, int, tuple[str, ...]]] = {}
         result = RunResult()
 
         prefill_rep = self._prefill_pool.slots[0].devices[0]
@@ -667,7 +817,7 @@ class Simulator:
                         arbiter.job_rescaled_events(job_index)
                     )
                     for req in reqs:
-                        dispatch_time, b_index = meta[id(req)]
+                        dispatch_time, b_index, _ = meta[id(req)]
                         result.records.append(
                             RequestRecord(
                                 request_id=req.request_id,
@@ -680,6 +830,13 @@ class Simulator:
                                 first_token_time=first_token_time,
                             )
                         )
+                        # Release this workload's next turn now that this one
+                        # is done; it enters the prefill queue for its turn.
+                        follow_on = next_of.get((req.workload_id, req.turn_index))
+                        if follow_on is not None:
+                            prefill_ready.append(replace(follow_on, arrival_time=end))
+                            if prefill_window is None:
+                                prefill_window = now
             if len(result.records) != completed_before:
                 report(now)
 
@@ -719,8 +876,21 @@ class Simulator:
                 job_index, slot, pp, ep = self._dispatch(
                     arbiter, batch, pool=self._prefill_pool, phase="prefill"
                 )
+                device_names = tuple(d.name for d in slot.devices)
+                members = tuple((r.workload_id, r.turn_index) for r in batch)
                 for req in batch:
-                    meta[id(req)] = (now, batch_index)
+                    meta[id(req)] = (now, batch_index, device_names)
+                    result.decisions.append(_decision(
+                        now, "prefill", req, device_names, batch_index,
+                        tokens=req.prompt_tokens - req.cached_tokens,
+                        batch_members=members))
+                    if req.cached_tokens > 0:
+                        result.decisions.append(_decision(
+                            now, "kv_reuse", req, device_names, batch_index,
+                            tokens=req.cached_tokens,
+                            source_workload_id=req.workload_id,
+                            source_turn_index=req.turn_index - 1,
+                            source_devices=device_names))
                 jobs[job_index] = ("prefill", batch, slot, self._prefill_pool)
                 job_meta[job_index] = ("prefill", batch, slot, batch_index, pp, ep)
                 batch_index += 1
@@ -741,6 +911,21 @@ class Simulator:
                 job_index, slot, pp, ep = self._dispatch(
                     arbiter, batch, pool=self._decode_pool, phase="decode"
                 )
+                device_names = tuple(d.name for d in slot.devices)
+                members = tuple((r.workload_id, r.turn_index) for r in batch)
+                for req in batch:
+                    _, _, prefill_devices = meta[id(req)]
+                    result.decisions.append(_decision(
+                        now, "kv_transfer", req, device_names, batch_index,
+                        tokens=req.prompt_tokens,
+                        source_request_id=req.request_id,
+                        source_workload_id=req.workload_id,
+                        source_turn_index=req.turn_index,
+                        source_devices=prefill_devices))
+                    result.decisions.append(_decision(
+                        now, "decode", req, device_names, batch_index,
+                        tokens=req.output_tokens,
+                        batch_members=members))
                 jobs[job_index] = ("decode", batch, slot, self._decode_pool)
                 job_meta[job_index] = ("decode", batch, slot, batch_index, pp, ep)
                 batch_index += 1
