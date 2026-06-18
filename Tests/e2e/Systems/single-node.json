@@ -1,0 +1,20 @@
+{
+  "name": "E2E single node (2x Tiny GPU)",
+  "description": "One node with two synthetic Tiny GPUs. For basic, weight-loading, chunked-prefill and concurrency end-to-end tests.",
+  "network": {
+    "scale_up_bandwidth_bytes_per_s": 1.0e12,
+    "scale_up_latency_s": 1.0e-6,
+    "cxl_bandwidth_bytes_per_s": 1.0e11,
+    "cxl_latency_s": 3.0e-7
+  },
+  "input_memory": "tiny-nvm",
+  "nodes": [
+    {
+      "name": "node-0",
+      "node_memory": "tiny-node-mem",
+      "compute_devices": [
+        { "device": "tiny-gpu", "count": 2 }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "name": "tiny-moe",
+  "note": "Synthetic small mixture-of-experts transformer for end-to-end tests.",
+  "global": {
+    "num_layers": 4,
+    "hidden_size": 256,
+    "vocab_size": 2048,
+    "tie_word_embeddings": false,
+    "param_dtype_bytes": 2,
+    "kv_dtype_bytes": 2,
+    "layer_pattern": ["dense", "moe", "dense", "moe"]
+  },
+  "blocks": {
+    "dense": {
+      "block_type": "composite",
+      "attention": {
+        "block_type": "attention",
+        "attention_type": "GQA",
+        "num_query_heads": 8,
+        "num_kv_heads": 2,
+        "head_dim": 32
+      },
+      "ffn": {
+        "block_type": "ffn",
+        "ffn_type": "dense",
+        "intermediate_size": 512,
+        "gated": true
+      }
+    },
+    "moe": {
+      "block_type": "composite",
+      "attention": {
+        "block_type": "attention",
+        "attention_type": "GQA",
+        "num_query_heads": 8,
+        "num_kv_heads": 2,
+        "head_dim": 32
+      },
+      "ffn": {
+        "block_type": "ffn",
+        "ffn_type": "moe",
+        "intermediate_size": 256,
+        "num_experts": 4,
+        "num_experts_per_token": 2,
+        "gated": true
+      }
+    }
+  }
+}

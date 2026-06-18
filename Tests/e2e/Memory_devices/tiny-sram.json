@@ -1,0 +1,6 @@
+{
+  "name": "Tiny SRAM",
+  "capacity_bytes": 4.0e9,
+  "bandwidth_bytes_per_s": 4.0e12,
+  "notes": "Synthetic first-tier memory for the second (faster, accelerator) test device."
+}

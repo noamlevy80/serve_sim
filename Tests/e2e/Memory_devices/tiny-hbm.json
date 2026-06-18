@@ -1,0 +1,6 @@
+{
+  "name": "Tiny HBM",
+  "capacity_bytes": 4.0e9,
+  "bandwidth_bytes_per_s": 2.0e12,
+  "notes": "Synthetic first-tier memory for end-to-end tests (small but >> the tiny test models)."
+}

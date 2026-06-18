@@ -1,0 +1,27 @@
+{
+  "name": "E2E dual node (4x Tiny GPU)",
+  "description": "Two nodes of two synthetic Tiny GPUs each (four GPUs). For PDD, parallelism and concurrency end-to-end tests.",
+  "network": {
+    "scale_up_bandwidth_bytes_per_s": 1.0e12,
+    "scale_up_latency_s": 1.0e-6,
+    "cxl_bandwidth_bytes_per_s": 1.0e11,
+    "cxl_latency_s": 3.0e-7
+  },
+  "input_memory": "tiny-nvm",
+  "nodes": [
+    {
+      "name": "node-0",
+      "node_memory": "tiny-node-mem",
+      "compute_devices": [
+        { "device": "tiny-gpu", "count": 2 }
+      ]
+    },
+    {
+      "name": "node-1",
+      "node_memory": "tiny-node-mem",
+      "compute_devices": [
+        { "device": "tiny-gpu", "count": 2 }
+      ]
+    }
+  ]
+}

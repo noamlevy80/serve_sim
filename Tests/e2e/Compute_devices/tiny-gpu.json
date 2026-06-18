@@ -1,0 +1,7 @@
+{
+  "name": "Tiny GPU",
+  "peak_flops_fp16": 1.0e12,
+  "first_tier_memory": "tiny-hbm",
+  "kernel_launch_latency": 1.0e-6,
+  "notes": "Synthetic compute device for end-to-end tests."
+}

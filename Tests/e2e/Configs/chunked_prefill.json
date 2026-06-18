@@ -1,0 +1,26 @@
+{
+  "run_id": "e2e-chunked-prefill",
+  "system": "../Systems/single-node.json",
+  "models_dir": "../Models",
+  "tokenizer": "whitespace",
+  "suite": {
+    "name": "e2e-chunked-prefill",
+    "type": "randomized",
+    "num_workloads": 3,
+    "models": ["tiny-dense"]
+  },
+  "max_concurrency": 2,
+  "concurrency_window_sec": 0.5,
+  "target_concurrency": 4,
+  "allow_pdd": false,
+  "auto_parallelism": false,
+  "pipeline_parallel": 1,
+  "expert_parallel": 1,
+  "model_weight_loading": true,
+  "prefill_chunk_size": 4,
+  "arrival_interval_sec": 0.0,
+  "max_turns_per_workload": 2,
+  "event_random_factor_range": 0.0,
+  "report_time_buckets": 8,
+  "random_seed": 7
+}

@@ -1,0 +1,27 @@
+{
+  "name": "E2E heterogeneous (Tiny GPU + Tiny Accel)",
+  "description": "Two heterogeneous nodes: node-0 has two synthetic Tiny GPUs, node-1 has two synthetic Tiny Accelerators (a different speed/memory profile).",
+  "network": {
+    "scale_up_bandwidth_bytes_per_s": 1.0e12,
+    "scale_up_latency_s": 1.0e-6,
+    "cxl_bandwidth_bytes_per_s": 1.0e11,
+    "cxl_latency_s": 3.0e-7
+  },
+  "input_memory": "tiny-nvm",
+  "nodes": [
+    {
+      "name": "node-0",
+      "node_memory": "tiny-node-mem",
+      "compute_devices": [
+        { "device": "tiny-gpu", "count": 2 }
+      ]
+    },
+    {
+      "name": "node-1",
+      "node_memory": "tiny-node-mem",
+      "compute_devices": [
+        { "device": "tiny-accel", "count": 2 }
+      ]
+    }
+  ]
+}

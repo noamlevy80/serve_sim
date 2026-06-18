@@ -1,0 +1,26 @@
+{
+  "run_id": "e2e-parallel-concurrency",
+  "system": "../Systems/dual-node.json",
+  "models_dir": "../Models",
+  "tokenizer": "whitespace",
+  "suite": {
+    "name": "e2e-parallel-concurrency",
+    "type": "randomized",
+    "num_workloads": 4,
+    "models": ["tiny-dense"]
+  },
+  "max_concurrency": 1,
+  "concurrency_window_sec": 0.5,
+  "target_concurrency": 8,
+  "allow_pdd": false,
+  "auto_parallelism": false,
+  "pipeline_parallel": 1,
+  "expert_parallel": 1,
+  "model_weight_loading": true,
+  "prefill_chunk_size": null,
+  "arrival_interval_sec": 0.0,
+  "max_turns_per_workload": 1,
+  "event_random_factor_range": 0.0,
+  "report_time_buckets": 8,
+  "random_seed": 7
+}

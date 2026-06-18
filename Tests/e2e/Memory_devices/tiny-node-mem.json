@@ -1,0 +1,6 @@
+{
+  "name": "Tiny Node DRAM",
+  "capacity_bytes": 6.4e10,
+  "bandwidth_bytes_per_s": 5.0e11,
+  "notes": "Synthetic per-node memory (idle in these runs)."
+}

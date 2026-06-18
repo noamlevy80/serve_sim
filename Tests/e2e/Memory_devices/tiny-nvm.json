@@ -1,0 +1,6 @@
+{
+  "name": "Tiny NVM Pool",
+  "capacity_bytes": 1.0e13,
+  "bandwidth_bytes_per_s": 2.0e11,
+  "notes": "Synthetic datacenter input memory that holds model weights at init."
+}

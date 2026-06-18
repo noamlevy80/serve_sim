@@ -1,0 +1,7 @@
+{
+  "name": "Tiny Accel",
+  "peak_flops_fp16": 5.0e11,
+  "first_tier_memory": "tiny-sram",
+  "kernel_launch_latency": 2.0e-6,
+  "notes": "Second synthetic compute device with a different speed/memory profile for heterogeneous topologies."
+}

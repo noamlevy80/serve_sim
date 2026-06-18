@@ -130,8 +130,15 @@ Network tests auto-skip if the dataset API is unreachable.
   elapsed wall time) and the CLI prints it in place via `BuildProgressReporter`
   (suppressed by `--quiet`, like the run progress). 2 offline tests (reporter) +
   1 offline (runner callback).
+- **End-to-end runs:** a self-contained fixture set under `Tests/e2e/` (tiny
+  devices, memories, models, systems and one config per feature) drives full
+  `config -> system -> suite -> requests -> simulation -> outputs` runs offline
+  and asserts the simulator behaves correctly across every config-reachable
+  feature: weight loading on/off, PDD, fixed and auto parallelism, chunked
+  prefill, heterogeneous topologies, multi-model suites and concurrency-bound
+  admission. 29 offline tests.
 
-Totals: 611 tests (606 offline + 5 live).
+Totals: 640 tests (635 offline + 5 live).
 
 ## Stage 1: Workloads
 
@@ -964,4 +971,69 @@ time) each time the run retires one or more sequences; the runner's
   the line on the final (100%) update.
 - **Throttling:** intermediate updates within `min_interval` are suppressed, but
   the first and the final updates always print.
+
+## End-to-end tests
+
+The stage tests above each pin one mechanism in isolation. The **end-to-end
+tests** close the loop: they run the *whole* pipeline a user runs — parse a
+`config.json`, load a `System` from JSON, build a suite, tokenize it into
+requests, simulate, and write every output file — and then assert the simulator
+behaves correctly. The goal is to catch integration regressions (a knob wired to
+nothing, an architecture the loader silently drops, an output that stops being
+written) that unit tests miss, and to give a place to grow scenario coverage as
+new architectures are explored.
+
+Everything an end-to-end run needs lives under
+[Tests/e2e/](Tests/e2e/) so the cases are self-contained, fast and
+deterministic, and decoupled from the production device/model specs (which are
+actively being tuned):
+
+- `Tests/e2e/Compute_devices/` and `Tests/e2e/Memory_devices/` — two tiny device
+  types (`tiny-gpu` on fast HBM, `tiny-accel` on faster SRAM) plus an input NVM
+  pool and a node DRAM. Capacities dwarf the test models, so every run is
+  *feasible* (memory occupancy stays well under 1.0) — unlike a real 600B model
+  pinned to a single 180 GB GPU.
+- `Tests/e2e/Models/` — a small dense transformer (`tiny-dense`) and a small MoE
+  (`tiny-moe`), a few megabytes each.
+- `Tests/e2e/Systems/` — `single-node` (2 GPUs), `dual-node` (4 GPUs, two nodes)
+  and `hetero` (GPUs on node-0, accelerators on node-1).
+- `Tests/e2e/Configs/` — one config per feature, all with
+  `event_random_factor_range = 0` and a fixed `random_seed`, so a run is
+  byte-stable and can be re-run for an exact-match determinism check.
+
+The system files sit at `Tests/e2e/Systems/*.json`, so the loader's default
+device-directory resolution (`<system>/../../Compute_devices`,
+`../Memory_devices`) finds the tiny device library next to them; a config's
+`system`/`models_dir` are resolved relative to the config. The workload source
+and tokenizer are injected (an in-memory fetcher and the dependency-free
+whitespace tokenizer), so the runs need no network.
+
+Tests in [Tests/test_e2e.py](Tests/test_e2e.py).
+
+- **Every config runs, is feasible and is deterministic:** each config under
+  `Tests/e2e/Configs/` completes with every request retired, a positive makespan,
+  all output files written (both raw-event CSVs, the request/device/memory
+  summaries, the timeline, and the JSON + text report and config echo), every
+  event attributed to a real system device, and no memory over its capacity; a
+  second run with the same inputs reproduces the makespan and request count
+  exactly.
+- **Weight loading on/off:** with `model_weight_loading` on, a `transfer` from
+  the input NVM precedes the compute and the NVM moves bytes; with it off there
+  are no NVM loads and the NVM moves nothing.
+- **PDD:** prefill and decode events land on disjoint device sets (the two pools),
+  every request gets a first-token time, and the run still drains.
+- **Fixed parallelism:** with `pipeline_parallel = 2` every dispatched job runs on
+  a two-device engine slot.
+- **Auto parallelism:** with `auto_parallelism` on over a two-device budget the
+  planner's chosen arrangement runs the MoE model feasibly across the slot.
+- **Chunked prefill:** a small `prefill_chunk_size` splits each prompt into more
+  ordered prefill groups than the unchunked twin on the same workloads.
+- **Heterogeneous topology:** a system mixing two device types loads both (both
+  first-tier memories appear in the memory report) and runs to completion.
+- **Multi-model suite:** a suite drawing two models resolves and serves both, and
+  the input NVM streams weights for them.
+- **Concurrency-bound admission:** the same workloads finish sooner with a high
+  `target_concurrency` than with `target_concurrency = 1` (which serializes the
+  pipeline), pinning down the admission-control behaviour that makes a run look
+  under-utilized when the concurrency cap, not the hardware, is the bottleneck.
 
