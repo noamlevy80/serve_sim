@@ -15,6 +15,7 @@ are injectable so the wiring can be exercised offline.
 from __future__ import annotations
 
 import json
+import random
 import sys
 import time
 from dataclasses import dataclass
@@ -198,28 +199,69 @@ def _make_loader(cfg: Mapping[str, Any], base: Path) -> WorkloadLoader:
     )
 
 
+def _sample_arrival_gap(mean: float, variance: float, rng: random.Random) -> float:
+    """Draw one inter-arrival gap with the given mean and variance.
+
+    Gaps follow a Gamma distribution so the mean and variance are set
+    independently: ``variance == 0`` yields a deterministic gap of ``mean`` (the
+    fixed-cadence behaviour), while ``variance == mean ** 2`` makes the gaps
+    exponential -- i.e. a Poisson arrival process at rate ``1 / mean``. A
+    non-positive ``mean`` admits every workload at ``t = 0``.
+    """
+
+    if mean <= 0.0:
+        return 0.0
+    if variance <= 0.0:
+        return mean
+    beta = variance / mean
+    alpha = mean / beta  # == mean ** 2 / variance
+    return rng.gammavariate(alpha, beta)
+
+
+def _arrival_times(
+    count: int, mean: float, variance: float, rng: random.Random
+) -> list[float]:
+    """Cumulative arrival time per workload (the first always arrives at ``t=0``)."""
+
+    times: list[float] = []
+    clock = 0.0
+    for index in range(count):
+        if index > 0:
+            clock += _sample_arrival_gap(mean, variance, rng)
+        times.append(clock)
+    return times
+
+
 def _build_requests(
     suite: Suite,
     models: Mapping[str, Any],
     tokenizer: Tokenizer,
     arrival_interval: float,
     max_turns: int | None,
+    arrival_variance: float = 0.0,
+    arrival_seed: int | None = None,
     progress: BuildProgressCallback | None = None,
 ) -> list[Request]:
     """Turn each suite conversation's turns into single-sequence requests.
 
-    Each workload's *first* turn arrives ``arrival_interval`` seconds after the
-    previous workload's (0 admits every workload at once); its later turns are
-    follow-ups the simulator releases only once the prior turn completes, so they
-    carry the same base arrival time here. A turn with no work at all (empty
-    prompt and no output) is skipped. If ``progress`` is given it is called with a
-    :class:`BuildProgress` after each workload is processed (tokenizing a large
-    suite can be slow).
+    Each workload's *first* turn arrives after a randomized inter-arrival gap with
+    mean ``arrival_interval`` and variance ``arrival_variance`` (a Gamma process;
+    ``arrival_variance == 0`` reproduces the fixed ``index * arrival_interval``
+    cadence, and ``arrival_variance == arrival_interval ** 2`` is a Poisson
+    process). ``arrival_seed`` makes the draws reproducible. A workload's later
+    turns are follow-ups the simulator releases only once the prior turn
+    completes, so they carry the same base arrival time here. A turn with no work
+    at all (empty prompt and no output) is skipped. If ``progress`` is given it is
+    called with a :class:`BuildProgress` after each workload is processed
+    (tokenizing a large suite can be slow).
     """
 
     requests: list[Request] = []
     rid = 0
     total = len(suite)
+    arrival_times = _arrival_times(
+        total, arrival_interval, arrival_variance, random.Random(arrival_seed)
+    )
     start_wall = time.perf_counter()
     for index, entry in enumerate(suite):
         model = models[entry.model]
@@ -232,7 +274,7 @@ def _build_requests(
                 entry.workload,
                 model,
                 tokenizer,
-                arrival_time=index * arrival_interval,
+                arrival_time=arrival_times[index],
                 turn_index=turn_index,
                 workload_id=index,
             )
@@ -297,6 +339,8 @@ def run_from_config(
         tokenizer,
         float(cfg.get("arrival_interval_sec", 0.0)),
         cfg.get("max_turns_per_workload"),
+        arrival_variance=float(cfg.get("arrival_variance_sec2", 0.0)),
+        arrival_seed=cfg.get("random_seed"),
         progress=build_progress,
     )
 

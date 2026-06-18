@@ -117,6 +117,12 @@ Two scheduling paths exist: the **non-PDD** path (`run()`) and the **prefill/dec
 path (`_run_pdd()`), selected by `StrategyConfig.allow_pdd`. **Any orchestration change must usually
 be made in *both* paths.**
 
+Both paths finish in `_collect_outputs`, which calls `_check_memory_capacity`: the peak reserved
+footprint (sum of concurrently-active jobs' `per_device_bytes`) on every compute device is compared
+against its memory (first tier + any second tier). If a device is oversubscribed the run aborts with
+`MemoryCapacityExceeded` rather than reporting an impossible occupancy. (A single batch that cannot
+fit one device is rejected earlier, in `_parallelism_for`.)
+
 ---
 
 ## 5. "How do I change X" playbooks
@@ -183,7 +189,7 @@ be made in *both* paths.**
 2. Emit via the `_decision(...)` helper (or a dedicated builder, e.g. `_eviction_decision`).
 3. Register the kind in `_DECISION_KINDS` in [report.py](Src/serve_sim/report.py) so it is counted
    and written to `orchestration_decisions.csv`; add fields to `_DECISION_FIELDS` if new columns.
-4. Current kinds: `prefill`, `kv_reuse`, `kv_transfer`, `decode`, `kv_eviction`.
+4. Current kinds: `weight_load`, `weight_eviction`, `prefill`, `kv_reuse`, `kv_transfer`, `decode`, `kv_eviction`.
 
 ### Global (system-wide) KV cache — [kv_store.py](Src/serve_sim/kv_store.py)
 - **What it does:** keeps every non-evicted sequence's KV resident in **floating memories**
@@ -245,7 +251,7 @@ Written by `write_outputs` in [report.py](Src/serve_sim/report.py):
 |---|---|
 | `run_report.json` / `run_report.txt` | Aggregate metrics over the suite (throughput, TTFT, latency percentiles, TPS). |
 | `requests.csv` | Per-request arrival/dispatch/first-token/completion + tokens, batch. |
-| `orchestration_decisions.csv` | Ordered log of every decision (`prefill`/`kv_reuse`/`kv_transfer`/`decode`/`kv_eviction`). |
+| `orchestration_decisions.csv` | Ordered log of every decision (`weight_load`/`weight_eviction`/`prefill`/`kv_reuse`/`kv_transfer`/`decode`/`kv_eviction`). |
 | `events_before_rescaling.csv` / `events_after_rescaling.csv` | Raw compute/transfer events, pre/post arbiter contention rescaling. |
 | `device_summary.csv` | Per-device compute & bandwidth utilization, busy time. |
 | `memory_summary.csv` | Per-memory-device bandwidth utilization, busy time. |

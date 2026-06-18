@@ -9,8 +9,9 @@ PRD calls for and writes them under one run directory:
 - ``requests.csv`` -- per-request arrival, dispatch, first-token and completion
   times plus latency, TTFT and TPOT.
 - ``orchestration_decisions.csv`` -- the ordered log of orchestration decisions
-  (prefill, decode, KV reuse and KV transfer) with the sequence, serving
-  devices, token counts and source sequence/devices for KV movements.
+  (model-weight load/eviction, prefill, decode, KV reuse, KV transfer and KV
+  eviction) with the sequence, serving devices, token counts and source
+  sequence/devices/memory for weight and KV movements.
 - ``events_before_rescaling.csv`` / ``events_after_rescaling.csv`` -- the raw
   event log, as generated in isolation and after the arbiter rescales events for
   resource contention.
@@ -103,7 +104,10 @@ def _union_length(intervals: Sequence[tuple[float, float]]) -> float:
 _COMPUTE_PHASES = ("prefill", "decode")
 
 # Orchestration-decision kinds, in report order.
-_DECISION_KINDS = ("prefill", "kv_reuse", "kv_transfer", "decode", "kv_eviction")
+_DECISION_KINDS = (
+    "weight_load", "weight_eviction", "prefill", "kv_reuse", "kv_transfer",
+    "decode", "kv_eviction",
+)
 
 
 def _decision_counts(decisions: Sequence[DecisionRecord]) -> dict[str, int]:

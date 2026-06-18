@@ -10,13 +10,46 @@ from __future__ import annotations
 
 import csv
 import json
+import random
 from pathlib import Path
 
 from serve_sim.dataset import WorkloadLoader
-from serve_sim.runner import run_from_config
+from serve_sim.runner import _arrival_times, _sample_arrival_gap, run_from_config
 from serve_sim.tokenizer import WhitespaceTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_arrival_times_zero_variance_is_evenly_spaced():
+    times = _arrival_times(5, mean=0.25, variance=0.0, rng=random.Random(0))
+    assert times == [0.0, 0.25, 0.5, 0.75, 1.0]
+
+
+def test_arrival_times_zero_mean_admits_all_at_once():
+    times = _arrival_times(4, mean=0.0, variance=1.0, rng=random.Random(0))
+    assert times == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_arrival_times_are_monotonic_and_reproducible():
+    a = _arrival_times(50, mean=0.25, variance=0.0625, rng=random.Random(7))
+    b = _arrival_times(50, mean=0.25, variance=0.0625, rng=random.Random(7))
+    assert a == b  # same seed -> identical draws
+    assert a[0] == 0.0
+    assert all(later >= earlier for earlier, later in zip(a, a[1:]))
+    # Randomized gaps differ from the deterministic cadence.
+    assert a != [i * 0.25 for i in range(50)]
+
+
+def test_sample_arrival_gap_matches_requested_moments():
+    rng = random.Random(123)
+    mean, variance = 0.4, 0.09
+    gaps = [_sample_arrival_gap(mean, variance, rng) for _ in range(20000)]
+    sample_mean = sum(gaps) / len(gaps)
+    sample_var = sum((g - sample_mean) ** 2 for g in gaps) / len(gaps)
+    assert abs(sample_mean - mean) < 0.02
+    assert abs(sample_var - variance) < 0.02
+    assert all(g >= 0.0 for g in gaps)
+
 
 
 def _write_config(path: Path) -> None:

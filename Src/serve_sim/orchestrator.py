@@ -46,6 +46,33 @@ from .transfer import transfer_duration
 from .workload import Workload
 
 
+class MemoryCapacityExceeded(RuntimeError):
+    """Raised when a device's reserved memory footprint exceeds its capacity.
+
+    The simulator pins each job's weights + KV footprint on its serving devices'
+    memory. If the concurrent footprint on any device ever exceeds the memory
+    available to it (its first tier, plus any second tier it can spill into), the
+    configuration is physically infeasible: the run is aborted rather than
+    silently reporting an impossible, oversubscribed occupancy.
+    """
+
+    def __init__(self, device: str, peak_bytes: float, capacity_bytes: float) -> None:
+        self.device = device
+        self.peak_bytes = peak_bytes
+        self.capacity_bytes = capacity_bytes
+        over = peak_bytes / capacity_bytes if capacity_bytes else float("inf")
+        super().__init__(
+            f"out of memory on device {device!r}: peak reserved footprint "
+            f"{peak_bytes / 1e9:.2f} GB exceeds its {capacity_bytes / 1e9:.2f} GB "
+            f"capacity ({over:.2f}x oversubscribed). The concurrent weights + KV "
+            f"of the jobs placed on this device do not fit in its memory. Reduce "
+            f"target_concurrency or max_batch_size, raise the parallelism degree "
+            f"(or enable auto_parallelism) to shard the footprint across more "
+            f"devices, give the device a second memory tier to spill into, or use "
+            f"a smaller model."
+        )
+
+
 @dataclass(frozen=True)
 class StrategyConfig:
     """The orchestration knobs (v0 subset).
@@ -296,18 +323,19 @@ class JobRecord:
 class DecisionRecord:
     """One high-level orchestration decision, for the decisions report.
 
-    Covers the orchestration acts the PRD calls out -- ``prefill``, ``decode``,
-    ``kv_reuse``, ``kv_transfer`` and ``kv_eviction`` -- each tagged with the
-    device(s) it mapped to, the model, and the sequence it served (the workload
-    id and turn number). KV reuse and KV transfer additionally name the second
-    sequence and the device(s) it involves: for reuse, the earlier turn whose
-    cached prefix is reused (in place, on the serving devices); for transfer, the
-    same sequence's prefill devices the KV is moved from.
+    Covers the orchestration acts the PRD calls out -- ``weight_load``,
+    ``weight_eviction``, ``prefill``, ``decode``, ``kv_reuse``, ``kv_transfer``
+    and ``kv_eviction`` -- each tagged with the device(s) it mapped to, the
+    model, and the sequence it served (the workload id and turn number). KV reuse
+    and KV transfer additionally name the second sequence and the device(s) it
+    involves: for reuse, the earlier turn whose cached prefix is reused (in place,
+    on the serving devices); for transfer, the same sequence's prefill devices
+    the KV is moved from.
 
     Attributes:
         time: Simulation clock when the decision was taken.
-        kind: One of ``prefill``/``decode``/``kv_reuse``/``kv_transfer``/
-            ``kv_eviction``.
+        kind: One of ``weight_load``/``weight_eviction``/``prefill``/``decode``/
+            ``kv_reuse``/``kv_transfer``/``kv_eviction``.
         request_id: The served request's run-unique id.
         workload_id: The served sequence's workload id (``-1`` if synthetic).
         turn_index: The served sequence's turn within its workload.
@@ -699,7 +727,8 @@ class Simulator:
                     batch, matches = self._resolve_kv(batch, now)
                     kv_fetches = self._kv_fetches(batch, matches)
                 job_index, slot, pp, ep = self._dispatch(
-                    arbiter, batch, kv_fetches=kv_fetches)
+                    arbiter, batch, kv_fetches=kv_fetches,
+                    result=result, now=now, batch_index=batch_index)
                 device_names = tuple(d.name for d in slot.devices)
                 members = tuple((r.workload_id, r.turn_index) for r in batch)
                 for req in batch:
@@ -923,6 +952,7 @@ class Simulator:
                 job_index, slot, pp, ep = self._dispatch(
                     arbiter, batch, pool=self._prefill_pool, phase="prefill",
                     kv_fetches=kv_fetches,
+                    result=result, now=now, batch_index=batch_index,
                 )
                 device_names = tuple(d.name for d in slot.devices)
                 members = tuple((r.workload_id, r.turn_index) for r in batch)
@@ -961,7 +991,8 @@ class Simulator:
                     break
                 batch = self._take_decode_batch(decode_ready)
                 job_index, slot, pp, ep = self._dispatch(
-                    arbiter, batch, pool=self._decode_pool, phase="decode"
+                    arbiter, batch, pool=self._decode_pool, phase="decode",
+                    result=result, now=now, batch_index=batch_index,
                 )
                 device_names = tuple(d.name for d in slot.devices)
                 members = tuple((r.workload_id, r.turn_index) for r in batch)
@@ -1097,6 +1128,42 @@ class Simulator:
             )
             for entry in self.system.memory_inventory()
         ]
+        self._check_memory_capacity(result)
+
+    def _check_memory_capacity(self, result: RunResult) -> None:
+        """Abort the run if any device's reserved footprint exceeds its memory.
+
+        The reservation model pins each job's weights + KV (``per_device_bytes``)
+        on its serving devices; a device with a second memory tier can spill the
+        overflow into it. Occupancy is evaluated at every job boundary (the only
+        instants it can change), so a transient overlap of concurrent jobs is
+        caught -- not merely the steady state. Raises
+        :class:`MemoryCapacityExceeded` on the first device that overflows.
+        """
+
+        capacity: dict[str, float] = {}
+        for device in self.system.compute_devices:
+            cap = device.first_tier_memory.capacity_bytes
+            if device.second_tier_memory is not None:
+                cap += device.second_tier_memory.capacity_bytes
+            capacity[device.name] = cap
+
+        for name, cap in capacity.items():
+            jobs = [
+                j for j in result.jobs
+                if name in j.devices and j.per_device_bytes
+            ]
+            if not jobs:
+                continue
+            breakpoints = sorted({j.start for j in jobs} | {j.end for j in jobs})
+            peak = 0.0
+            for t in breakpoints:
+                occ = sum(j.per_device_bytes for j in jobs if j.start <= t < j.end)
+                peak = max(peak, occ)
+            # Tiny relative tolerance so exact-fit footprints are not rejected by
+            # floating-point rounding.
+            if peak > cap * (1.0 + 1e-9):
+                raise MemoryCapacityExceeded(name, peak, cap)
 
     @staticmethod
     def _event_memory_name(device: ComputeDevice, event: ComputeEvent) -> str:
@@ -1184,6 +1251,9 @@ class Simulator:
         pool: EnginePool | None = None,
         phase: str = "full",
         kv_fetches: list[tuple[object, float]] | None = None,
+        result: "RunResult | None" = None,
+        now: float = 0.0,
+        batch_index: int = -1,
     ) -> tuple[int, EngineSlot, int, int]:
         """Place a batch on an engine slot and admit its events to the arbiter.
 
@@ -1217,6 +1287,9 @@ class Simulator:
         loads: list[ComputeEvent] = []
         if self.strategy.model_weight_loading and placement.needs_weight_load:
             loads = self._weight_load_events(model, slot, pp, ep)
+            if result is not None:
+                self._emit_weight_decisions(
+                    result, batch, slot, placement.evicted_model, now, batch_index)
         fetches = self._kv_fetch_events(slot, kv_fetches) if kv_fetches else []
         prelude = loads + fetches
         if prelude:
@@ -1279,6 +1352,49 @@ class Simulator:
                 )
             )
         return events
+
+    def _emit_weight_decisions(
+        self,
+        result: "RunResult",
+        batch: list[Request],
+        slot: EngineSlot,
+        evicted_model: object | None,
+        now: float,
+        batch_index: int,
+    ) -> None:
+        """Record the weight-residency decisions for a slot (re)load.
+
+        When this placement displaced a different model, a ``weight_eviction`` is
+        recorded first (the prior resident leaves the slot), then the
+        ``weight_load`` that streams this batch's model in from the input NVM.
+        """
+
+        device_names = tuple(d.name for d in slot.devices)
+        if evicted_model is not None:
+            result.decisions.append(self._weight_eviction_decision(
+                now, evicted_model, device_names, batch_index))
+        members = tuple((r.workload_id, r.turn_index) for r in batch)
+        result.decisions.append(_decision(
+            now, "weight_load", batch[0], device_names, batch_index,
+            source_devices=(self.system.input_memory.name,),
+            batch_members=members))
+
+    @staticmethod
+    def _weight_eviction_decision(
+        now: float, model: object, device_names: tuple[str, ...], batch_index: int
+    ) -> DecisionRecord:
+        """A ``weight_eviction`` decision for a model displaced from a slot."""
+
+        return DecisionRecord(
+            time=now,
+            kind="weight_eviction",
+            request_id=-1,
+            workload_id=-1,
+            turn_index=-1,
+            model=getattr(model, "name", "model"),
+            devices=device_names,
+            batch_index=batch_index,
+        )
 
     # --- global KV cache ----------------------------------------------------
 

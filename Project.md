@@ -182,7 +182,7 @@ Each workload is also assigned an arrival time: the time at which its first turn
 The JSON for configuring a randomized test suite contains:
 1. Number of workloads in the test suite
 2. List of models to choose from
-3. Inter-arrival mean and variance (seconds)
+3. Inter-arrival mean (arrival_interval_sec) and variance (arrival_variance_sec2)
 
 ### Directed suite
 TBD - not implemented for now
@@ -258,6 +258,8 @@ For each batch the orchestrator selects a *device set* (engine slot), not just a
 The orchestration eagerly decides on prefill-decode dissagregation if enabled.
 The orchestration eagerly decides on parallelism using a high-level roofline estimate: for the candidate device sets and parallelism degrees available at the time of issue, it estimates the batch's compute-bound and bandwidth-bound time (as the event generator would) and picks the option with the best expected outcome, subject to the device and memory-capacity constraints it knows about.
 
+**Memory is a hard constraint.** A single batch is rejected up front if its per-device footprint does not fit the serving device's memory. Beyond that, the simulator also enforces the *aggregate* constraint: the reserved footprint (weights + KV) of all jobs concurrently resident on a device may never exceed the memory available to it (its first tier, plus any second tier it can spill into). If a run would ever oversubscribe a device, the simulation aborts with an informative out-of-memory error naming the device, its peak reserved footprint, its capacity and the oversubscription factor, rather than reporting a physically impossible occupancy. The fix is to reduce concurrency (`target_concurrency`/`max_batch_size`), increase the parallelism degree (or enable `auto_parallelism`) to shard the footprint across more devices, give the device a second memory tier, or use a smaller model.
+
 When prefill-decode disaggregation is enabled (`allow_pdd`), the engine slots are split into two disjoint pools — a prefill pool and a decode pool — with the partition point set by `prefill_engine_fraction` (a fixed fraction for now; dynamic repartitioning is left as future work, since fixed partitions tend to be predictably suboptimal). A request is prefilled on the prefill pool; on completion its KV cache is moved to the decode pool as one modeled transfer of the prompt's KV bytes over the link between the two engines' memories, and decode begins only after that transfer completes. Prefill and decode batch independently, while target concurrency counts a sequence as in flight from prefill dispatch through decode completion.
 
 Concretely, an engine slot is a *fixed device budget* (the parallelism degree); the search only chooses how to wire it into a `pipeline x expert` arrangement. Since a single batch has no pipeline overlap, the speed estimate favours expert parallelism (`time ~ max(compute, bandwidth) / expert_parallel`), while pipeline parallelism is what relieves memory: pipeline stages shard the layers, whereas expert parallelism shards only the routed experts and replicates the attention/dense/shared/LM-head weights and the KV cache across ranks. The search therefore takes the most expert-parallel arrangement that still fits each device's memory, reaching for more pipeline stages only when a batch would otherwise not fit. This search is opt-in (`auto_parallelism`); by default the configured pipeline/expert degrees are used as-is.
@@ -273,6 +275,13 @@ The orchestrator keeps a single, system-wide record of every sequence's KV cache
 
 **Capacity and eviction.** Stored KV competes for floating-memory capacity with everything else resident there. As long as some floating memory has room the entry is kept; only when the whole floating pool is full does the orchestrator evict, choosing victims by least-recently-used at the granularity of a whole stored sequence (sequence-level resolution, for simplicity). Each eviction is a `kv_eviction` decision. A reuse refreshes an entry's recency, so hot prefixes survive while cold ones are reclaimed first.
 
+### Model weight residency
+A batch can only run on an engine slot (device set) whose first-tier memory already holds that model's weights. The orchestrator tracks, per slot, which model's weights are currently resident, and follows a simple residency/eviction policy:
+
+- **Affinity.** When dispatching a batch, the orchestrator prefers a free slot that already hosts the batch's model, so back-to-back batches of the same model reuse the resident weights and pay no reload.
+- **Load on (re)placement.** When a batch lands on a slot that does not currently host its model (an empty slot, or one last used by a different model), the model's full weight footprint is streamed from the system input NVM into each of the slot's devices as a modeled, arbiter-accounted transfer over the appropriate link; compute waits for that load to finish. This is a `weight_load` decision. The footprint is sized by the parallelism planner for the chosen pipeline × expert arrangement, and its bytes contend the input-NVM bandwidth against all other in-flight loads, so weight streaming can itself become the bottleneck.
+- **Eviction (displacement).** A slot holds exactly one model's weights at a time, so placing a different model on a slot displaces the previous resident. That displacement is a `weight_eviction` decision naming the evicted model and the slot it left; the evicted model simply pays a fresh `weight_load` the next time it is dispatched there. Eviction is therefore implicit, single-model-per-slot, and driven by which slot the placement chooses — there is no capacity-aware multi-model weight cache per slot.
+- This behaviour is gated on `model_weight_loading`; when it is off, weights are assumed pre-resident everywhere and no weight loads or evictions are charged or recorded.
 
 
 ### Strategy
@@ -283,6 +292,7 @@ The orchestration strategy is configured by a few knobs:
 - Prefill engine fraction: when PDD is enabled, the share of engine slots devoted to prefill (the rest serve decode).
 - Max parallelism degrees: caps on pipeline and expert parallelism the roofline search may choose from.
 - Global KV cache: whether the system-wide, cross-conversation KV cache (with LRU eviction and KV migration across floating memories) is active.
+- Model weight loading: whether model weights are streamed from the input NVM onto an engine slot on (re)placement (with per-slot single-model residency and displacement), or assumed pre-resident.
 
 ## List of simulation parameters (to appear in config.JSON)
 - max_concurrency (default 8)
@@ -314,9 +324,13 @@ The orchestration strategy is configured by a few knobs:
 - random_seed (default null)
     Seed for all simulation randomness (expert persistence, suite arrivals, event-time randomization); null draws a non-deterministic seed. A fixed seed makes a run fully reproducible.
 - arrival_interval_sec (default 0)
-    Spacing between successive request arrivals; 0 admits the whole suite at once.
+    Mean of the randomized inter-arrival gap between successive workloads (the first arrives at time 0); 0 admits the whole suite at once.
+- arrival_variance_sec2 (default 0)
+    Variance (in seconds squared) of the inter-arrival gap. Gaps are drawn from a Gamma distribution with the configured mean and variance, so 0 gives deterministic, evenly spaced arrivals and a variance equal to arrival_interval_sec squared gives a Poisson arrival process (rate 1/mean). Draws are governed by random_seed.
 - max_turns_per_workload (default null)
     Cap on how many conversation turns of each workload are issued as requests; null issues every turn.
+- model_weight_loading (default true for config-driven runs)
+    If true, a model's weights are streamed from the input NVM onto an engine slot the first time it is placed there (and reloaded if the slot is later repurposed to another model), as a modeled transfer that contends input-NVM bandwidth; if false, weights are assumed pre-resident and no load is charged.
 - report_time_buckets (default 64)
     Number of time buckets in the per-device timeline output.
 
@@ -342,9 +356,9 @@ The simulator produces a run report aggregated over the test suite.
 - Count of requests, batches ran, memory used and total DMA transfers
 - Per-request latency, time-to-first-token (TTFT), and time-per-output-token (TPOT). TTFT is the time the request's first decode step completes (after prefill and any KV transfer) relative to arrival; TPOT is the remaining decode time divided by the remaining output tokens.
 - Throughput (requests and tokens per second) and overall makespan.
-- Per-device utilization (compute and bandwidth) and memory occupancy over time. Memory occupancy is the reserved per-device footprint (weights + KV) of the jobs active at each instant, as sized by the parallelism planner -- a reservation estimate, not a byte-accurate residency trace.
+- Per-device utilization (compute and bandwidth) and memory occupancy over time. Memory occupancy is the reserved per-device footprint (weights + KV) of the jobs active at each instant, as sized by the parallelism planner -- a reservation estimate, not a byte-accurate residency trace. This occupancy can never exceed a device's memory: a run that would oversubscribe any device aborts with an out-of-memory error (see "Memory is a hard constraint" above) instead of producing a report.
 - Raw list of all simulation events in CSV format. Rescaled events appear seperately before and after rescaling.
-- A high level list of all orchestration decisions: prefill, KV reuse, KV transfer, decode, KV eviction. Each decision is described with the mapped to device(s), the model,  the sequence identifier (unique workload ID and turn number), the second sequence ID and device(s) (in case of KV reuse or KV transfer)
+- A high level list of all orchestration decisions: model-weight load, model-weight eviction, prefill, KV reuse, KV transfer, decode, KV eviction. Each decision is described with the mapped to device(s), the model, the sequence identifier (unique workload ID and turn number), the second sequence ID and device(s) (in case of KV reuse or KV transfer), and the source memory (the input NVM for a weight load). A weight eviction names the displaced model and the slot it leaves.
 
 These are written as `run_report.json`/`run_report.txt`, `requests.csv`, `orchestration_decisions.csv`, `device_summary.csv`, `device_timeline.csv`, `events_before_rescaling.csv` and `events_after_rescaling.csv`, alongside an echo of the input `config.json`.
 

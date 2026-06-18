@@ -67,6 +67,7 @@ from .pdd import (
 from .orchestrator import (
     EventRecord,
     JobRecord,
+    MemoryCapacityExceeded,
     MemoryRecord,
     ProgressCallback,
     Request,
@@ -182,6 +183,7 @@ __all__ = [
     "split_work",
     "EventRecord",
     "JobRecord",
+    "MemoryCapacityExceeded",
     "MemoryRecord",
     "Request",
     "RequestRecord",

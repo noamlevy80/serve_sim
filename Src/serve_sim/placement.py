@@ -50,10 +50,14 @@ class Placement:
         needs_weight_load: ``True`` when the slot last hosted a different model
             (or none), so this model's weights must be loaded before it can run;
             ``False`` when the model's weights were already resident.
+        evicted_model: The model whose weights were displaced from the slot by
+            this placement (the slot's previous resident), or ``None`` when the
+            slot was empty or already hosted this model.
     """
 
     slot: EngineSlot
     needs_weight_load: bool
+    evicted_model: object | None = None
 
 
 class EnginePool:
@@ -189,11 +193,15 @@ class EnginePool:
         return candidates[0]
 
     def _place_on(self, slot: EngineSlot, model: object | None) -> Placement:
-        needs_load = model is not None and self._resident.get(slot.index) is not model
+        prior = self._resident.get(slot.index)
+        needs_load = model is not None and prior is not model
+        evicted = prior if (needs_load and prior is not None) else None
         if model is not None:
             self._resident[slot.index] = model
         self._load[slot.index] += 1
-        return Placement(slot=slot, needs_weight_load=needs_load)
+        return Placement(
+            slot=slot, needs_weight_load=needs_load, evicted_model=evicted
+        )
 
     def _check_owned(self, slot: EngineSlot) -> None:
         if not (0 <= slot.index < len(self._slots)) or self._slots[slot.index] is not slot:

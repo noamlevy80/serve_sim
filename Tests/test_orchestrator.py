@@ -607,6 +607,81 @@ def test_weight_loading_reloads_when_slot_repurposed():
     assert len(loads) == 2
 
 
+def test_weight_load_and_eviction_decisions_recorded():
+    # Two different models on a single slot: the first load has no eviction; the
+    # second model evicts the first, so we expect 2 weight_load + 1 weight_eviction.
+    from serve_sim.model import toy_moe_model
+
+    model_a = toy_model()
+    model_b = toy_moe_model()
+    system = make_system(1)
+    strat = StrategyConfig(
+        max_batch_size=1, target_concurrency=1, model_weight_loading=True
+    )
+    reqs = [Request(0, model_a, 64, 8, 0.0), Request(1, model_b, 64, 8, 0.0)]
+
+    result = Simulator(system, strat).run(reqs)
+
+    loads = [d for d in result.decisions if d.kind == "weight_load"]
+    evictions = [d for d in result.decisions if d.kind == "weight_eviction"]
+    assert len(loads) == 2
+    assert len(evictions) == 1
+    # The eviction names the displaced model and the slot it left.
+    assert evictions[0].model == model_a.name
+    assert evictions[0].devices == (system.compute_devices[0].name,)
+    # The load that triggered it names the incoming model and sources the NVM.
+    second_load = loads[1]
+    assert second_load.model == model_b.name
+    assert second_load.source_devices == (system.input_memory.name,)
+    # The eviction is recorded just before the load that displaced it.
+    order = [d.kind for d in result.decisions]
+    assert order.index("weight_eviction") < order.index("weight_load", 1)
+
+
+def test_no_weight_decisions_without_weight_loading():
+    model_a = toy_model()
+    from serve_sim.model import toy_moe_model
+
+    model_b = toy_moe_model()
+    system = make_system(1)
+    strat = StrategyConfig(max_batch_size=1, target_concurrency=1)
+    reqs = [Request(0, model_a, 64, 8, 0.0), Request(1, model_b, 64, 8, 0.0)]
+
+    result = Simulator(system, strat).run(reqs)
+
+    assert not [d for d in result.decisions
+                if d.kind in ("weight_load", "weight_eviction")]
+
+
+# --- memory-capacity enforcement -----------------------------------------------
+
+
+def test_run_raises_when_device_memory_oversubscribed():
+    from serve_sim.orchestrator import MemoryCapacityExceeded
+
+    model = toy_model()
+    # One job's footprint (~7.6 MB for 72 KV tokens) fits, but two concurrent
+    # jobs sharing the single device overflow this capacity.
+    system = make_system(1, cap=10e6)
+    reqs = [Request(0, model, 64, 8, 0.0), Request(1, model, 64, 8, 0.0)]
+
+    with pytest.raises(MemoryCapacityExceeded) as exc:
+        Simulator(system, StrategyConfig(max_batch_size=1)).run(reqs)
+
+    assert exc.value.device == system.compute_devices[0].name
+    assert exc.value.peak_bytes > exc.value.capacity_bytes
+
+
+def test_run_succeeds_when_footprint_fits():
+    model = toy_model()
+    system = make_system(1)  # ample default capacity for the toy model
+    req = Request(0, model, 64, 8, 0.0)
+
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run([req])
+
+    assert result.records  # ran to completion without an OOM abort
+
+
 
 # --- prefill/decode disaggregation (PDD) ---------------------------------------
 
