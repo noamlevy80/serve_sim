@@ -189,7 +189,33 @@ fit one device is rejected earlier, in `_parallelism_for`.)
 2. Emit via the `_decision(...)` helper (or a dedicated builder, e.g. `_eviction_decision`).
 3. Register the kind in `_DECISION_KINDS` in [report.py](Src/serve_sim/report.py) so it is counted
    and written to `orchestration_decisions.csv`; add fields to `_DECISION_FIELDS` if new columns.
-4. Current kinds: `weight_load`, `weight_eviction`, `prefill`, `kv_reuse`, `kv_transfer`, `decode`, `kv_eviction`.
+4. Current kinds: `weight_load`, `weight_eviction`, `prefill`, `kv_reuse`, `kv_transfer`, `decode`, `kv_eviction`, `expert_load`, `expert_eviction`.
+
+### Weight staging and MoE expert streaming — [orchestrator.py](Src/serve_sim/orchestrator.py)
+- **What it does:** stages every model through host RAM before serving. A model's **home node** is
+  the node whose `node_memory` can hold its *full* weights (`ParallelismPlanner.full_model_bytes`),
+  preferring a node that already owns the serving slot's device. `_weight_load_events` then emits two
+  `weight_transfer` stages — NVM → home RAM (once per model, tracked in `self._home_loaded`) and home
+  RAM → device (the resident, **non-expert** footprint `streaming_footprint(pp, 0, 0, tp)`).
+- **Expert streaming:** for MoE models the routed experts are **not** pinned; they stream on demand.
+  `_dispatch` builds an activation trace (`build_activation_trace`), sizes an LRU residency cache to
+  the batch's peak working set per EP rank (`peak_active_per_rank`), and passes both to
+  `EventGenerator.run(..., expert_source=...)`. Cache misses become `expert_transfer` events sourced
+  from the home RAM; `_emit_expert_decisions` records an `expert_load` (and `expert_eviction` when the
+  LRU evicts) decision. The job reserves only its working set (`self._job_reserve[batch_index]`,
+  consumed by `_job_footprint`), so the capacity check sees the streaming footprint, not full residency.
+- **No-home fallback:** when no node can hold the full model, the model stays in the NVM —
+  non-expert weights load NVM → device and experts stream from the NVM. Dense models without a home use
+  the legacy single NVM → device stage of the whole resident footprint.
+- **Node-RAM capacity:** `_check_memory_capacity` additionally sums `full_model_bytes` of every model
+  homed on a node and aborts with `MemoryCapacityExceeded(node.node_memory.name, …)` if they overflow.
+- **Event phases:** `transfer` = KV fetches, `weight_transfer` = weight staging (both stages),
+  `expert_transfer` = routed-expert fetches. Reports/arbiter key off these and `source_memory`.
+- **Toggle:** `StrategyConfig.model_weight_loading` (config key `model_weight_loading`). Expert
+  streaming itself is automatic for any MoE model.
+- Tests: [Tests/test_orchestrator.py](Tests/test_orchestrator.py) (`test_moe_experts_stream_*`,
+  `test_streaming_reserves_*`, `test_home_node_*`), [Tests/test_two_tier.py](Tests/test_two_tier.py),
+  [Tests/test_tiering.py](Tests/test_tiering.py).
 
 ### Global (system-wide) KV cache — [kv_store.py](Src/serve_sim/kv_store.py)
 - **What it does:** keeps every non-evicted sequence's KV resident in **floating memories**

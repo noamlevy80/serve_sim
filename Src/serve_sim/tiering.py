@@ -141,21 +141,36 @@ class ExpertResidencyCache:
         is never evicted mid-group.
         """
 
+        missed, _ = self.access_detail(active_experts)
+        return len(missed)
+
+    def access_detail(
+        self, active_experts: frozenset[int] | set[int]
+    ) -> tuple[list[int], list[int]]:
+        """Touch ``active_experts``; return ``(missed, evicted)`` expert indices.
+
+        ``missed`` are the indices that were not resident and had to be fetched
+        (one transfer each); ``evicted`` are the indices the LRU dropped to make
+        room. Requires ``capacity >= len(active_experts)`` so the current working
+        set is never evicted mid-group.
+        """
+
         if len(active_experts) > self.capacity:
             raise ValueError(
                 f"first tier too small: active set {len(active_experts)} exceeds "
                 f"expert cache capacity {self.capacity}"
             )
-        misses = 0
+        missed: list[int] = []
         for idx in sorted(active_experts):
             if idx in self._resident:
                 self._resident.move_to_end(idx)
             else:
-                misses += 1
+                missed.append(idx)
                 self._resident[idx] = None
+        evicted: list[int] = []
         while len(self._resident) > self.capacity:
-            self._resident.popitem(last=False)
-        return misses
+            evicted.append(self._resident.popitem(last=False)[0])
+        return missed, evicted
 
 
 def _peak_kv_bytes(model: LayeredModel, batch_work: list[SequenceWork]) -> int:
@@ -218,3 +233,26 @@ def derive_expert_cache_capacity(
             "first tier too small to hold reserved bytes plus one routed expert"
         )
     return capacity
+
+
+def peak_active_per_rank(
+    expert_trace: list[GroupActivation], expert_parallel: int = 1
+) -> int:
+    """Largest number of distinct experts any one ep-rank touches in a group.
+
+    This is the minimum first-tier expert-cache capacity (in indices, per rank)
+    that lets every group run without evicting a member of its own working set:
+    expert ``e`` is owned by rank ``e % expert_parallel``, so each group loads at
+    most this many experts onto any single rank at once. Returns ``0`` for an
+    empty trace.
+    """
+
+    if expert_parallel < 1:
+        raise ValueError("expert_parallel must be >= 1")
+    peak = 0
+    for group in expert_trace:
+        counts = [0] * expert_parallel
+        for e in group.active_experts:
+            counts[e % expert_parallel] += 1
+        peak = max(peak, max(counts, default=0))
+    return peak

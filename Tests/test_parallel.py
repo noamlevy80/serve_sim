@@ -248,7 +248,7 @@ def test_each_device_holds_full_model_no_movement():
     gen = EventGenerator(model, devs, expert_parallel=2)
     sched = gen.run(shards, expert_trace=trace, expert_cache_capacity=999)
     # no second tier -> experts are all resident -> no transfer events
-    assert all(e.phase != "transfer" for e in sched.events)
+    assert all(e.phase != "expert_transfer" for e in sched.events)
     single = simulate(model, [make_device()], work)
     assert sched.makespan == pytest.approx(single.makespan / 2, rel=1e-9)
 
@@ -287,7 +287,7 @@ def test_shared_tier2_matches_reference():
     compute = reference_roofline(model, devs[0], work) / 2
     movement = reference_ep_transfer(devs, model, trace, cap, 2, shared_tier2=True)
     assert sched.makespan == pytest.approx(compute + movement, rel=1e-9)
-    assert any(e.phase == "transfer" for e in sched.events)
+    assert any(e.phase == "expert_transfer" for e in sched.events)
 
 
 def test_private_tier2_matches_reference():
@@ -354,4 +354,4 @@ def test_real_model_shared_tier2_movement(deepseek):
     compute = reference_layered(deepseek, devs[0], work) / 2
     movement = reference_ep_transfer(devs, deepseek, trace, cap, 2, shared_tier2=True)
     assert sched.makespan == pytest.approx(compute + movement, rel=1e-9)
-    assert any(e.phase == "transfer" for e in sched.events)
+    assert any(e.phase == "expert_transfer" for e in sched.events)

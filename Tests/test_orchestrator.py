@@ -610,12 +610,22 @@ def test_empty_run_is_empty():
 
 
 def _weight_load_seconds(system, model, device, pp=1, ep=1):
+    """Critical-path seconds to stage weights NVM -> home RAM -> device."""
+
     from serve_sim.transfer import transfer_duration
 
-    weight_bytes = ParallelismPlanner(model, device).footprint(pp, ep, 0)
-    source = system.input_memory
+    planner = ParallelismPlanner(model, device)
+    nvm = system.input_memory
+    ram = system.node_of(device).node_memory
     dst = device.first_tier_memory
-    return transfer_duration(weight_bytes, source, dst, system.link_between(source, dst))
+    d1 = transfer_duration(
+        planner.full_model_bytes, nvm, ram, system.link_between(nvm, ram)
+    )
+    d2 = transfer_duration(
+        planner.streaming_footprint(pp, 0, 0, 1), ram, dst,
+        system.link_between(ram, dst),
+    )
+    return d1 + d2
 
 
 def test_weight_loading_off_by_default_matches_solo():
@@ -627,7 +637,7 @@ def test_weight_loading_off_by_default_matches_solo():
     result = Simulator(system, StrategyConfig(max_batch_size=1)).run([req])
 
     # Default strategy assumes weights resident: no transfer events, solo timing.
-    assert not [e for e in result.events if e.phase == "transfer"]
+    assert not [e for e in result.events if e.phase == "weight_transfer"]
     assert result.record_for(0).completion_time == pytest.approx(
         solo_makespan(model, device, 64, 8)
     )
@@ -642,15 +652,17 @@ def test_weight_loading_prepends_transfer_and_delays_compute():
 
     result = Simulator(system, strat).run([req])
 
-    loads = [e for e in result.events if e.phase == "transfer" and e.rescaled]
+    loads = [e for e in result.events if e.phase == "weight_transfer" and e.rescaled]
     assert loads, "expected a weight-load transfer"
-    load = loads[0]
-    assert load.start == pytest.approx(0.0)
-    assert load.group_index == -1
-    assert load.memory == system.input_memory.name
-    assert load.bytes_read > 0
+    # Weights stage through the home node's RAM: the first stage reads the input
+    # NVM at t=0; the device stage follows it.
+    first = min(loads, key=lambda e: e.start)
+    assert first.start == pytest.approx(0.0)
+    assert first.group_index == -1
+    assert first.memory == system.input_memory.name
+    assert first.bytes_read > 0
     load_seconds = _weight_load_seconds(system, model, device)
-    assert load.end == pytest.approx(load_seconds)
+    assert max(e.end for e in loads) == pytest.approx(load_seconds)
     # Compute waits for the load, so the request finishes a solo run later.
     assert result.record_for(0).completion_time == pytest.approx(
         load_seconds + solo_makespan(model, device, 64, 8)
@@ -669,8 +681,10 @@ def test_weight_loading_charged_once_for_resident_model():
 
     result = Simulator(system, strat).run(reqs)
 
-    loads = [e for e in result.events if e.phase == "transfer" and not e.rescaled]
-    assert len(loads) == 1
+    # One model staged through RAM: NVM -> RAM then RAM -> device = two events;
+    # the second request reuses the resident weights (no reload).
+    loads = [e for e in result.events if e.phase == "weight_transfer" and not e.rescaled]
+    assert len(loads) == 2
 
 
 def test_weight_loading_reloads_when_slot_repurposed():
@@ -688,8 +702,10 @@ def test_weight_loading_reloads_when_slot_repurposed():
 
     result = Simulator(system, strat).run(reqs)
 
-    loads = [e for e in result.events if e.phase == "transfer" and not e.rescaled]
-    assert len(loads) == 2
+    # Each model stages through RAM (NVM -> RAM, then RAM -> device): two events
+    # per model, the second model evicting the first from the slot.
+    loads = [e for e in result.events if e.phase == "weight_transfer" and not e.rescaled]
+    assert len(loads) == 4
 
 
 def test_weight_load_and_eviction_decisions_recorded():
@@ -765,6 +781,180 @@ def test_run_succeeds_when_footprint_fits():
     result = Simulator(system, StrategyConfig(max_batch_size=1)).run([req])
 
     assert result.records  # ran to completion without an OOM abort
+
+
+
+# --- MoE expert streaming ------------------------------------------------------
+
+
+def make_streaming_system(num_devices=1, node_cap=80e9, dev_cap=80e9, num_nodes=1):
+    """A system with per-node RAM and device caps tunable for streaming tests."""
+
+    network = Network(
+        scale_up_bandwidth_bytes_per_s=1e12,
+        scale_up_latency_s=1e-6,
+        cxl_bandwidth_bytes_per_s=1e11,
+        cxl_latency_s=1e-7,
+    )
+    nodes = tuple(
+        Node(
+            name=f"node-{n}",
+            compute_devices=tuple(
+                make_device(f"n{n}g{i}", cap=dev_cap) for i in range(num_devices)
+            ),
+            node_memory=make_memory(f"node-{n}-ram", bw=5e11, cap=node_cap),
+        )
+        for n in range(num_nodes)
+    )
+    return System(
+        name="stream",
+        network=network,
+        input_memory=make_memory("nvm", bw=5e9, cap=1e15),
+        nodes=nodes,
+    )
+
+
+def test_moe_experts_stream_from_home_ram():
+    # A node large enough to home the whole MoE model streams its routed experts
+    # from that RAM; the device only stages its resident (non-expert) weights.
+    from serve_sim.model import toy_moe_model
+
+    model = toy_moe_model()
+    system = make_streaming_system(1)  # 80 GB node RAM homes the ~39 MB model
+    strat = StrategyConfig(max_batch_size=1, model_weight_loading=True)
+    req = Request(0, model, 64, 8, 0.0)
+
+    result = Simulator(system, strat).run([req])
+
+    ram_name = system.nodes[0].node_memory.name
+    experts = [e for e in result.events if e.phase == "expert_transfer"]
+    assert experts, "expected routed-expert streaming events"
+    assert all(e.memory == ram_name for e in experts)
+    # Weights stage NVM -> home RAM (once) then RAM -> device (non-expert only).
+    weights = [e for e in result.events if e.phase == "weight_transfer"]
+    assert any(e.memory == system.input_memory.name for e in weights)  # stage 1
+    assert any(e.memory == ram_name for e in weights)  # stage 2
+    # The streaming misses are recorded as expert_load decisions sourced from RAM.
+    loads = [d for d in result.decisions if d.kind == "expert_load"]
+    assert loads
+    assert loads[0].source_devices == (ram_name,)
+
+
+def test_moe_experts_stream_from_nvm_without_home():
+    # No node can home the 39 MB model (10 MB RAM), so the device loads only its
+    # resident non-expert weights from the NVM and streams the experts from it.
+    from serve_sim.model import toy_moe_model
+
+    model = toy_moe_model()
+    system = make_streaming_system(1, node_cap=10e6, dev_cap=80e9)
+    strat = StrategyConfig(max_batch_size=1, model_weight_loading=True)
+    req = Request(0, model, 64, 8, 0.0)
+
+    result = Simulator(system, strat).run([req])
+
+    nvm_name = system.input_memory.name
+    ram_name = system.nodes[0].node_memory.name
+    experts = [e for e in result.events if e.phase == "expert_transfer"]
+    assert experts, "expected routed-expert streaming events"
+    assert all(e.memory == nvm_name for e in experts)
+    # All weight loads come straight from the NVM -- nothing is staged into RAM.
+    weights = [e for e in result.events if e.phase == "weight_transfer"]
+    assert weights
+    assert all(e.memory == nvm_name for e in weights)
+    assert not any(e.memory == ram_name for e in weights)
+    loads = [d for d in result.decisions if d.kind == "expert_load"]
+    assert loads
+    assert loads[0].source_devices == (nvm_name,)
+
+
+def test_streaming_reserves_only_working_set_not_full_residency():
+    # The full MoE footprint (~39 MB) does not fit a 30 MB device, but streaming
+    # reserves only the working set (~22 MB), so the run completes without an OOM.
+    from serve_sim.model import toy_moe_model
+    from serve_sim.parallelism import ParallelismPlanner
+
+    model = toy_moe_model()
+    device = make_device("probe", cap=80e9)
+    full_footprint = ParallelismPlanner(model, device).footprint(1, 1, 0, 1)
+    assert full_footprint > 30e6  # full residency would overflow the device
+
+    system = make_streaming_system(1, node_cap=80e9, dev_cap=30e6)
+    strat = StrategyConfig(
+        max_batch_size=1, model_weight_loading=True, random_seed=0
+    )
+    req = Request(0, model, 64, 8, 0.0)
+
+    result = Simulator(system, strat).run([req])
+
+    assert result.records  # streaming working set fits where full residency would not
+    assert [e for e in result.events if e.phase == "expert_transfer"]
+
+
+def test_home_node_ram_capacity_enforced_across_models():
+    # Two MoE models each fit the node RAM alone (~39 MB < 50 MB) but not together
+    # (~78 MB): homing both on the one node overflows its RAM.
+    from serve_sim.model import toy_moe_model
+    from serve_sim.orchestrator import MemoryCapacityExceeded
+
+    model_a = toy_moe_model()
+    model_b = toy_moe_model()
+    system = make_streaming_system(1, node_cap=50e6, dev_cap=80e9)
+    strat = StrategyConfig(max_batch_size=1, target_concurrency=2)
+    reqs = [Request(0, model_a, 64, 8, 0.0), Request(1, model_b, 64, 8, 0.0)]
+
+    with pytest.raises(MemoryCapacityExceeded) as exc:
+        Simulator(system, strat).run(reqs)
+
+    assert exc.value.device == system.nodes[0].node_memory.name
+    assert exc.value.peak_bytes > exc.value.capacity_bytes
+
+
+def test_home_node_prefers_slot_owning_node():
+    # With two nodes that can both home the model, the one owning the serving
+    # slot's device is chosen (cheapest in-node fetch).
+    from serve_sim.model import toy_moe_model
+
+    model = toy_moe_model()
+    system = make_streaming_system(num_devices=1, num_nodes=2)
+    sim = Simulator(system, StrategyConfig(max_batch_size=1))
+    slot = sim._pool.slots[0]
+
+    home = sim._home_node_for(model, slot)
+
+    assert home is system.node_of(slot.devices[0])
+
+
+def test_dense_model_has_no_expert_streaming():
+    # A dense model never streams experts: a single resident weight load, no
+    # expert_transfer events or decisions.
+    model = toy_model()
+    system = make_streaming_system(1)
+    strat = StrategyConfig(max_batch_size=1, model_weight_loading=True)
+    req = Request(0, model, 64, 8, 0.0)
+
+    result = Simulator(system, strat).run([req])
+
+    assert not [e for e in result.events if e.phase == "expert_transfer"]
+    assert not [d for d in result.decisions if d.kind in ("expert_load", "expert_eviction")]
+
+
+def test_expert_evictions_recorded_under_cache_pressure():
+    # A long sequence routes through more experts than the working-set cache
+    # holds, so the residency LRU evicts warm experts and records the bookkeeping.
+    from serve_sim.model import toy_moe_model
+
+    model = toy_moe_model()
+    system = make_streaming_system(1)
+    strat = StrategyConfig(
+        max_batch_size=1, model_weight_loading=True, random_seed=0
+    )
+    req = Request(0, model, 128, 128, 0.0)
+
+    result = Simulator(system, strat).run([req])
+
+    evictions = [d for d in result.decisions if d.kind == "expert_eviction"]
+    assert evictions, "expected expert evictions under cache pressure"
+    assert evictions[0].tokens > 0  # number of experts evicted
 
 
 

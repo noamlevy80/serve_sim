@@ -103,8 +103,8 @@ def test_total_is_compute_plus_transfers():
     trace = build_activation_trace(model, work, seed=0)
     cap = min_capacity(trace)
     sched, _ = simulate_two_tier(model, dev, work, cap)
-    compute = sum(e.duration for e in sched.events if e.phase != "transfer")
-    transfers = sum(e.duration for e in sched.events if e.phase == "transfer")
+    compute = sum(e.duration for e in sched.events if e.phase != "expert_transfer")
+    transfers = sum(e.duration for e in sched.events if e.phase == "expert_transfer")
     assert compute == pytest.approx(reference_roofline(model, dev, work), rel=1e-9)
     assert compute + transfers == pytest.approx(sched.makespan, rel=1e-9)
 
@@ -116,7 +116,7 @@ def test_compute_time_equals_single_tier_makespan():
     trace = build_activation_trace(model, work, seed=0)
     cap = min_capacity(trace)
     sched, _ = simulate_two_tier(model, dev, work, cap)
-    compute_only = sum(e.duration for e in sched.events if e.phase != "transfer")
+    compute_only = sum(e.duration for e in sched.events if e.phase != "expert_transfer")
     assert compute_only == pytest.approx(reference_roofline(model, dev, work), rel=1e-9)
 
 
@@ -231,4 +231,4 @@ def test_no_trace_falls_back_to_single_tier():
     shards = WorkShardGenerator(model).generate(work)
     sched = EventGenerator(model, [dev]).run(shards)
     assert sched.makespan == pytest.approx(reference_roofline(model, dev, work), rel=1e-9)
-    assert all(e.phase != "transfer" for e in sched.events)
+    assert all(e.phase != "expert_transfer" for e in sched.events)

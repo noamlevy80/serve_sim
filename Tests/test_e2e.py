@@ -129,7 +129,7 @@ def _nvm_loads(result) -> list:
     return [
         e
         for e in result.events
-        if e.rescaled and e.phase == "transfer" and e.memory == nvm_name
+        if e.rescaled and e.phase == "weight_transfer" and e.memory == nvm_name
     ]
 
 

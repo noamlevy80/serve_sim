@@ -212,8 +212,8 @@ def test_transfer_event_is_scaled():
         model, [dev], event_random_factor_range=0.3, rng=random.Random(11)
     ).run(shards, expert_trace=trace, expert_cache_capacity=cap)
 
-    base_xfer = [e for e in base.events if e.phase == "transfer"]
-    rnd_xfer = [e for e in rnd.events if e.phase == "transfer"]
+    base_xfer = [e for e in base.events if e.phase == "expert_transfer"]
+    rnd_xfer = [e for e in rnd.events if e.phase == "expert_transfer"]
     assert base_xfer  # the two-tier MoE streams experts
     # bytes conserved, duration perturbed within band.
     for d, b in zip(rnd_xfer, base_xfer):

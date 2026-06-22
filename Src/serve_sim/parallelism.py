@@ -40,7 +40,7 @@ token count of a batch and receives a :class:`ParallelismChoice`.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from .blocks import DenseFFN, LayeredModel, MoEFFN
@@ -117,6 +117,61 @@ class ParallelismPlanner:
         """First-tier memory capacity (bytes) of the engine's device."""
 
         return self._capacity
+
+    @property
+    def full_model_bytes(self) -> float:
+        """Whole-model weight bytes (every layer, all experts, LM head; no KV).
+
+        This is what a node's RAM must hold to be a valid home for the model:
+        replicated weights plus *all* routed experts of every layer plus the LM
+        head, unsharded by any parallelism.
+        """
+
+        total = self._lm_head_bytes
+        for lf in self._layers:
+            total += lf.replicated_bytes
+            total += lf.num_experts * lf.routed_expert_bytes
+        return total
+
+    def streaming_footprint(
+        self,
+        pipeline_parallel: int,
+        kv_tokens: int,
+        cache_capacity: int,
+        tensor_parallel: int = 1,
+    ) -> float:
+        """Peak resident bytes on the busiest device when experts are streamed.
+
+        Unlike :meth:`footprint`, which pins *every* owned routed expert, a
+        streaming device keeps only a working set of ``cache_capacity`` expert
+        indices per expert-parallel rank resident on its first tier; the rest are
+        fetched on demand from the home node's RAM. Each resident index occupies
+        that stage's per-layer routed-expert bytes in every MoE layer of the
+        stage. The replicated weights, KV cache and resident experts are all
+        sharded by ``tensor_parallel``.
+        """
+
+        if self.model.num_layers % pipeline_parallel != 0:
+            raise ValueError("pipeline_parallel must divide num_layers")
+        if tensor_parallel < 1:
+            raise ValueError("tensor_parallel must be >= 1")
+        layers_per_stage = self.model.num_layers // pipeline_parallel
+        peak = 0.0
+        for stage in range(pipeline_parallel):
+            stage_layers = self._layers[
+                stage * layers_per_stage : (stage + 1) * layers_per_stage
+            ]
+            replicated = sum(
+                lf.replicated_bytes + lf.kv_bytes_per_token * kv_tokens
+                for lf in stage_layers
+            )
+            if stage == pipeline_parallel - 1:
+                replicated += self._lm_head_bytes
+            resident_experts = cache_capacity * sum(
+                lf.routed_expert_bytes for lf in stage_layers if lf.num_experts
+            )
+            peak = max(peak, (replicated + resident_experts) / tensor_parallel)
+        return peak
 
     # --- candidate enumeration ----------------------------------------------
 
@@ -214,18 +269,27 @@ class ParallelismPlanner:
         flops_by_dtype: Mapping[int, float],
         total_bytes: float,
         tensor_parallel: int = 1,
+        expert_cache_capacity: "Callable[[int], int] | None" = None,
     ) -> ParallelismChoice:
         """Pick the fastest ``(pp, ep)`` that fits; raise if none do.
 
         ``degree`` is the ``pp * ep`` budget to re-factor; ``tensor_parallel`` is
         held fixed (the engine's full device count is ``degree * tensor_parallel``)
-        and applied to every candidate's footprint and time estimate.
+        and applied to every candidate's footprint and time estimate. When
+        ``expert_cache_capacity`` is given (the streaming path) the per-device
+        footprint reserves only ``expert_cache_capacity(ep)`` routed experts per
+        rank instead of every owned expert.
         """
 
         candidates = self.factorizations(degree)
         best_unfit: tuple[float, int, int] | None = None
         for pp, ep in candidates:  # fastest (max ep) first
-            per_device = self.footprint(pp, ep, kv_tokens, tensor_parallel)
+            if expert_cache_capacity is not None:
+                per_device = self.streaming_footprint(
+                    pp, kv_tokens, expert_cache_capacity(ep), tensor_parallel
+                )
+            else:
+                per_device = self.footprint(pp, ep, kv_tokens, tensor_parallel)
             if per_device <= self._capacity:
                 return ParallelismChoice(
                     pipeline_parallel=pp,

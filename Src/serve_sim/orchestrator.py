@@ -40,6 +40,7 @@ from .placement import EnginePool, EngineSlot
 from .kv_store import KVCacheManager, Match
 from .shards import WorkShardGenerator
 from .system import System
+from .tiering import build_activation_trace, peak_active_per_rank
 from .tokenizer import Tokenizer
 from .tracker import SequenceWork
 from .transfer import transfer_duration
@@ -598,6 +599,17 @@ class Simulator:
         # model instance since the layout depends only on the model and device.
         self._planners: dict[int, ParallelismPlanner] = {}
         self._rng = random.Random(self.strategy.random_seed)
+        # Home node per MoE model: the one node whose RAM holds the full model and
+        # streams routed experts up to the serving devices on demand. Chosen the
+        # first time the model is placed and then fixed for the run.
+        self._home_nodes: dict[int, object] = {}
+        # Models whose full weights have already been staged into their home node's
+        # RAM (NVM -> RAM happens once; later placements only stage RAM -> device).
+        self._home_loaded: set[int] = set()
+        # Per-dispatch streaming reservation (per-device resident bytes) keyed by
+        # batch index, so the capacity check uses the working-set footprint rather
+        # than pinning every expert.
+        self._job_reserve: dict[int, float] = {}
         # System-wide persistent KV cache (cross-conversation prefix reuse, LRU
         # eviction, migration across floating memories). Inert when disabled or
         # when the system has no floating (node) memory to offload KV into.
@@ -610,6 +622,61 @@ class Simulator:
             planner = ParallelismPlanner(model, self._pool.slots[0].devices[0])
             self._planners[key] = planner
         return planner
+
+    # --- expert streaming ---------------------------------------------------
+
+    def _is_moe(self, model: object) -> bool:
+        """Whether ``model`` has routed-expert (MoE) layers."""
+
+        return self._planner_for(model).model.num_moe_layers > 0
+
+    def _home_node_for(self, model: object, slot: EngineSlot):
+        """The node whose RAM holds ``model`` in full and streams its experts.
+
+        Chosen once per model and then fixed: prefer a node that owns one of the
+        serving slot's devices and whose ``node_memory`` can hold the whole model
+        (in-node CXL fetches are cheapest); otherwise any node with enough RAM,
+        picked at random; ``None`` when no node can hold the model (the model then
+        keeps every expert resident on the devices, the legacy behaviour).
+        """
+
+        key = id(model)
+        if key in self._home_nodes:
+            return self._home_nodes[key]
+        full = self._planner_for(model).full_model_bytes
+        slot_nodes = []
+        seen: set[int] = set()
+        for device in slot.devices:
+            node = self.system.node_of(device)
+            if id(node) not in seen:
+                seen.add(id(node))
+                slot_nodes.append(node)
+
+        def fits(node) -> bool:
+            mem = node.node_memory
+            return mem is not None and mem.capacity_bytes >= full
+
+        candidates = [n for n in slot_nodes if fits(n)]
+        if candidates:
+            home = candidates[0]
+        else:
+            eligible = [n for n in self.system.nodes if fits(n)]
+            home = self._rng.choice(eligible) if eligible else None
+        self._home_nodes[key] = home
+        return home
+
+    def _expert_fetch_latency(self, source, slot: EngineSlot) -> float:
+        """One-way fabric latency from the expert ``source`` memory to the slot.
+
+        The slowest hop bounds the group's fetch start, so use the worst link
+        among the slot's devices. ``source`` is the home node's RAM when the model
+        fits a node, otherwise the shared input NVM that streams experts directly.
+        """
+
+        return max(
+            self.system.link_between(source, d.first_tier_memory).latency_s
+            for d in slot.devices
+        )
 
     def run(
         self, requests: list[Request], *, progress: ProgressCallback | None = None
@@ -1126,7 +1193,8 @@ class Simulator:
             start = min((e.start for e in rescaled), default=0.0)
             end = max((e.end for e in rescaled), default=start)
             kv_tokens = sum(req.prompt_tokens + req.output_tokens for req in reqs)
-            per_device_bytes = self._job_footprint(reqs[0].model, pp, ep, tp, kv_tokens)
+            per_device_bytes = self._job_footprint(
+                reqs[0].model, pp, ep, tp, kv_tokens, b_index)
             result.jobs.append(
                 JobRecord(
                     job_index=job_index,
@@ -1176,7 +1244,6 @@ class Simulator:
         decision time for both endpoints.
         """
 
-        nvm = self.system.input_memory.name
         spans: dict[tuple[int, str], list[float]] = {}
         for ev in events:
             if not ev.rescaled:
@@ -1186,8 +1253,11 @@ class Simulator:
             elif ev.phase == "decode":
                 key = (ev.batch_index, "decode")
             elif ev.phase == "transfer":
-                key = (ev.batch_index,
-                       "weight_transfer" if ev.memory == nvm else "kv_transfer")
+                key = (ev.batch_index, "kv_transfer")
+            elif ev.phase == "weight_transfer":
+                key = (ev.batch_index, "weight_transfer")
+            elif ev.phase == "expert_transfer":
+                key = (ev.batch_index, "expert_transfer")
             else:
                 continue
             span = spans.get(key)
@@ -1203,6 +1273,7 @@ class Simulator:
             "kv_reuse": "kv_transfer",
             "kv_transfer": "kv_transfer",
             "weight_load": "weight_transfer",
+            "expert_load": "expert_transfer",
         }
         timed: list[DecisionRecord] = []
         for d in decisions:
@@ -1249,6 +1320,23 @@ class Simulator:
             if peak > cap * (1.0 + 1e-9):
                 raise MemoryCapacityExceeded(name, peak, cap)
 
+        # Home-node RAM holds the *whole* model of every model homed there for the
+        # life of the run; several models sharing one node must all fit at once.
+        homed: dict[int, list[object]] = {}
+        for model_key, node in self._home_nodes.items():
+            if node is not None:
+                homed.setdefault(id(node), []).append(model_key)
+        for node in self.system.nodes:
+            keys = homed.get(id(node))
+            if not keys or node.node_memory is None:
+                continue
+            reserved = sum(
+                self._planners[k].full_model_bytes for k in keys if k in self._planners
+            )
+            ram_cap = node.node_memory.capacity_bytes
+            if reserved > ram_cap * (1.0 + 1e-9):
+                raise MemoryCapacityExceeded(node.node_memory.name, reserved, ram_cap)
+
     @staticmethod
     def _event_memory_name(device: ComputeDevice, event: ComputeEvent) -> str:
         """Name of the memory whose bandwidth ``event`` consumed on ``device``.
@@ -1261,7 +1349,7 @@ class Simulator:
 
         if event.phase == "kernel_launch":
             return ""
-        if event.phase == "transfer":
+        if event.phase in ("transfer", "weight_transfer", "expert_transfer"):
             if event.source_memory is not None:
                 return event.source_memory.name
             memory = device.second_tier_memory or device.first_tier_memory
@@ -1269,10 +1357,18 @@ class Simulator:
         return device.first_tier_memory.name
 
     def _job_footprint(
-        self, model: object, pp: int, ep: int, tp: int, kv_tokens: int
+        self, model: object, pp: int, ep: int, tp: int, kv_tokens: int,
+        batch_index: int = -1,
     ) -> float:
-        """Reserved per-device bytes (weights + KV) for a job, or 0 if unknown."""
+        """Reserved per-device bytes (weights + KV) for a job, or 0 if unknown.
 
+        A streaming job reserves only its working set (recorded at dispatch in
+        ``self._job_reserve``); otherwise every owned expert is pinned.
+        """
+
+        reserve = self._job_reserve.get(batch_index)
+        if reserve is not None:
+            return reserve
         try:
             return float(self._planner_for(model).footprint(pp, ep, kv_tokens, tp))
         except (ValueError, ZeroDivisionError):
@@ -1362,7 +1458,38 @@ class Simulator:
         shards = WorkShardGenerator(model).generate(
             work, prefill_chunk_size=self.strategy.prefill_chunk_size
         )
-        pp, ep, tp = self._parallelism_for(model, batch, shards)
+
+        # A real stack stages weights through host RAM: when a node can hold the
+        # whole model it becomes the model's home (NVM -> RAM once, then RAM ->
+        # device). MoE models additionally keep only their working set resident
+        # and stream the rest of the experts on demand -- from the home node's RAM
+        # when one fits, otherwise straight from the shared input NVM (so even a
+        # model too large for any single node's RAM still streams its experts
+        # instead of pinning every one on the serving devices).
+        home = self._home_node_for(model, slot)
+        expert_trace = None
+        expert_cap = None
+        expert_source = None
+        expert_latency = 0.0
+        if self._is_moe(model):
+            expert_trace = build_activation_trace(
+                model, work, self.strategy.prefill_chunk_size,
+                seed=self._rng.randrange(1 << 30),
+            )
+
+        pp, ep, tp = self._parallelism_for(model, batch, shards, expert_trace)
+
+        if expert_trace is not None:
+            expert_cap = max(1, peak_active_per_rank(expert_trace, ep))
+            expert_source = (
+                home.node_memory if home is not None else self.system.input_memory
+            )
+            expert_latency = self._expert_fetch_latency(expert_source, slot)
+            kv_tokens = sum(r.prompt_tokens + r.output_tokens for r in batch)
+            self._job_reserve[batch_index] = self._planner_for(model).streaming_footprint(
+                pp, kv_tokens, expert_cap, tp
+            )
+
         generator = EventGenerator(
             model,
             list(slot.devices),
@@ -1374,14 +1501,24 @@ class Simulator:
         )
         loads: list[ComputeEvent] = []
         if self.strategy.model_weight_loading and placement.needs_weight_load:
-            loads = self._weight_load_events(model, slot, pp, ep, tp)
+            loads = self._weight_load_events(model, slot, pp, ep, tp, home)
             if result is not None:
                 self._emit_weight_decisions(
                     result, batch, slot, placement.evicted_model, now, batch_index)
         fetches = self._kv_fetch_events(slot, kv_fetches) if kv_fetches else []
         prelude = loads + fetches
-        if prelude:
-            events = self._prepend_transfers(prelude, generator.run(shards).events)
+        if prelude or expert_trace is not None:
+            schedule = generator.run(
+                shards,
+                expert_trace=expert_trace,
+                expert_cache_capacity=expert_cap,
+                expert_source=expert_source,
+                expert_fetch_latency=expert_latency,
+            )
+            if result is not None and expert_trace is not None:
+                self._emit_expert_decisions(
+                    result, batch, slot, schedule, now, batch_index, expert_source.name)
+            events = self._prepend_transfers(prelude, schedule.events)
             return arbiter.admit_events(events, list(slot.devices)), slot, pp, ep, tp
         return arbiter.admit(generator, shards), slot, pp, ep, tp
 
@@ -1406,20 +1543,77 @@ class Simulator:
         return prelude + shifted
 
     def _weight_load_events(
-        self, model: object, slot: EngineSlot, pp: int, ep: int, tp: int
+        self, model: object, slot: EngineSlot, pp: int, ep: int, tp: int, home
     ) -> list[ComputeEvent]:
-        """One ``transfer`` event per device: input NVM -> first-tier weights.
+        """Weight-load (``weight_transfer``) events for a slot (re)load.
 
-        The link latency is folded into ``bandwidth_time`` (as the expert-movement
-        transfers do) so the arbiter reproduces the load's duration exactly while
-        still contending its bytes on the shared input-NVM bandwidth.
+        A real serving stack stages a model through host RAM: the weights are
+        read from the shared input NVM into the *home node's* RAM once, then
+        streamed from that RAM onto each serving device. So when the model has a
+        home node this emits (1) a one-off NVM -> home RAM transfer of the whole
+        model (skipped on later placements -- the RAM keeps it resident) and (2) a
+        RAM -> device transfer of the resident *non-expert* weights per device
+        (the routed experts arrive lazily as ``expert_transfer`` fetches). When no
+        node can home the model but it is MoE, the device still loads only its
+        resident *non-expert* weights -- straight from the NVM -- and streams the
+        experts from that same NVM. Only a dense model without a home falls back
+        to the legacy single stage: NVM -> each device of the whole resident
+        footprint. The link latency is folded into ``bandwidth_time`` so the
+        arbiter reproduces each transfer's duration while contending its bytes on
+        the source memory's bandwidth.
         """
 
-        weight_bytes = float(self._planner_for(model).footprint(pp, ep, 0, tp))
+        planner = self._planner_for(model)
+        events: list[ComputeEvent] = []
+        if home is not None:
+            ram = home.node_memory
+            if id(model) not in self._home_loaded:
+                full = float(planner.full_model_bytes)
+                if full > 0:
+                    nvm = self.system.input_memory
+                    link = self.system.link_between(nvm, ram)
+                    d1 = transfer_duration(full, nvm, ram, link)
+                    events.append(ComputeEvent(
+                        group_index=-1, phase="weight_transfer", device_index=0,
+                        flops=0.0, bytes_read=full, compute_time=0.0,
+                        bandwidth_time=d1, duration=d1, start=0.0, end=d1,
+                        source_memory=nvm))
+                self._home_loaded.add(id(model))
+            stage1_end = max((e.end for e in events), default=0.0)
+            dev_bytes = float(planner.streaming_footprint(pp, 0, 0, tp))
+            if dev_bytes > 0:
+                for index, device in enumerate(slot.devices):
+                    destination = device.first_tier_memory
+                    link = self.system.link_between(ram, destination)
+                    d2 = transfer_duration(dev_bytes, ram, destination, link)
+                    events.append(ComputeEvent(
+                        group_index=-1, phase="weight_transfer", device_index=index,
+                        flops=0.0, bytes_read=dev_bytes, compute_time=0.0,
+                        bandwidth_time=d2, duration=d2, start=stage1_end,
+                        end=stage1_end + d2, source_memory=ram))
+            return events
+
+        source = self.system.input_memory
+        if self._is_moe(model):
+            # No node can home the whole model: stream the resident non-expert
+            # weights from the NVM (experts stream lazily from the same NVM).
+            dev_bytes = float(planner.streaming_footprint(pp, 0, 0, tp))
+            if dev_bytes <= 0:
+                return []
+            for index, device in enumerate(slot.devices):
+                destination = device.first_tier_memory
+                link = self.system.link_between(source, destination)
+                duration = transfer_duration(dev_bytes, source, destination, link)
+                events.append(ComputeEvent(
+                    group_index=-1, phase="weight_transfer", device_index=index,
+                    flops=0.0, bytes_read=dev_bytes, compute_time=0.0,
+                    bandwidth_time=duration, duration=duration, start=0.0,
+                    end=duration, source_memory=source))
+            return events
+
+        weight_bytes = float(planner.footprint(pp, ep, 0, tp))
         if weight_bytes <= 0:
             return []
-        source = self.system.input_memory
-        events: list[ComputeEvent] = []
         for index, device in enumerate(slot.devices):
             destination = device.first_tier_memory
             link = self.system.link_between(source, destination)
@@ -1427,7 +1621,7 @@ class Simulator:
             events.append(
                 ComputeEvent(
                     group_index=-1,
-                    phase="transfer",
+                    phase="weight_transfer",
                     device_index=index,
                     flops=0.0,
                     bytes_read=weight_bytes,
@@ -1466,6 +1660,41 @@ class Simulator:
             now, "weight_load", batch[0], device_names, batch_index,
             source_devices=(self.system.input_memory.name,),
             batch_members=members))
+
+    def _emit_expert_decisions(
+        self,
+        result: "RunResult",
+        batch: list[Request],
+        slot: EngineSlot,
+        schedule,
+        now: float,
+        batch_index: int,
+        source_name: str,
+    ) -> None:
+        """Record the routed-expert streaming decisions for a dispatched batch.
+
+        A batch that misses on its working set fetches the absent experts from the
+        home node's RAM: that is one ``expert_load`` decision (its execution window
+        is later backfilled from the batch's ``expert_transfer`` events). When the
+        residency LRU has to evict warm experts to make room, an
+        ``expert_eviction`` decision records that bookkeeping act. Batches that hit
+        entirely on resident experts emit nothing.
+        """
+
+        device_names = tuple(d.name for d in slot.devices)
+        members = tuple((r.workload_id, r.turn_index) for r in batch)
+        if schedule.expert_experts_loaded > 0:
+            result.decisions.append(_decision(
+                now, "expert_load", batch[0], device_names, batch_index,
+                tokens=schedule.expert_experts_loaded,
+                source_devices=(source_name,),
+                batch_members=members))
+        if schedule.expert_evictions > 0:
+            result.decisions.append(_decision(
+                now, "expert_eviction", batch[0], device_names, batch_index,
+                tokens=schedule.expert_evictions,
+                source_devices=(source_name,),
+                batch_members=members))
 
     @staticmethod
     def _weight_eviction_decision(
@@ -1705,7 +1934,8 @@ class Simulator:
         raise ValueError(f"unknown dispatch phase {phase!r}")
 
     def _parallelism_for(
-        self, model: object, batch: list[Request], shards: list
+        self, model: object, batch: list[Request], shards: list,
+        expert_trace: list | None = None,
     ) -> tuple[int, int, int]:
         """Pick (pipeline_parallel, expert_parallel, tensor_parallel) for a batch.
 
@@ -1715,17 +1945,28 @@ class Simulator:
         always taken verbatim and applied to the footprint. Either way the chosen
         arrangement must fit in device memory; a batch that cannot be placed
         raises rather than producing a physically impossible (over-capacity)
-        schedule.
+        schedule. When ``expert_trace`` is given the model streams its experts, so
+        the fit only reserves the per-rank working set instead of every expert.
         """
 
         planner = self._planner_for(model)
         kv_tokens = sum(req.prompt_tokens + req.output_tokens for req in batch)
         tp = self.strategy.tensor_parallel
+        cap_for = (
+            (lambda ep: peak_active_per_rank(expert_trace, ep))
+            if expert_trace is not None
+            else None
+        )
 
         if not self.strategy.auto_parallelism:
             pp = self.strategy.pipeline_parallel
             ep = self.strategy.expert_parallel
-            per_device = planner.footprint(pp, ep, kv_tokens, tp)
+            if cap_for is not None:
+                per_device = planner.streaming_footprint(
+                    pp, kv_tokens, cap_for(ep), tp
+                )
+            else:
+                per_device = planner.footprint(pp, ep, kv_tokens, tp)
             if per_device > planner.capacity:
                 raise ValueError(
                     f"fixed parallelism pp={pp}, ep={ep}, tp={tp} cannot serve a "
@@ -1750,5 +1991,6 @@ class Simulator:
             flops_by_dtype=flops_by_dtype,
             total_bytes=total_bytes,
             tensor_parallel=tp,
+            expert_cache_capacity=cap_for,
         )
         return choice.pipeline_parallel, choice.expert_parallel, choice.tensor_parallel

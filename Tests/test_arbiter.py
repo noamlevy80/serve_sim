@@ -195,7 +195,7 @@ def test_two_jobs_sharing_nvm_double_transfer_time():
     model, work, trace, cap, shards = _moe_setup()
     dev = make_two_tier("a")  # both jobs use this device (shared nvm + tiers)
     solo = gen(model, [dev]).run(shards, expert_trace=trace, expert_cache_capacity=cap)
-    solo_first_transfer = next(e for e in solo.events if e.phase == "transfer")
+    solo_first_transfer = next(e for e in solo.events if e.phase == "expert_transfer")
 
     arb = ResourceArbiter()
     arb.add_job(gen(model, [dev]), shards, expert_trace=trace, expert_cache_capacity=cap)
@@ -204,7 +204,7 @@ def test_two_jobs_sharing_nvm_double_transfer_time():
 
     # the group-0 transfers both start at t=0 on the shared NVM -> each doubles.
     job0_first_transfer = next(
-        e for e in result.schedules[0].events if e.phase == "transfer"
+        e for e in result.schedules[0].events if e.phase == "expert_transfer"
     )
     assert job0_first_transfer.duration == pytest.approx(
         2 * solo_first_transfer.duration, rel=1e-9
@@ -216,7 +216,7 @@ def test_transfers_on_separate_nvm_do_not_contend():
     da = make_two_tier("a")  # its own nvm
     db = make_two_tier("b")  # a different nvm instance
     solo = gen(model, [da]).run(shards, expert_trace=trace, expert_cache_capacity=cap)
-    solo_first_transfer = next(e for e in solo.events if e.phase == "transfer")
+    solo_first_transfer = next(e for e in solo.events if e.phase == "expert_transfer")
 
     arb = ResourceArbiter()
     arb.add_job(gen(model, [da]), shards, expert_trace=trace, expert_cache_capacity=cap)
@@ -224,7 +224,7 @@ def test_transfers_on_separate_nvm_do_not_contend():
     result = arb.run()
 
     job0_first_transfer = next(
-        e for e in result.schedules[0].events if e.phase == "transfer"
+        e for e in result.schedules[0].events if e.phase == "expert_transfer"
     )
     # disjoint NVMs -> transfers keep their standalone duration.
     assert job0_first_transfer.duration == pytest.approx(

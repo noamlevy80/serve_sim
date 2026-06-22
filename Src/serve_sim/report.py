@@ -108,7 +108,7 @@ _COMPUTE_PHASES = ("prefill", "decode")
 # Orchestration-decision kinds, in report order.
 _DECISION_KINDS = (
     "weight_load", "weight_eviction", "prefill", "kv_reuse", "kv_transfer",
-    "decode", "kv_eviction",
+    "decode", "kv_eviction", "expert_load", "expert_eviction",
 )
 
 
@@ -146,7 +146,8 @@ def device_summaries(result: RunResult) -> list[dict[str, Any]]:
                                 if e.phase in _COMPUTE_PHASES)
         busy = _union_length([(e.start, e.end) for e in dev_events
                               if e.phase != "kernel_launch"])
-        transfers = [e for e in dev_events if e.phase == "transfer"]
+        transfers = [e for e in dev_events
+                     if e.phase in ("transfer", "weight_transfer", "expert_transfer")]
         peak_mem = _peak_occupancy(result, name)
         summaries.append({
             "device": name,
@@ -286,7 +287,8 @@ def summarize(result: RunResult) -> dict[str, Any]:
     records = result.records
     makespan = result.makespan or 0.0
     isolated = _isolated(result.events)
-    transfers = [e for e in isolated if e.phase == "transfer"]
+    transfers = [e for e in isolated
+                 if e.phase in ("transfer", "weight_transfer", "expert_transfer")]
     devices = device_summaries(result)
     memories = memory_summaries(result)
 
