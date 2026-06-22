@@ -85,7 +85,7 @@ Outputs land in `Outputs/<run_id>/` (see §8).
 | [shards.py](Src/serve_sim/shards.py) | Turn a batch into work shards. | `WorkShard`, `WorkShardGenerator` |
 | [events.py](Src/serve_sim/events.py) | Generate compute events from shards. | `ComputeEvent`, `EventGenerator`, `EventSchedule` |
 | [weights.py](Src/serve_sim/weights.py) | Model-weight load tracking. | `ModelWeightsTracker`, `WeightShard` |
-| [parallelism.py](Src/serve_sim/parallelism.py) | Pipeline/expert parallelism planning. | `ParallelismChoice`, `ParallelismPlanner` |
+| [parallelism.py](Src/serve_sim/parallelism.py) | Pipeline/expert/tensor parallelism planning. | `ParallelismChoice`, `ParallelismPlanner` |
 | [placement.py](Src/serve_sim/placement.py) | Map work to engine slots/devices. | `EnginePool`, `EngineSlot`, `Placement` |
 | [arbiter.py](Src/serve_sim/arbiter.py) | Resolve contention for compute & bandwidth over time. | `ResourceArbiter`, `IncrementalArbiter`, `ArbiterResult` |
 | [pdd.py](Src/serve_sim/pdd.py) | Prefill/decode-disaggregation helpers; KV byte sizing. | `context_kv_bytes`, PDD pools |
@@ -231,7 +231,8 @@ Keys read by [runner.py](Src/serve_sim/runner.py) (`run_from_config` / `_strateg
 | `allow_pdd` | `True` | Prefill/decode disaggregation path. |
 | `prefill_engine_fraction` | `0.5` | Slot split for PDD. |
 | `prefill_chunk_size` | `None` | Optional prefill chunking. |
-| `pipeline_parallel` / `expert_parallel` | `1` | Fixed parallel degrees. |
+| `pipeline_parallel` / `expert_parallel` | `1` | Fixed parallel degrees (re-factored by `auto_parallelism`). |
+| `tensor_parallel` | `1` | Fixed tensor-parallel degree; shards every tensor + KV and splits compute. Always applied verbatim. Engine = `pp x ep x tp` devices. |
 | `auto_parallelism` | `False` | Let the orchestrator pick parallelism. |
 | `model_weight_loading` | `True` | Model first-placement weight-load cost. |
 | `event_random_factor_range` | `0.05` | Per-event time perturbation magnitude. |

@@ -11,8 +11,8 @@ v0 deliberately uses the *trivial fixed policy* the plan calls for:
 - **No PDD:** a request's prefill and decode for its turn run as one job (the
   existing work-shard -> event pipeline), not split across prefill/decode pools.
 - **Fixed parallelism:** the engine is the first ``pipeline_parallel x
-  expert_parallel`` compute devices of the system; the roofline parallelism
-  search comes in a later stage.
+  expert_parallel x tensor_parallel`` compute devices of the system; the
+  roofline parallelism search comes in a later stage.
 - **Target concurrency only:** the one admission knob caps how many sequences
   are in flight; beyond that, ready sequences wait for a completion.
 - **Concurrency-window batching:** ready sequences of the same model are grouped
@@ -84,6 +84,14 @@ class StrategyConfig:
         target_concurrency: Max sequences in flight, or ``None`` for unbounded.
         pipeline_parallel: Fixed pipeline-parallel degree of the engine.
         expert_parallel: Fixed expert-parallel degree of the engine.
+        tensor_parallel: Fixed tensor-parallel degree of the engine. Tensor
+            parallelism shards every weight tensor and the KV cache across its
+            ranks and splits each rank's compute, so it divides the per-device
+            footprint by ``tensor_parallel`` and speeds a batch up by the same
+            factor. It is always applied verbatim; ``auto_parallelism`` only
+            re-factors the ``pipeline_parallel x expert_parallel`` budget while
+            ``tensor_parallel`` is held fixed. The engine occupies
+            ``pipeline_parallel x expert_parallel x tensor_parallel`` devices.
         auto_parallelism: When ``True``, the orchestrator treats
             ``pipeline_parallel x expert_parallel`` only as the fixed engine size
             and, per batch, searches the ``(pp, ep)`` factorizations of that size
@@ -122,6 +130,7 @@ class StrategyConfig:
     target_concurrency: int | None = None
     pipeline_parallel: int = 1
     expert_parallel: int = 1
+    tensor_parallel: int = 1
     auto_parallelism: bool = False
     allow_pdd: bool = False
     prefill_engine_fraction: float = 0.5
@@ -139,6 +148,8 @@ class StrategyConfig:
         if self.target_concurrency is not None and self.target_concurrency < 1:
             raise ValueError("target_concurrency must be >= 1 when set")
         if self.pipeline_parallel < 1 or self.expert_parallel < 1:
+            raise ValueError("parallelism degrees must be >= 1")
+        if self.tensor_parallel < 1:
             raise ValueError("parallelism degrees must be >= 1")
         if self.prefill_chunk_size is not None and self.prefill_chunk_size < 1:
             raise ValueError("prefill_chunk_size must be >= 1")
@@ -547,12 +558,16 @@ class Simulator:
     def __init__(self, system: System, strategy: StrategyConfig | None = None) -> None:
         self.system = system
         self.strategy = strategy or StrategyConfig()
-        degree = self.strategy.pipeline_parallel * self.strategy.expert_parallel
+        degree = (
+            self.strategy.pipeline_parallel
+            * self.strategy.expert_parallel
+            * self.strategy.tensor_parallel
+        )
         devices = system.compute_devices
         if len(devices) < degree:
             raise ValueError(
                 f"system has {len(devices)} compute devices but the engine needs "
-                f"{degree} (pipeline_parallel x expert_parallel)"
+                f"{degree} (pipeline_parallel x expert_parallel x tensor_parallel)"
             )
         # Carve the system into fixed-size engine slots. Concurrent batches land
         # on disjoint slots when free (running independently); when every slot is
@@ -629,8 +644,10 @@ class Simulator:
 
         # job_index -> (requests, dispatch_time, batch_index, slot)
         jobs: dict[int, tuple[list[Request], float, int, EngineSlot]] = {}
-        # job_index -> (job_phase, requests, slot, batch_index, pp, ep)
-        job_meta: dict[int, tuple[str, list[Request], EngineSlot, int, int, int]] = {}
+        # job_index -> (job_phase, requests, slot, batch_index, pp, ep, tp)
+        job_meta: dict[
+            int, tuple[str, list[Request], EngineSlot, int, int, int, int]
+        ] = {}
         reported: set[int] = set()
         result = RunResult()
 
@@ -734,7 +751,7 @@ class Simulator:
                 if self._kv_active:
                     batch, matches = self._resolve_kv(batch, now)
                     kv_fetches = self._kv_fetches(batch, matches)
-                job_index, slot, pp, ep = self._dispatch(
+                job_index, slot, pp, ep, tp = self._dispatch(
                     arbiter, batch, kv_fetches=kv_fetches,
                     result=result, now=now, batch_index=batch_index)
                 device_names = tuple(d.name for d in slot.devices)
@@ -760,7 +777,7 @@ class Simulator:
                         tokens=req.output_tokens,
                         batch_members=members))
                 jobs[job_index] = (batch, now, batch_index, slot)
-                job_meta[job_index] = ("full", batch, slot, batch_index, pp, ep)
+                job_meta[job_index] = ("full", batch, slot, batch_index, pp, ep, tp)
                 batch_index += 1
                 progressed = True
 
@@ -814,8 +831,10 @@ class Simulator:
 
         # job_index -> (kind, requests, slot, pool)
         jobs: dict[int, tuple[str, list[Request], EngineSlot, EnginePool]] = {}
-        # job_index -> (job_phase, requests, slot, batch_index, pp, ep)
-        job_meta: dict[int, tuple[str, list[Request], EngineSlot, int, int, int]] = {}
+        # job_index -> (job_phase, requests, slot, batch_index, pp, ep, tp)
+        job_meta: dict[
+            int, tuple[str, list[Request], EngineSlot, int, int, int, int]
+        ] = {}
         reported: set[int] = set()
         # id(request) -> (prefill dispatch time, prefill batch index, prefill devices)
         meta: dict[int, tuple[float, int, tuple[str, ...]]] = {}
@@ -957,7 +976,7 @@ class Simulator:
                 if self._kv_active:
                     batch, matches = self._resolve_kv(batch, now)
                     kv_fetches = self._kv_fetches(batch, matches)
-                job_index, slot, pp, ep = self._dispatch(
+                job_index, slot, pp, ep, tp = self._dispatch(
                     arbiter, batch, pool=self._prefill_pool, phase="prefill",
                     kv_fetches=kv_fetches,
                     result=result, now=now, batch_index=batch_index,
@@ -982,7 +1001,7 @@ class Simulator:
                             source_turn_index=req.turn_index - 1,
                             source_devices=device_names))
                 jobs[job_index] = ("prefill", batch, slot, self._prefill_pool)
-                job_meta[job_index] = ("prefill", batch, slot, batch_index, pp, ep)
+                job_meta[job_index] = ("prefill", batch, slot, batch_index, pp, ep, tp)
                 batch_index += 1
                 progressed = True
             if not prefill_ready:
@@ -998,7 +1017,7 @@ class Simulator:
                 if not (fill or decode_elapsed):
                     break
                 batch = self._take_decode_batch(decode_ready)
-                job_index, slot, pp, ep = self._dispatch(
+                job_index, slot, pp, ep, tp = self._dispatch(
                     arbiter, batch, pool=self._decode_pool, phase="decode",
                     result=result, now=now, batch_index=batch_index,
                 )
@@ -1018,7 +1037,7 @@ class Simulator:
                         tokens=req.output_tokens,
                         batch_members=members))
                 jobs[job_index] = ("decode", batch, slot, self._decode_pool)
-                job_meta[job_index] = ("decode", batch, slot, batch_index, pp, ep)
+                job_meta[job_index] = ("decode", batch, slot, batch_index, pp, ep, tp)
                 batch_index += 1
                 progressed = True
             if not decode_ready:
@@ -1047,7 +1066,9 @@ class Simulator:
         self,
         result: RunResult,
         arbiter: IncrementalArbiter,
-        job_meta: dict[int, tuple[str, list[Request], EngineSlot, int, int, int]],
+        job_meta: dict[
+            int, tuple[str, list[Request], EngineSlot, int, int, int, int]
+        ],
     ) -> None:
         """Attach the raw event log, per-job footprints and first-token times.
 
@@ -1058,7 +1079,7 @@ class Simulator:
         """
 
         first_token: dict[int, float] = {}
-        for job_index, (job_phase, reqs, slot, b_index, pp, ep) in job_meta.items():
+        for job_index, (job_phase, reqs, slot, b_index, pp, ep, tp) in job_meta.items():
             request_ids = tuple(req.request_id for req in reqs)
             devices = slot.devices
             device_names = tuple(d.name for d in devices)
@@ -1105,7 +1126,7 @@ class Simulator:
             start = min((e.start for e in rescaled), default=0.0)
             end = max((e.end for e in rescaled), default=start)
             kv_tokens = sum(req.prompt_tokens + req.output_tokens for req in reqs)
-            per_device_bytes = self._job_footprint(reqs[0].model, pp, ep, kv_tokens)
+            per_device_bytes = self._job_footprint(reqs[0].model, pp, ep, tp, kv_tokens)
             result.jobs.append(
                 JobRecord(
                     job_index=job_index,
@@ -1247,11 +1268,13 @@ class Simulator:
             return memory.name
         return device.first_tier_memory.name
 
-    def _job_footprint(self, model: object, pp: int, ep: int, kv_tokens: int) -> float:
+    def _job_footprint(
+        self, model: object, pp: int, ep: int, tp: int, kv_tokens: int
+    ) -> float:
         """Reserved per-device bytes (weights + KV) for a job, or 0 if unknown."""
 
         try:
-            return float(self._planner_for(model).footprint(pp, ep, kv_tokens))
+            return float(self._planner_for(model).footprint(pp, ep, kv_tokens, tp))
         except (ValueError, ZeroDivisionError):
             return 0.0
 
@@ -1317,7 +1340,7 @@ class Simulator:
         result: "RunResult | None" = None,
         now: float = 0.0,
         batch_index: int = -1,
-    ) -> tuple[int, EngineSlot, int, int]:
+    ) -> tuple[int, EngineSlot, int, int, int]:
         """Place a batch on an engine slot and admit its events to the arbiter.
 
         ``phase`` selects the work generated: ``"full"`` (prefill + decode in one
@@ -1327,7 +1350,8 @@ class Simulator:
         ``kv_fetches`` lists ``(floating_memory, bytes)`` prefixes to fetch from
         the global KV cache before compute. Returns the arbiter job index, the
         slot the batch occupies (released on completion), and the
-        ``(pipeline_parallel, expert_parallel)`` arrangement chosen.
+        ``(pipeline_parallel, expert_parallel, tensor_parallel)`` arrangement
+        chosen.
         """
 
         model = batch[0].model
@@ -1338,18 +1362,19 @@ class Simulator:
         shards = WorkShardGenerator(model).generate(
             work, prefill_chunk_size=self.strategy.prefill_chunk_size
         )
-        pp, ep = self._parallelism_for(model, batch, shards)
+        pp, ep, tp = self._parallelism_for(model, batch, shards)
         generator = EventGenerator(
             model,
             list(slot.devices),
             pipeline_parallel=pp,
             expert_parallel=ep,
+            tensor_parallel=tp,
             event_random_factor_range=self.strategy.event_random_factor_range,
             rng=self._rng,
         )
         loads: list[ComputeEvent] = []
         if self.strategy.model_weight_loading and placement.needs_weight_load:
-            loads = self._weight_load_events(model, slot, pp, ep)
+            loads = self._weight_load_events(model, slot, pp, ep, tp)
             if result is not None:
                 self._emit_weight_decisions(
                     result, batch, slot, placement.evicted_model, now, batch_index)
@@ -1357,8 +1382,8 @@ class Simulator:
         prelude = loads + fetches
         if prelude:
             events = self._prepend_transfers(prelude, generator.run(shards).events)
-            return arbiter.admit_events(events, list(slot.devices)), slot, pp, ep
-        return arbiter.admit(generator, shards), slot, pp, ep
+            return arbiter.admit_events(events, list(slot.devices)), slot, pp, ep, tp
+        return arbiter.admit(generator, shards), slot, pp, ep, tp
 
     @staticmethod
     def _prepend_transfers(
@@ -1381,7 +1406,7 @@ class Simulator:
         return prelude + shifted
 
     def _weight_load_events(
-        self, model: object, slot: EngineSlot, pp: int, ep: int
+        self, model: object, slot: EngineSlot, pp: int, ep: int, tp: int
     ) -> list[ComputeEvent]:
         """One ``transfer`` event per device: input NVM -> first-tier weights.
 
@@ -1390,7 +1415,7 @@ class Simulator:
         still contending its bytes on the shared input-NVM bandwidth.
         """
 
-        weight_bytes = float(self._planner_for(model).footprint(pp, ep, 0))
+        weight_bytes = float(self._planner_for(model).footprint(pp, ep, 0, tp))
         if weight_bytes <= 0:
             return []
         source = self.system.input_memory
@@ -1681,12 +1706,13 @@ class Simulator:
 
     def _parallelism_for(
         self, model: object, batch: list[Request], shards: list
-    ) -> tuple[int, int]:
-        """Pick (pipeline_parallel, expert_parallel) for a batch.
+    ) -> tuple[int, int, int]:
+        """Pick (pipeline_parallel, expert_parallel, tensor_parallel) for a batch.
 
         Fixed from the strategy unless ``auto_parallelism`` is set, in which case
-        the planner searches the factorizations of the engine size for the
-        fastest memory-feasible arrangement of this batch. Either way the chosen
+        the planner searches the factorizations of the ``pp x ep`` budget for the
+        fastest memory-feasible arrangement of this batch; ``tensor_parallel`` is
+        always taken verbatim and applied to the footprint. Either way the chosen
         arrangement must fit in device memory; a batch that cannot be placed
         raises rather than producing a physically impossible (over-capacity)
         schedule.
@@ -1694,21 +1720,22 @@ class Simulator:
 
         planner = self._planner_for(model)
         kv_tokens = sum(req.prompt_tokens + req.output_tokens for req in batch)
+        tp = self.strategy.tensor_parallel
 
         if not self.strategy.auto_parallelism:
             pp = self.strategy.pipeline_parallel
             ep = self.strategy.expert_parallel
-            per_device = planner.footprint(pp, ep, kv_tokens)
+            per_device = planner.footprint(pp, ep, kv_tokens, tp)
             if per_device > planner.capacity:
                 raise ValueError(
-                    f"fixed parallelism pp={pp}, ep={ep} cannot serve a batch of "
-                    f"{kv_tokens} KV tokens: the per-device footprint is "
+                    f"fixed parallelism pp={pp}, ep={ep}, tp={tp} cannot serve a "
+                    f"batch of {kv_tokens} KV tokens: the per-device footprint is "
                     f"{per_device:.0f} bytes but device memory holds only "
                     f"{planner.capacity:.0f} bytes. Raise pipeline_parallel/"
-                    f"expert_parallel, enable auto_parallelism, or use a device "
-                    f"with more memory."
+                    f"expert_parallel/tensor_parallel, enable auto_parallelism, or "
+                    f"use a device with more memory."
                 )
-            return pp, ep
+            return pp, ep, tp
 
         flops_by_dtype: dict[int, float] = {}
         total_bytes = 0.0
@@ -1718,9 +1745,10 @@ class Simulator:
             )
             total_bytes += shard.bytes_read
         choice = planner.plan(
-            self._degree,
+            self._degree // tp,
             kv_tokens=kv_tokens,
             flops_by_dtype=flops_by_dtype,
             total_bytes=total_bytes,
+            tensor_parallel=tp,
         )
-        return choice.pipeline_parallel, choice.expert_parallel
+        return choice.pipeline_parallel, choice.expert_parallel, choice.tensor_parallel

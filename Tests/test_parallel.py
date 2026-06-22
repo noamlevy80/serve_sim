@@ -42,9 +42,11 @@ def make_two_tier(
     return ComputeDevice(name, peak_flops_fp16=peak, first_tier_memory=t1, second_tier_memory=tier2)
 
 
-def simulate(model, devices, work, pp=1, ep=1, chunk=None):
+def simulate(model, devices, work, pp=1, ep=1, tp=1, chunk=None):
     shards = WorkShardGenerator(model).generate(work, chunk)
-    gen = EventGenerator(model, devices, pipeline_parallel=pp, expert_parallel=ep)
+    gen = EventGenerator(
+        model, devices, pipeline_parallel=pp, expert_parallel=ep, tensor_parallel=tp
+    )
     return gen.run(shards)
 
 
@@ -101,6 +103,89 @@ def test_expert_parallel_works_on_dense_model():
     single = simulate(model, [make_device()], work)
     dual = simulate(model, [make_device("a"), make_device("b")], work, ep=2)
     assert dual.makespan == pytest.approx(single.makespan / 2, rel=1e-9)
+
+
+# --- tensor-parallel compute ----------------------------------------------------
+
+
+def test_tensor_parallel_conserves_work():
+    model = toy_moe_model()
+    work = [SequenceWork(0, 64, 8)]
+    single = simulate(model, [make_device()], work)
+    dual = simulate(model, [make_device("a"), make_device("b")], work, tp=2)
+    assert dual.total_flops == pytest.approx(single.total_flops, rel=1e-12)
+    assert dual.total_bytes == pytest.approx(single.total_bytes, rel=1e-12)
+
+
+def test_tensor_parallel_halves_makespan():
+    model = toy_moe_model()
+    work = [SequenceWork(0, 64, 8)]
+    single = simulate(model, [make_device()], work)
+    dual = simulate(model, [make_device("a"), make_device("b")], work, tp=2)
+    assert dual.makespan == pytest.approx(single.makespan / 2, rel=1e-9)
+
+
+def test_tensor_parallel_works_on_dense_model():
+    model = toy_model()
+    work = [SequenceWork(0, 64, 8)]
+    single = simulate(model, [make_device()], work)
+    quad = simulate(model, [make_device(f"g{i}") for i in range(4)], work, tp=4)
+    assert quad.makespan == pytest.approx(single.makespan / 4, rel=1e-9)
+
+
+def test_tensor_and_expert_parallel_compose():
+    # tp and ep both speed a stage up; together they give an ep*tp speedup.
+    model = toy_moe_model()
+    work = [SequenceWork(0, 64, 8)]
+    single = simulate(model, [make_device()], work)
+    devs = [make_device(f"g{i}") for i in range(4)]
+    grid = simulate(model, devs, work, ep=2, tp=2)
+    assert grid.makespan == pytest.approx(single.makespan / 4, rel=1e-9)
+    assert grid.total_flops == pytest.approx(single.total_flops, rel=1e-12)
+
+
+def test_pipeline_expert_tensor_grid_composes():
+    model = toy_moe_model(num_layers=4)
+    work = [SequenceWork(0, 64, 8)]
+    pp_only = simulate(model, [make_device("s0"), make_device("s1")], work, pp=2)
+    devs = [make_device(f"g{i}") for i in range(8)]
+    grid = simulate(model, devs, work, pp=2, ep=2, tp=2)
+    # ep*tp = 4 concurrent ranks per stage -> 4x faster than pp alone.
+    assert grid.makespan == pytest.approx(pp_only.makespan / 4, rel=1e-9)
+
+
+def test_tensor_parallel_grid_uses_pp_ep_tp_devices():
+    model = toy_moe_model(num_layers=4)
+    # pp*ep*tp = 8 devices required; 4 is not divisible.
+    with pytest.raises(ValueError, match="divisible"):
+        EventGenerator(
+            model,
+            [make_device(f"g{i}") for i in range(4)],
+            pipeline_parallel=2,
+            expert_parallel=2,
+            tensor_parallel=2,
+        )
+
+
+def test_tensor_parallel_event_uses_distinct_devices():
+    model = toy_model()
+    work = [SequenceWork(0, 32, 4)]
+    devs = [make_device("a"), make_device("b")]
+    sched = simulate(model, devs, work, tp=2)
+    # Each tp rank lands on its own device index (the grid is laid out per rank).
+    indices = {e.device_index for e in sched.events if e.phase != "kernel_launch"}
+    assert indices == {0, 1}
+
+
+def test_two_tier_rejects_tensor_parallel():
+    model = toy_moe_model()
+    work = [SequenceWork(0, 32, 4)]
+    devs = [make_two_tier("a"), make_two_tier("b")]
+    trace = build_activation_trace(model, work, seed=0)
+    shards = WorkShardGenerator(model).generate(work)
+    gen = EventGenerator(model, devs, tensor_parallel=2)
+    with pytest.raises(NotImplementedError, match="tensor_parallel"):
+        gen.run(shards, expert_trace=trace, expert_cache_capacity=8)
 
 
 # --- pipeline x expert parallelism ----------------------------------------------

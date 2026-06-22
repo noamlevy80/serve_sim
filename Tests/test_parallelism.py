@@ -253,3 +253,78 @@ def test_plan_degree_one_returns_trivial():
     planner = ParallelismPlanner(model, make_device())
     choice = planner.plan(1, kv_tokens=10, flops_by_dtype={2: 1e12}, total_bytes=1e9)
     assert (choice.pipeline_parallel, choice.expert_parallel) == (1, 1)
+
+
+# --- tensor parallelism --------------------------------------------------------
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_tensor_parallel_divides_footprint(tp):
+    # TP shards every tensor AND the KV cache, so the whole per-device footprint
+    # scales as 1/tp (unlike ep, which shards only routed experts).
+    model = moe_model(num_layers=4, num_experts=8)
+    planner = ParallelismPlanner(model, make_device())
+    base = planner.footprint(1, 1, kv_tokens=50)
+    assert planner.footprint(1, 1, kv_tokens=50, tensor_parallel=tp) == pytest.approx(
+        base / tp
+    )
+
+
+def test_tensor_parallel_relieves_dense_footprint_unlike_ep():
+    # A dense model: ep does nothing, but tp still shrinks the footprint.
+    model = dense_model(num_layers=8)
+    planner = ParallelismPlanner(model, make_device())
+    base = planner.footprint(1, 1, 100)
+    assert planner.footprint(1, 4, 100) == pytest.approx(base)  # ep inert on dense
+    assert planner.footprint(1, 1, 100, tensor_parallel=2) == pytest.approx(base / 2)
+
+
+def test_tensor_parallel_rejects_zero():
+    planner = ParallelismPlanner(dense_model(num_layers=4), make_device())
+    with pytest.raises(ValueError):
+        planner.footprint(1, 1, 10, tensor_parallel=0)
+
+
+def test_estimate_scales_inversely_with_ep_times_tp():
+    device = make_device(peak=100e12, bw=1e12)
+    planner = ParallelismPlanner(dense_model(), device)
+    flops = {2: 200e12}
+    base = planner.estimate_time(1, flops, total_bytes=0.0)
+    assert planner.estimate_time(2, flops, 0.0, tensor_parallel=2) == pytest.approx(
+        base / 4
+    )
+    assert planner.estimate_time(1, flops, 0.0, tensor_parallel=4) == pytest.approx(
+        base / 4
+    )
+
+
+def test_plan_holds_tensor_parallel_fixed_and_refactors_pp_ep():
+    model = dense_model(num_layers=8)
+    planner = ParallelismPlanner(model, make_device(cap=80e9))
+    # The pp*ep budget here is 4; tp=2 is held fixed and applied to the footprint.
+    choice = planner.plan(
+        4, kv_tokens=100, flops_by_dtype={2: 1e12}, total_bytes=1e9, tensor_parallel=2
+    )
+    assert isinstance(choice, ParallelismChoice)
+    assert (choice.pipeline_parallel, choice.expert_parallel) == (1, 4)
+    assert choice.tensor_parallel == 2
+    assert choice.per_device_bytes == pytest.approx(
+        ref_footprint(model, 1, 4, 100) / 2
+    )
+
+
+def test_plan_tensor_parallel_makes_a_tight_batch_fit():
+    model = dense_model(num_layers=8)
+    # The smallest tp=1 footprint over the degree-4 budget is the most-pipelined
+    # pp=4 arrangement; a cap below it cannot place the batch at any (pp, ep).
+    min_fp = ParallelismPlanner(model, make_device()).footprint(4, 1, 100)
+    planner = ParallelismPlanner(model, make_device(cap=min_fp * 0.75))
+    with pytest.raises(ValueError, match="no parallelism arrangement"):
+        planner.plan(4, kv_tokens=100, flops_by_dtype={2: 1e12}, total_bytes=1e9)
+    # tp=2 halves every arrangement's footprint, so the batch now fits.
+    choice = planner.plan(
+        4, kv_tokens=100, flops_by_dtype={2: 1e12}, total_bytes=1e9, tensor_parallel=2
+    )
+    assert choice.tensor_parallel == 2
+    assert choice.per_device_bytes <= planner.capacity
+

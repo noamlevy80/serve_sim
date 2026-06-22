@@ -1,10 +1,10 @@
 """Event generation: turn work shards into timed compute events.
 
 The event generator maps each work shard onto a grid of ``pipeline_parallel x
-expert_parallel`` devices, consolidates the shards of one forward-pass group
-that land on the same device into a single event (a roofline ``max`` of
-compute-bound and bandwidth-bound time), and lays the events out to produce a
-makespan.
+expert_parallel x tensor_parallel`` devices, consolidates the shards of one
+forward-pass group that land on the same device into a single event (a roofline
+``max`` of compute-bound and bandwidth-bound time), and lays the events out to
+produce a makespan.
 
 Pipeline parallelism partitions the layers across stages. For a single batch
 there is no pipeline overlap, so the stages of a group run sequentially and
@@ -13,13 +13,19 @@ and conserved across the partition.
 
 Expert parallelism partitions the routed experts across the ``expert_parallel``
 devices of a stage (expert ``e`` lives on rank ``e % expert_parallel``). The
-compute of a stage is split evenly across those ranks (balanced routing, with
-the non-expert work tensor-parallel across the group), so the ranks run
-concurrently and an evenly balanced stage is ``expert_parallel`` times faster.
-Each rank keeps its own LRU residency of the experts it owns; in a two-tier
-system those experts are streamed up from the second tier on demand, and when
-the second tier is a single shared device (a system NVM) its bandwidth bounds
-the aggregate movement. Inter-stage activation transfers are not modeled here.
+compute of a stage is split evenly across those ranks (balanced routing), so the
+ranks run concurrently and an evenly balanced stage is ``expert_parallel`` times
+faster. Each rank keeps its own LRU residency of the experts it owns; in a
+two-tier system those experts are streamed up from the second tier on demand,
+and when the second tier is a single shared device (a system NVM) its bandwidth
+bounds the aggregate movement. Inter-stage activation transfers are not modeled
+here.
+
+Tensor parallelism shards every tensor (and the per-rank compute) across the
+``tensor_parallel`` devices that sit under each ``(stage, expert_rank)`` cell, so
+a stage's work is divided evenly across all ``expert_parallel x tensor_parallel``
+devices of the stage and runs that many times faster. Tensor parallelism is not
+supported alongside two-tier expert movement.
 
 A group's compute may be preceded by a kernel-launch event: when a work shard
 marks a kernel launch, each participating device waits its
@@ -108,17 +114,18 @@ class EventGenerator:
         compute_devices: list[ComputeDevice],
         pipeline_parallel: int = 1,
         expert_parallel: int = 1,
+        tensor_parallel: int = 1,
         event_random_factor_range: float = 0.0,
         rng: random.Random | None = None,
     ) -> None:
         model = LayeredModel.from_model(model)
         if not compute_devices:
             raise ValueError("at least one compute device is required")
-        if pipeline_parallel < 1 or expert_parallel < 1:
+        if pipeline_parallel < 1 or expert_parallel < 1 or tensor_parallel < 1:
             raise ValueError("parallelism degrees must be >= 1")
         if not 0.0 <= event_random_factor_range < 1.0:
             raise ValueError("event_random_factor_range must be in [0, 1)")
-        product = pipeline_parallel * expert_parallel
+        product = pipeline_parallel * expert_parallel * tensor_parallel
         if len(compute_devices) % product != 0:
             raise ValueError(
                 f"number of devices ({len(compute_devices)}) must be divisible by "
@@ -133,6 +140,7 @@ class EventGenerator:
         self.devices = compute_devices
         self.pipeline_parallel = pipeline_parallel
         self.expert_parallel = expert_parallel
+        self.tensor_parallel = tensor_parallel
         self.event_random_factor_range = event_random_factor_range
         self._rng = rng if rng is not None else random.Random()
         self._layers_per_stage = model.num_layers // pipeline_parallel
@@ -142,10 +150,18 @@ class EventGenerator:
             ffn.routed_expert_params for ffn in model.moe_ffns()
         ) * model.param_dtype_bytes
 
-    def _device_index(self, stage: int, ep_rank: int) -> int:
-        """Grid device for a (pipeline stage, expert-parallel rank) pair."""
+    def _device_index(self, stage: int, ep_rank: int, tp_rank: int = 0) -> int:
+        """Grid device for a (pipeline stage, expert rank, tensor rank) triple.
 
-        return stage * self.expert_parallel + ep_rank
+        The ``pp x ep x tp`` devices are laid out stage-major, then expert-rank,
+        then tensor-rank: ``stage * (ep * tp) + ep_rank * tp + tp_rank``.
+        """
+
+        return (
+            stage * self.expert_parallel * self.tensor_parallel
+            + ep_rank * self.tensor_parallel
+            + tp_rank
+        )
 
     def _stage_of_layer(self, layer_index: int | None) -> int:
         """Pipeline stage handling a layer; LM head goes to the last stage."""
@@ -189,6 +205,8 @@ class EventGenerator:
         schedule = EventSchedule()
         clock = 0.0
         ep = self.expert_parallel
+        tp = self.tensor_parallel
+        divide = ep * tp
 
         two_tier = (
             expert_trace is not None
@@ -203,6 +221,11 @@ class EventGenerator:
                 raise NotImplementedError(
                     "two-tier expert movement is only supported with "
                     "pipeline_parallel == 1"
+                )
+            if tp != 1:
+                raise NotImplementedError(
+                    "two-tier expert movement is only supported with "
+                    "tensor_parallel == 1"
                 )
             if expert_cache_capacity is None:
                 raise ValueError(
@@ -249,30 +272,38 @@ class EventGenerator:
                 stage = self._stage_of_layer(shard.layer_index)
                 stage_shards.setdefault(stage, []).append(shard)
 
-            # Stages run sequentially; the ep ranks of a stage run concurrently.
+            # Stages run sequentially; the ep*tp ranks of a stage run concurrently.
             for stage in sorted(stage_shards):
                 bucket = stage_shards[stage]
                 # A new kernel is launched on each rank of this stage; they
                 # launch concurrently, so the slowest rank gates the group.
                 if launch:
                     latency = max(
-                        self.devices[self._device_index(stage, r)].kernel_launch_latency
+                        self.devices[
+                            self._device_index(stage, r, t)
+                        ].kernel_launch_latency
                         for r in range(ep)
+                        for t in range(tp)
                     )
                     if latency > 0:
                         event = self._build_kernel_launch_event(
-                            group_index, self._device_index(stage, 0), latency, clock
+                            group_index, self._device_index(stage, 0, 0), latency, clock
                         )
                         clock = event.end
                         schedule.events.append(event)
                 stage_end = clock
+                # Expert parallelism shards the routed experts across the ep
+                # ranks; tensor parallelism shards every rank's tensors across
+                # its tp ranks. Both run concurrently, so each of the ep*tp
+                # devices of a stage does an even 1/(ep*tp) slice of the work.
                 for ep_rank in range(ep):
-                    device_index = self._device_index(stage, ep_rank)
-                    event = self._build_event(
-                        group_index, device_index, bucket, clock, divide=ep
-                    )
-                    stage_end = max(stage_end, event.end)
-                    schedule.events.append(event)
+                    for tp_rank in range(tp):
+                        device_index = self._device_index(stage, ep_rank, tp_rank)
+                        event = self._build_event(
+                            group_index, device_index, bucket, clock, divide=divide
+                        )
+                        stage_end = max(stage_end, event.end)
+                        schedule.events.append(event)
                 clock = stage_end
 
         return schedule

@@ -152,6 +152,7 @@ def _strategy_from_config(cfg: Mapping[str, Any]) -> StrategyConfig:
         target_concurrency=cfg.get("target_concurrency"),
         pipeline_parallel=int(cfg.get("pipeline_parallel", 1)),
         expert_parallel=int(cfg.get("expert_parallel", 1)),
+        tensor_parallel=int(cfg.get("tensor_parallel", 1)),
         auto_parallelism=bool(cfg.get("auto_parallelism", False)),
         allow_pdd=bool(cfg.get("allow_pdd", True)),
         prefill_engine_fraction=float(cfg.get("prefill_engine_fraction", 0.5)),

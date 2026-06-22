@@ -311,6 +311,16 @@ def _engine_makespan(model, devices, prompt, output, pp, ep):
     ).run(shards).makespan
 
 
+def _engine_makespan_tp(model, devices, prompt, output, pp, ep, tp):
+    """Reference makespan of one batch on an explicit (pp, ep, tp) arrangement."""
+    work = [Request(0, model, prompt, output).work]
+    shards = WorkShardGenerator(model).generate(work)
+    return EventGenerator(
+        model, list(devices),
+        pipeline_parallel=pp, expert_parallel=ep, tensor_parallel=tp,
+    ).run(shards).makespan
+
+
 def test_auto_parallelism_uses_chosen_arrangement():
     # Engine size = degree 2; ample memory -> planner picks (pp=1, ep=2).
     model = toy_model()  # 4 layers, dense
@@ -404,6 +414,81 @@ def test_fixed_parallelism_raises_when_batch_cannot_fit():
     strat = StrategyConfig(max_batch_size=1)  # auto_parallelism off by default
     with pytest.raises(ValueError, match="fixed parallelism"):
         Simulator(system, strat).run([req])
+
+
+# --- tensor parallelism --------------------------------------------------------
+
+
+def test_fixed_tensor_parallel_speeds_up_and_conserves():
+    # tp=2 runs a single batch on two devices, each doing half the work, so the
+    # batch finishes in half the single-device time.
+    model = toy_model()
+    system = make_system(2)
+    devices = system.compute_devices
+    req = Request(0, model, 64, 8, 0.0)
+    strat = StrategyConfig(
+        max_batch_size=1, pipeline_parallel=1, expert_parallel=1, tensor_parallel=2
+    )
+    result = Simulator(system, strat).run([req])
+    expected = _engine_makespan_tp(model, devices, 64, 8, pp=1, ep=1, tp=2)
+    assert result.record_for(0).completion_time == pytest.approx(expected)
+    solo = solo_makespan(model, make_device(), 64, 8)
+    assert result.record_for(0).completion_time == pytest.approx(solo / 2, rel=1e-9)
+
+
+def test_tensor_parallel_uses_pp_ep_tp_devices():
+    # The engine occupies pp*ep*tp devices; a job's events span all tp ranks.
+    model = toy_model()
+    system = make_system(2)
+    req = Request(0, model, 48, 6, 0.0)
+    strat = StrategyConfig(
+        max_batch_size=1, pipeline_parallel=1, expert_parallel=1, tensor_parallel=2
+    )
+    result = Simulator(system, strat).run([req])
+    job = result.jobs[0]
+    assert len(job.devices) == 2
+
+
+def test_tensor_parallel_relieves_oom():
+    # A footprint that overflows one device at tp=1 fits once tp=2 halves it.
+    model = toy_model()
+    probe = ParallelismPlanner(model, make_device())
+    kv_tokens = 64 + 8
+    full = probe.footprint(1, 1, kv_tokens)
+    cap = full * 0.75  # holds the tp=2 (half) footprint, not the tp=1 one
+    req = Request(0, model, 64, 8, 0.0)
+
+    # tp=1 cannot place the batch...
+    with pytest.raises(ValueError, match="fixed parallelism"):
+        Simulator(
+            make_system(1, cap=cap),
+            StrategyConfig(max_batch_size=1),
+        ).run([req])
+
+    # ...but tp=2 shards the footprint across two devices and runs.
+    result = Simulator(
+        make_system(2, cap=cap),
+        StrategyConfig(max_batch_size=1, tensor_parallel=2),
+    ).run([req])
+    assert result.record_for(0).completion_time > 0.0
+
+
+def test_auto_parallelism_holds_tensor_parallel_fixed():
+    # Engine = pp*ep*tp devices. With tp=2 fixed and a degree-2 pp*ep budget on
+    # ample memory, the search picks (pp=1, ep=2) and tp rides along, so the run
+    # uses all 4 devices and matches the explicit (1, 2, 2) arrangement.
+    model = toy_model()
+    system = make_system(4)
+    devices = system.compute_devices
+    req = Request(0, model, 64, 8, 0.0)
+    strat = StrategyConfig(
+        max_batch_size=1, pipeline_parallel=2, expert_parallel=1, tensor_parallel=2,
+        auto_parallelism=True,
+    )
+    result = Simulator(system, strat).run([req])
+    expected = _engine_makespan_tp(model, devices, 64, 8, pp=1, ep=2, tp=2)
+    assert result.record_for(0).completion_time == pytest.approx(expected)
+    assert len(result.jobs[0].devices) == 4
 
 
 # --- model grouping ------------------------------------------------------------

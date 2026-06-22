@@ -31,7 +31,8 @@
 
   "auto_parallelism": true,
   "pipeline_parallel": 4,
-  "expert_parallel": 4,
+  "expert_parallel": 2,
+  "tensor_parallel": 2,
   "max_parallelism": 32,
 
   "prefill_chunk_size": null,

@@ -24,6 +24,14 @@ Two ingredients drive the choice:
   relieves dense-weight and KV pressure, and the search will reach for more
   pipeline stages when a batch will not fit otherwise.
 
+Tensor parallelism (``tp``) is the third axis. Unlike ``ep`` it shards *every*
+resident tensor -- the replicated weights, the routed experts and the KV cache
+alike -- and splits each rank's compute, so it both speeds the batch up by
+``tp`` and divides the per-device footprint by ``tp``. It is set by the strategy
+and held fixed: the engine's device count is ``pp * ep * tp`` and the search
+only re-factors the ``pp * ep`` budget while ``tp`` rides along through the
+footprint and time estimate.
+
 This module is pure arithmetic: it stores no tensors and runs no events. The
 orchestrator feeds it the conserved work (FLOPs by dtype, bytes) and the KV
 token count of a batch and receives a :class:`ParallelismChoice`.
@@ -48,12 +56,16 @@ class ParallelismChoice:
         expert_parallel: Expert-parallel ranks per stage (shards routed experts).
         per_device_bytes: Peak resident footprint on the busiest device.
         estimated_time: Lightweight roofline time estimate used to rank options.
+        tensor_parallel: Tensor-parallel ranks (shards every weight tensor and the
+            KV cache, and splits each rank's compute). Held fixed by the strategy;
+            the search only re-factors ``pp``/``ep`` over the remaining budget.
     """
 
     pipeline_parallel: int
     expert_parallel: int
     per_device_bytes: float
     estimated_time: float
+    tensor_parallel: int = 1
 
 
 @dataclass(frozen=True)
@@ -130,17 +142,26 @@ class ParallelismPlanner:
     # --- footprint ----------------------------------------------------------
 
     def footprint(
-        self, pipeline_parallel: int, expert_parallel: int, kv_tokens: int
+        self,
+        pipeline_parallel: int,
+        expert_parallel: int,
+        kv_tokens: int,
+        tensor_parallel: int = 1,
     ) -> float:
         """Peak resident bytes on the busiest device for an arrangement.
 
         ``pp`` splits the layers across stages; ``ep`` replicates the
         non-expert weights and KV across ranks while sharding the routed experts
-        (the busiest rank owns ``ceil(num_experts / ep)`` of them).
+        (the busiest rank owns ``ceil(num_experts / ep)`` of them). ``tp`` then
+        shards *every* resident tensor -- the replicated weights, the routed
+        experts and the KV cache alike -- evenly across its ranks, so the busiest
+        device's footprint is divided by ``tensor_parallel``.
         """
 
         if self.model.num_layers % pipeline_parallel != 0:
             raise ValueError("pipeline_parallel must divide num_layers")
+        if tensor_parallel < 1:
+            raise ValueError("tensor_parallel must be >= 1")
         layers_per_stage = self.model.num_layers // pipeline_parallel
         peak = 0.0
         for stage in range(pipeline_parallel):
@@ -158,7 +179,7 @@ class ParallelismPlanner:
                 for lf in stage_layers
                 if lf.num_experts
             )
-            peak = max(peak, replicated + experts)
+            peak = max(peak, (replicated + experts) / tensor_parallel)
         return peak
 
     # --- speed estimate -----------------------------------------------------
@@ -168,15 +189,20 @@ class ParallelismPlanner:
         expert_parallel: int,
         flops_by_dtype: Mapping[int, float],
         total_bytes: float,
+        tensor_parallel: int = 1,
     ) -> float:
-        """Lightweight roofline time: ``max(compute, bandwidth) / ep``."""
+        """Lightweight roofline time: ``max(compute, bandwidth) / (ep * tp)``.
+
+        Both expert and tensor parallelism split a stage's work across concurrent
+        ranks, so each shrinks the critical path by its degree.
+        """
 
         compute = sum(
             flops / self.device.effective_flops(dtype)
             for dtype, flops in flops_by_dtype.items()
         )
         bandwidth = total_bytes / self.device.bandwidth_bytes_per_s
-        return max(compute, bandwidth) / expert_parallel
+        return max(compute, bandwidth) / (expert_parallel * tensor_parallel)
 
     # --- planning -----------------------------------------------------------
 
@@ -187,19 +213,28 @@ class ParallelismPlanner:
         kv_tokens: int,
         flops_by_dtype: Mapping[int, float],
         total_bytes: float,
+        tensor_parallel: int = 1,
     ) -> ParallelismChoice:
-        """Pick the fastest ``(pp, ep)`` that fits; raise if none do."""
+        """Pick the fastest ``(pp, ep)`` that fits; raise if none do.
+
+        ``degree`` is the ``pp * ep`` budget to re-factor; ``tensor_parallel`` is
+        held fixed (the engine's full device count is ``degree * tensor_parallel``)
+        and applied to every candidate's footprint and time estimate.
+        """
 
         candidates = self.factorizations(degree)
         best_unfit: tuple[float, int, int] | None = None
         for pp, ep in candidates:  # fastest (max ep) first
-            per_device = self.footprint(pp, ep, kv_tokens)
+            per_device = self.footprint(pp, ep, kv_tokens, tensor_parallel)
             if per_device <= self._capacity:
                 return ParallelismChoice(
                     pipeline_parallel=pp,
                     expert_parallel=ep,
                     per_device_bytes=per_device,
-                    estimated_time=self.estimate_time(ep, flops_by_dtype, total_bytes),
+                    estimated_time=self.estimate_time(
+                        ep, flops_by_dtype, total_bytes, tensor_parallel
+                    ),
+                    tensor_parallel=tensor_parallel,
                 )
             if best_unfit is None or per_device < best_unfit[0]:
                 best_unfit = (per_device, pp, ep)
@@ -207,7 +242,8 @@ class ParallelismPlanner:
         assert best_unfit is not None
         smallest, pp, ep = best_unfit
         raise ValueError(
-            f"no parallelism arrangement of degree {degree} fits a batch of "
-            f"{kv_tokens} KV tokens in {self._capacity:.0f} bytes; the smallest "
-            f"footprint was {smallest:.0f} bytes at pp={pp}, ep={ep}"
+            f"no parallelism arrangement of degree {degree} (tensor_parallel="
+            f"{tensor_parallel}) fits a batch of {kv_tokens} KV tokens in "
+            f"{self._capacity:.0f} bytes; the smallest footprint was "
+            f"{smallest:.0f} bytes at pp={pp}, ep={ep}"
         )
