@@ -342,6 +342,12 @@ class DecisionRecord:
         model: Name of the model serving the request.
         devices: Compute device(s) the decision mapped to.
         batch_index: Dispatch batch the decision belongs to.
+        time_started: Simulation clock when the decision's execution began (the
+            start of the corresponding compute/transfer events after arbiter
+            rescaling), or the decision time for purely bookkeeping acts
+            (evictions). Backfilled in :meth:`Simulator._collect_outputs`.
+        time_completed: Simulation clock when the decision's execution finished
+            (the end of those events), or the decision time for bookkeeping acts.
         tokens: Token count the act concerns (prefilled / decoded / reused /
             transferred context).
         source_request_id: The second sequence's request id, if any.
@@ -361,6 +367,8 @@ class DecisionRecord:
     model: str
     devices: tuple[str, ...]
     batch_index: int
+    time_started: float | None = None
+    time_completed: float | None = None
     tokens: int = 0
     source_request_id: int | None = None
     source_workload_id: int | None = None
@@ -1117,6 +1125,7 @@ class Simulator:
 
         result.events.sort(key=lambda e: (e.rescaled, e.start, e.job_index, e.group_index))
         result.jobs.sort(key=lambda j: j.job_index)
+        result.decisions = self._attach_decision_times(result.decisions, result.events)
         result.memories = [
             MemoryRecord(
                 name=entry["name"],
@@ -1129,6 +1138,60 @@ class Simulator:
             for entry in self.system.memory_inventory()
         ]
         self._check_memory_capacity(result)
+
+    def _attach_decision_times(
+        self, decisions: list[DecisionRecord], events: list[EventRecord]
+    ) -> list[DecisionRecord]:
+        """Backfill each decision's execution window from the rescaled events.
+
+        A decision is taken at dispatch (its ``time``); its execution happens
+        later, once the arbiter has scheduled and rescaled the batch's events.
+        The execution window is the span of the rescaled events in the decision's
+        batch that realise it: prefill/decode compute for those acts, the weight
+        load (a transfer from the input NVM) for ``weight_load``, and the KV fetch
+        (a non-NVM transfer) for ``kv_transfer``/``kv_reuse``. Bookkeeping acts
+        that do not run as events (``weight_eviction``/``kv_eviction``, and any
+        transfer whose events are not tied to the batch) fall back to the
+        decision time for both endpoints.
+        """
+
+        nvm = self.system.input_memory.name
+        spans: dict[tuple[int, str], list[float]] = {}
+        for ev in events:
+            if not ev.rescaled:
+                continue
+            if ev.phase == "prefill":
+                key = (ev.batch_index, "prefill")
+            elif ev.phase == "decode":
+                key = (ev.batch_index, "decode")
+            elif ev.phase == "transfer":
+                key = (ev.batch_index,
+                       "weight_transfer" if ev.memory == nvm else "kv_transfer")
+            else:
+                continue
+            span = spans.get(key)
+            if span is None:
+                spans[key] = [ev.start, ev.end]
+            else:
+                span[0] = min(span[0], ev.start)
+                span[1] = max(span[1], ev.end)
+
+        phase_of = {
+            "prefill": "prefill",
+            "decode": "decode",
+            "kv_reuse": "kv_transfer",
+            "kv_transfer": "kv_transfer",
+            "weight_load": "weight_transfer",
+        }
+        timed: list[DecisionRecord] = []
+        for d in decisions:
+            span = spans.get((d.batch_index, phase_of[d.kind])) if d.kind in phase_of else None
+            if span is not None:
+                started, completed = span[0], span[1]
+            else:
+                started = completed = d.time
+            timed.append(replace(d, time_started=started, time_completed=completed))
+        return timed
 
     def _check_memory_capacity(self, result: RunResult) -> None:
         """Abort the run if any device's reserved footprint exceeds its memory.

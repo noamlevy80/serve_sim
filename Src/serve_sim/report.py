@@ -10,8 +10,10 @@ PRD calls for and writes them under one run directory:
   times plus latency, TTFT and TPOT.
 - ``orchestration_decisions.csv`` -- the ordered log of orchestration decisions
   (model-weight load/eviction, prefill, decode, KV reuse, KV transfer and KV
-  eviction) with the sequence, serving devices, token counts and source
-  sequence/devices/memory for weight and KV movements.
+  eviction) with the decision time, the execution window (``time_started`` /
+  ``time_completed`` from the rescaled events that realise it), the sequence,
+  serving devices, token counts and source sequence/devices/memory for weight
+  and KV movements.
 - ``events_before_rescaling.csv`` / ``events_after_rescaling.csv`` -- the raw
   event log, as generated in isolation and after the arbiter rescales events for
   resource contention.
@@ -368,8 +370,9 @@ def _batch_sequence_ids(members: Sequence[tuple[int, int]]) -> str:
 
 
 _DECISION_FIELDS = (
-    "time", "kind", "request_id", "sequence", "model", "devices", "batch_index",
-    "tokens", "source_sequence", "source_request_id", "source_devices",
+    "time", "time_started", "time_completed", "kind", "request_id", "sequence",
+    "model", "devices", "batch_index", "tokens", "source_sequence",
+    "source_request_id", "source_devices",
 )
 
 
@@ -385,6 +388,8 @@ def _decision_rows(decisions: Sequence[DecisionRecord]) -> list[dict[str, Any]]:
         )
         rows.append({
             "time": d.time,
+            "time_started": "" if d.time_started is None else d.time_started,
+            "time_completed": "" if d.time_completed is None else d.time_completed,
             "kind": d.kind,
             "request_id": d.request_id,
             "sequence": sequence,

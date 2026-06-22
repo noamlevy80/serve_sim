@@ -287,6 +287,33 @@ def test_decisions_list_batch_tenants_in_sequence():
         assert r["sequence"] == "w0t0 w1t0 w2t0"
 
 
+def test_decisions_carry_execution_window():
+    model = toy_model()
+    system = make_system(1)
+    reqs = [Request(i, model, 32, 4, workload_id=i, turn_index=0) for i in range(3)]
+
+    result = Simulator(system, StrategyConfig(max_batch_size=3)).run(reqs)
+
+    # Every decision gets a (started, completed) window with started <= completed.
+    for d in result.decisions:
+        assert d.time_started is not None
+        assert d.time_completed is not None
+        assert d.time_started <= d.time_completed
+
+    # Prefill/decode windows match the batch's rescaled compute events.
+    rescaled = [e for e in result.events if e.rescaled]
+    for kind, phase in (("prefill", "prefill"), ("decode", "decode")):
+        d = next(x for x in result.decisions if x.kind == kind)
+        evs = [e for e in rescaled
+               if e.batch_index == d.batch_index and e.phase == phase]
+        assert d.time_started == min(e.start for e in evs)
+        assert d.time_completed == max(e.end for e in evs)
+
+    # The CSV exposes the two new timeline columns.
+    rows = _decision_rows(result.decisions)
+    assert {"time_started", "time_completed"} <= set(rows[0].keys())
+
+
 def test_workload_turns_are_serialized():
     model = toy_model()
     system = make_system(1)

@@ -251,7 +251,7 @@ Written by `write_outputs` in [report.py](Src/serve_sim/report.py):
 |---|---|
 | `run_report.json` / `run_report.txt` | Aggregate metrics over the suite (throughput, TTFT, latency percentiles, TPS). |
 | `requests.csv` | Per-request arrival/dispatch/first-token/completion + tokens, batch. |
-| `orchestration_decisions.csv` | Ordered log of every decision (`weight_load`/`weight_eviction`/`prefill`/`kv_reuse`/`kv_transfer`/`decode`/`kv_eviction`). |
+| `orchestration_decisions.csv` | Ordered log of every decision (`weight_load`/`weight_eviction`/`prefill`/`kv_reuse`/`kv_transfer`/`decode`/`kv_eviction`), with the decision `time` plus the execution window `time_started`/`time_completed` taken from the rescaled events that realise it (`_attach_decision_times`); acts with no compute/transfer fall back to the decision time. |
 | `events_before_rescaling.csv` / `events_after_rescaling.csv` | Raw compute/transfer events, pre/post arbiter contention rescaling. |
 | `device_summary.csv` | Per-device compute & bandwidth utilization, busy time. |
 | `memory_summary.csv` | Per-memory-device bandwidth utilization, busy time. |
