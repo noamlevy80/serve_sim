@@ -924,6 +924,32 @@ def test_home_node_prefers_slot_owning_node():
     assert home is system.node_of(slot.devices[0])
 
 
+def test_large_model_homes_when_sharded_across_nodes():
+    # A model too large for any single node's RAM is still homed when the serving
+    # slot spans several nodes: the tensor/pipeline ranks shard the whole model so
+    # each node holds only its share, and experts stream from node RAM (not NVM).
+    from serve_sim.model import toy_moe_model
+    from serve_sim.placement import EngineSlot
+
+    model = toy_moe_model()
+    full = ParallelismPlanner(model, make_device("probe")).full_model_bytes
+    # No single node can hold the whole model, but half fits comfortably.
+    node_cap = full * 0.6
+    system = make_streaming_system(num_devices=1, node_cap=node_cap, num_nodes=2)
+    sim = Simulator(system, StrategyConfig(max_batch_size=1))
+    # One device per node, so a degree-2 slot spans both nodes.
+    slot = EngineSlot(0, tuple(system.compute_devices[:2]))
+    assert system.node_of(slot.devices[0]) is not system.node_of(slot.devices[1])
+
+    home = sim._home_node_for(model, slot)
+
+    assert home is not None  # homed despite the full model exceeding one node
+    shards = sim._home_shards[id(model)]
+    assert len(shards) == 2  # sharded across both participating nodes
+    assert all(s <= node_cap for s in shards.values())
+    assert sum(shards.values()) == pytest.approx(full)
+
+
 def test_dense_model_has_no_expert_streaming():
     # A dense model never streams experts: a single resident weight load, no
     # expert_transfer events or decisions.

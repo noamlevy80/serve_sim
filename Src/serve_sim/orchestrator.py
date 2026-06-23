@@ -635,13 +635,20 @@ class Simulator:
         # model instance since the layout depends only on the model and device.
         self._planners: dict[int, ParallelismPlanner] = {}
         self._rng = random.Random(self.strategy.random_seed)
-        # Home node per MoE model: the one node whose RAM holds the full model and
-        # streams routed experts up to the serving devices on demand. Chosen the
-        # first time the model is placed and then fixed for the run.
+        # Representative home node per MoE model: a node owning one of the serving
+        # devices whose RAM streams routed experts on demand. The model itself is
+        # sharded across all the slot's nodes (see ``_home_shards``); this node is
+        # only the homogeneous fetch source. Chosen the first time the model is
+        # placed and then fixed for the run.
         self._home_nodes: dict[int, object] = {}
-        # Models whose full weights have already been staged into their home node's
-        # RAM (NVM -> RAM happens once; later placements only stage RAM -> device).
-        self._home_loaded: set[int] = set()
+        # Per-model RAM reservation: ``id(model) -> {id(node): shard_bytes}``. Each
+        # participating node holds the fraction of the model its own devices serve
+        # for the life of the run, so co-located models must all fit at once.
+        self._home_shards: dict[int, dict[int, float]] = {}
+        # (model, node) pairs whose weight shard has already been staged into that
+        # node's RAM (NVM -> RAM happens once per node; later placements only stage
+        # RAM -> device).
+        self._home_loaded: set[tuple[int, int]] = set()
         # Per-dispatch streaming reservation (per-device resident bytes) keyed by
         # batch index, so the capacity check uses the working-set footprint rather
         # than pinning every expert.
@@ -667,48 +674,66 @@ class Simulator:
         return self._planner_for(model).model.num_moe_layers > 0
 
     def _home_node_for(self, model: object, slot: EngineSlot):
-        """The node whose RAM holds ``model`` in full and streams its experts.
+        """A representative node whose RAM streams ``model``'s experts.
 
-        Chosen once per model and then fixed: prefer a node that owns one of the
-        serving slot's devices and whose ``node_memory`` can hold the whole model
-        (in-node CXL fetches are cheapest); otherwise any node with enough RAM,
-        picked at random; ``None`` when no node can hold the model (the model then
-        keeps every expert resident on the devices, the legacy behaviour).
+        The model is *sharded across the nodes that own the serving slot's
+        devices*: each such node need only hold the fraction of the model its own
+        devices serve (``full_model_bytes`` split in proportion to its share of
+        the slot's devices), so the tensor/pipeline ranks together shard the whole
+        model even when no single node could hold it. When every participating
+        node can hold its shard the model is homed -- weights stage NVM -> each
+        node's RAM, then RAM -> its own devices, and routed experts stream from the
+        devices' own (in-node) RAM. The returned node is a representative (it owns
+        a slot device; node RAM is homogeneous) used as the expert-fetch source;
+        ``None`` means some node cannot hold its shard, so the model keeps
+        streaming experts straight from the shared input NVM.
         """
 
         key = id(model)
         if key in self._home_nodes:
             return self._home_nodes[key]
         full = self._planner_for(model).full_model_bytes
-        slot_nodes = []
-        seen: set[int] = set()
+        total = len(slot.devices)
+        counts: dict[int, int] = {}
+        nodes_by_id: dict[int, object] = {}
         for device in slot.devices:
             node = self.system.node_of(device)
-            if id(node) not in seen:
-                seen.add(id(node))
-                slot_nodes.append(node)
+            counts[id(node)] = counts.get(id(node), 0) + 1
+            nodes_by_id[id(node)] = node
 
-        def fits(node) -> bool:
-            mem = node.node_memory
-            return mem is not None and mem.capacity_bytes >= full
+        def shard_of(node_id: int) -> float:
+            return full * counts[node_id] / total if total else 0.0
 
-        candidates = [n for n in slot_nodes if fits(n)]
-        if candidates:
-            home = candidates[0]
+        homed = total > 0 and all(
+            nodes_by_id[nid].node_memory is not None
+            and nodes_by_id[nid].node_memory.capacity_bytes >= shard_of(nid)
+            for nid in counts
+        )
+        if homed:
+            home = self.system.node_of(slot.devices[0])
+            self._home_shards[key] = {nid: shard_of(nid) for nid in counts}
         else:
-            eligible = [n for n in self.system.nodes if fits(n)]
-            home = self._rng.choice(eligible) if eligible else None
+            home = None
+            self._home_shards[key] = {}
         self._home_nodes[key] = home
         return home
 
-    def _expert_fetch_latency(self, source, slot: EngineSlot) -> float:
-        """One-way fabric latency from the expert ``source`` memory to the slot.
+    def _expert_fetch_latency(self, source, slot: EngineSlot, home) -> float:
+        """One-way fabric latency from the experts' source memory to the slot.
 
-        The slowest hop bounds the group's fetch start, so use the worst link
-        among the slot's devices. ``source`` is the home node's RAM when the model
-        fits a node, otherwise the shared input NVM that streams experts directly.
+        When the model is homed each device fetches its experts from its *own*
+        node's RAM (the cheap in-node link), so the worst such in-node hop bounds
+        the group's fetch start. Without a home the experts stream from the shared
+        input NVM and the slowest device's link to it bounds the start instead.
         """
 
+        if home is not None:
+            return max(
+                self.system.link_between(
+                    self.system.node_of(d).node_memory, d.first_tier_memory
+                ).latency_s
+                for d in slot.devices
+            )
         return max(
             self.system.link_between(source, d.first_tier_memory).latency_s
             for d in slot.devices
@@ -1382,18 +1407,15 @@ class Simulator:
             if peak > cap * (1.0 + 1e-9):
                 raise MemoryCapacityExceeded(name, peak, cap)
 
-        # Home-node RAM holds the *whole* model of every model homed there for the
-        # life of the run; several models sharing one node must all fit at once.
-        homed: dict[int, list[object]] = {}
-        for model_key, node in self._home_nodes.items():
-            if node is not None:
-                homed.setdefault(id(node), []).append(model_key)
+        # Each node holds its shard of every model homed across it for the life of
+        # the run (the model is sharded over the nodes that serve it), so the
+        # shards co-located on one node must all fit its RAM at once.
         for node in self.system.nodes:
-            keys = homed.get(id(node))
-            if not keys or node.node_memory is None:
+            if node.node_memory is None:
                 continue
             reserved = sum(
-                self._planners[k].full_model_bytes for k in keys if k in self._planners
+                shards.get(id(node), 0.0)
+                for shards in self._home_shards.values()
             )
             ram_cap = node.node_memory.capacity_bytes
             if reserved > ram_cap * (1.0 + 1e-9):
@@ -1559,7 +1581,7 @@ class Simulator:
             expert_source = (
                 home.node_memory if home is not None else self.system.input_memory
             )
-            expert_latency = self._expert_fetch_latency(expert_source, slot)
+            expert_latency = self._expert_fetch_latency(expert_source, slot, home)
             kv_tokens = sum(r.prompt_tokens + r.output_tokens for r in batch)
             self._job_reserve[batch_index] = self._planner_for(model).streaming_footprint(
                 pp, kv_tokens, expert_cap, tp
@@ -1623,14 +1645,16 @@ class Simulator:
         """Weight-load (``weight_transfer``) events for a slot (re)load.
 
         A real serving stack stages a model through host RAM: the weights are
-        read from the shared input NVM into the *home node's* RAM once, then
-        streamed from that RAM onto each serving device. So when the model has a
-        home node this emits (1) a one-off NVM -> home RAM transfer of the whole
-        model (skipped on later placements -- the RAM keeps it resident) and (2) a
-        RAM -> device transfer of the resident *non-expert* weights per device
-        (the routed experts arrive lazily as ``expert_transfer`` fetches). When no
-        node can home the model but it is MoE, the device still loads only its
-        resident *non-expert* weights -- straight from the NVM -- and streams the
+        read from the shared input NVM into the serving nodes' RAM once, then
+        streamed from that RAM onto each serving device. The model is sharded
+        across the slot's nodes, so when it is homed this emits (1) a one-off
+        NVM -> RAM transfer into *each* participating node of that node's shard of
+        the model (skipped on later placements -- the RAM keeps it resident) and
+        (2) a RAM -> device transfer of the resident *non-expert* weights per
+        device, sourced from that device's *own* node RAM (the routed experts
+        arrive lazily as ``expert_transfer`` fetches). When no node can home its
+        shard but the model is MoE, the device still loads only its resident
+        *non-expert* weights -- straight from the NVM -- and streams the
         experts from that same NVM. Only a dense model without a home falls back
         to the legacy single stage: NVM -> each device of the whole resident
         footprint. The link latency is folded into ``bandwidth_time`` so the
@@ -1641,23 +1665,37 @@ class Simulator:
         planner = self._planner_for(model)
         events: list[ComputeEvent] = []
         if home is not None:
-            ram = home.node_memory
-            if id(model) not in self._home_loaded:
-                full = float(planner.full_model_bytes)
-                if full > 0:
-                    nvm = self.system.input_memory
-                    link = self.system.link_between(nvm, ram)
-                    d1 = transfer_duration(full, nvm, ram, link)
-                    events.append(ComputeEvent(
-                        group_index=-1, phase="weight_transfer", device_index=0,
-                        flops=0.0, bytes_read=full, compute_time=0.0,
-                        bandwidth_time=d1, duration=d1, start=0.0, end=d1,
-                        source_memory=nvm))
-                self._home_loaded.add(id(model))
+            nvm = self.system.input_memory
+            shards = self._home_shards.get(id(model), {})
+            # Stage 1: NVM -> each participating node's RAM, once per (model, node),
+            # of that node's shard of the model (its devices' share of the slot).
+            staged_nodes: set[int] = set()
+            for index, device in enumerate(slot.devices):
+                node = self.system.node_of(device)
+                if id(node) in staged_nodes:
+                    continue
+                staged_nodes.add(id(node))
+                marker = (id(model), id(node))
+                if marker in self._home_loaded:
+                    continue
+                self._home_loaded.add(marker)
+                shard = float(shards.get(id(node), 0.0))
+                if shard <= 0:
+                    continue
+                ram = node.node_memory
+                link = self.system.link_between(nvm, ram)
+                d1 = transfer_duration(shard, nvm, ram, link)
+                events.append(ComputeEvent(
+                    group_index=-1, phase="weight_transfer", device_index=index,
+                    flops=0.0, bytes_read=shard, compute_time=0.0,
+                    bandwidth_time=d1, duration=d1, start=0.0, end=d1,
+                    source_memory=nvm))
             stage1_end = max((e.end for e in events), default=0.0)
+            # Stage 2: each node's RAM -> its own devices (resident non-experts).
             dev_bytes = float(planner.streaming_footprint(pp, 0, 0, tp))
             if dev_bytes > 0:
                 for index, device in enumerate(slot.devices):
+                    ram = self.system.node_of(device).node_memory
                     destination = device.first_tier_memory
                     link = self.system.link_between(ram, destination)
                     d2 = transfer_duration(dev_bytes, ram, destination, link)
