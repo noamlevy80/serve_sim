@@ -413,13 +413,13 @@ The default for all graphs is displayed.
 1. For each compute Device:
 1.1 Compute (with both absolute and relative to max)
 1.2 Bandwidth used of the 1st tier device (with both absolute and relative to max)
-1.3 Capacity of the 1st tier device (with both absolute and relative to max)
+1.3 Capacity of the 1st tier device (with both absolute and relative to max) - broken down by content - KV and weights
 1.4 Reason idle (the most dominant of the reasons in the reporting section above)
 1.5 Transfer source (the device from which an incoming transfer is happening)
 1.6 Transfer object (KV of which sequence, weights)
 2. For each independent memory device:
 2.1 Bandwidth used (with both absolute and relative to max)
-2.2 Capacity used (with both absolute and relative to max) - broken down to content (weights of model X, KV of series Y)
+2.2 Capacity used (with both absolute and relative to max) - broken down by content - KV and weights
 2.3 Transfer source (the device from which an incoming transfer is happening)
 3. For each workload:
 3.1 Device computing workload

@@ -279,10 +279,10 @@ def _device_graphs(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
             "compute_device", name, "B/s",
             spec.get("first_tier_bandwidth_bytes_per_s"), rows,
             "first_tier_bytes_per_s"))
-        graphs.append(_value_graph(
+        graphs.append(_stacked_graph(
             f"dev:{name}:capacity", f"1st-tier capacity -- {name}",
             "compute_device", name, "B",
-            spec.get("first_tier_capacity_bytes"), rows, "memory_bytes"))
+            spec.get("first_tier_capacity_bytes"), rows))
         graphs.append(_discrete_graph(
             f"dev:{name}:reason", f"Reason idle -- {name}", "compute_device", name,
             _merge_segments(rows, lambda r: (
@@ -301,7 +301,8 @@ def _device_graphs(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     return graphs
 
 
-def _stacked_graph(gid: str, title: str, group: str, unit: str, max_value: Any,
+def _stacked_graph(gid: str, title: str, section: str, group: str, unit: str,
+                   max_value: Any,
                    rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     keys: list[str] = []
     for r in rows:
@@ -311,7 +312,7 @@ def _stacked_graph(gid: str, title: str, group: str, unit: str, max_value: Any,
     return {
         "id": gid,
         "title": title,
-        "section": "memory_device",
+        "section": section,
         "group": group,
         "kind": "stacked",
         "unit": unit,
@@ -340,7 +341,8 @@ def _memory_graphs(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
             f"mem:{name}:bandwidth", f"Bandwidth -- {name}", "memory_device", name,
             "B/s", spec.get("bandwidth_bytes_per_s"), rows, "bandwidth_bytes_per_s"))
         graphs.append(_stacked_graph(
-            f"mem:{name}:capacity", f"Capacity by content -- {name}", name, "B",
+            f"mem:{name}:capacity", f"Capacity by content -- {name}",
+            "memory_device", name, "B",
             spec.get("capacity_bytes"), rows))
         graphs.append(_discrete_graph(
             f"mem:{name}:xfer_src", f"Transfer source -- {name}", "memory_device",

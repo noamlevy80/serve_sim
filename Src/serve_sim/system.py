@@ -12,8 +12,10 @@ identity, so a node with ``{"device": "nvidia-b200", "count": 4}`` is expanded
 into four *distinct* :class:`~serve_sim.hardware.ComputeDevice` objects, each with
 its own distinct first-tier memory and a unique, node-qualified name (e.g.
 ``"NVIDIA B200 [node-0 #2]"``) so the instances stay distinguishable in
-per-device reports. The single input memory and each node's node memory are one
-shared instance apiece.
+per-device reports. The single input memory is one shared instance; each node's
+node memory is one instance per node, given a node-qualified name (e.g.
+``"NVIDIA Grace LPDDR5X [node-0]"``) so same-type node memories stay
+distinguishable in per-memory reports.
 """
 
 from __future__ import annotations
@@ -290,6 +292,12 @@ def system_from_config(
         node_memory_stem = raw_node.get("node_memory")
         if node_memory_stem is not None:
             node_memory = load_memory_device(memory_dir / f"{node_memory_stem}.json")
+            # Each node owns a distinct node-memory instance; qualify its name
+            # with the node so same-type node memories stay distinguishable in
+            # per-memory reports (events key utilization by memory name).
+            node_memory = replace(
+                node_memory, name=f"{node_memory.name} [{raw_node['name']}]"
+            )
 
         devices: list[ComputeDevice] = []
         for entry in raw_node["compute_devices"]:

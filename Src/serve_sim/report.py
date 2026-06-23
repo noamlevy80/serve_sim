@@ -27,10 +27,11 @@ PRD calls for and writes them under one run directory:
   is the memory-side view of the topology, independent of the compute devices,
   so it stays meaningful if a memory is shared across compute devices.
 - ``device_timeline.csv`` -- per-device busy fraction, memory occupancy, the
+  first-tier content breakdown (``content_json``: KV vs weights bytes), the
   execution-state breakdown, achieved compute and first-tier bandwidth, and the
   dominant transfer source/object over time (bucketed).
 - ``memory_timeline.csv`` -- per-memory-device bandwidth, occupancy, the content
-  breakdown (``content_json``: weights-by-model and KV bytes) and the dominant
+  breakdown (``content_json``: KV vs weights bytes) and the dominant
   transfer source/object over time (bucketed).
 - ``workload_timeline.csv`` -- per-workload current turn, lifecycle state
   (not-arrived / in-queue / KV-fetch / prefill / decode / done) and serving
@@ -358,8 +359,9 @@ def device_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, 
 
     Each row is one device in one time bucket. Beyond the busy fraction, memory
     occupancy and execution-state breakdown, it carries the achieved compute
-    (FLOP/s) and first-tier bandwidth (bytes/s) in the bucket and a discrete
-    label for any incoming transfer (its source memory and what it moves), so the
+    (FLOP/s) and first-tier bandwidth (bytes/s) in the bucket, the first-tier
+    occupancy split into KV vs weights (``content``), and a discrete label for
+    any incoming transfer (its source memory and what it moves), so the
     visualization can plot absolute values against the device's static ceilings.
     """
 
@@ -400,6 +402,13 @@ def device_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, 
             bucket_bw_s = sum(e.bandwidth_time * _overlap_fraction(e, t0, t1)
                               for e in first_tier_events)
             dom = _dominant_transfer(dev_events, t0, t1)
+            dev_weights, dev_kv = _first_tier_content_at(result, {name}, t0)
+            content: dict[str, float] = {}
+            weight_bytes = sum(dev_weights.values())
+            if weight_bytes > 0:
+                content["weights"] = weight_bytes
+            if dev_kv > 0:
+                content["KV"] = dev_kv
             row = {
                 "bucket": b,
                 "time_start": t0,
@@ -407,6 +416,7 @@ def device_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, 
                 "device": name,
                 "busy_fraction": overlap / width if width else 0.0,
                 "memory_bytes": _occupancy_at(result.jobs, name, t0),
+                "content": content,
                 "compute_flops_per_s": bucket_flops / width if width else 0.0,
                 "compute_seconds": bucket_compute_s,
                 "first_tier_bytes_per_s": bucket_bytes / width if width else 0.0,
@@ -552,11 +562,11 @@ def memory_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, 
     """Per-memory bandwidth, occupancy-by-content and incoming transfer over time.
 
     One row per memory per time bucket. Carries the achieved bandwidth (bytes/s)
-    in the bucket, the occupancy decomposed by content (model weights on a
-    first-tier memory; resident KV per sequence on a floating memory), and a
-    discrete label for the dominant incoming transfer (its source and object), so
-    the visualization can stack occupancy by content and plot bandwidth against
-    the memory's static ceiling.
+    in the bucket, the occupancy split into KV vs weights (``content``: resident
+    model weights and KV on a first-tier memory; offloaded KV on a floating
+    memory), and a discrete label for the dominant incoming transfer (its source
+    and object), so the visualization can stack occupancy by content and plot
+    bandwidth against the memory's static ceiling.
     """
 
     makespan = result.makespan or 0.0
@@ -592,16 +602,19 @@ def memory_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, 
             content: dict[str, float] = {}
             if mem.role == "first_tier":
                 weights, kv_bytes = _first_tier_content_at(result, attached, t0)
-                for model, b_ in weights.items():
-                    if b_ > 0:
-                        content[f"weights:{model}"] = b_
+                weight_bytes = sum(weights.values())
+                if weight_bytes > 0:
+                    content["weights"] = weight_bytes
                 if kv_bytes > 0:
-                    content["kv"] = kv_bytes
+                    content["KV"] = kv_bytes
             elif mem.role in ("node", "second_tier"):
-                for start, end, label, num_bytes in residency.get(mem.name, []):
-                    if start <= t0 < end:
-                        content[f"kv:{label}"] = content.get(
-                            f"kv:{label}", 0.0) + num_bytes
+                kv_bytes = sum(
+                    num_bytes
+                    for start, end, label, num_bytes in residency.get(mem.name, [])
+                    if start <= t0 < end
+                )
+                if kv_bytes > 0:
+                    content["KV"] = kv_bytes
             occupancy = sum(content.values())
 
             # Incoming transfer: into a first-tier memory it is the dominant
@@ -1035,10 +1048,11 @@ def write_outputs(
     _write_csv(
         out / "device_timeline.csv",
         ["bucket", "time_start", "time_end", "device", "busy_fraction",
-         "memory_bytes", "compute_flops_per_s", "compute_seconds",
+         "memory_bytes", "content_json", "compute_flops_per_s", "compute_seconds",
          "first_tier_bytes_per_s", "bandwidth_seconds", "transfer_source",
          "transfer_object", *(f"{state}_fraction" for state in DEVICE_STATES)],
-        timeline,
+        [{**row, "content_json": json.dumps(row["content"], sort_keys=True)}
+         for row in timeline],
     )
     _write_csv(
         out / "memory_timeline.csv",

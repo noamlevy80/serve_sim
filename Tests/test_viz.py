@@ -117,6 +117,22 @@ def test_memory_capacity_graph_is_stacked_with_keys():
         assert len(b) == 3 and isinstance(b[2], dict)
 
 
+def test_capacity_content_is_kv_vs_weights_only():
+    # Both the compute-device first-tier capacity and the memory-device capacity
+    # break occupancy down by KV vs weights only -- no per-model or per-sequence
+    # detail.
+    vm = build_view_model(_payload())
+    capacity = [g for g in vm["graphs"] if g["id"].endswith(":capacity")]
+    assert capacity
+    # The compute-device first-tier capacity is now a stacked breakdown too.
+    dev_cap = next(g for g in capacity if g["section"] == "compute_device")
+    assert dev_cap["kind"] == "stacked"
+    for g in capacity:
+        assert set(g["keys"]) <= {"KV", "weights"}
+        for _t0, _t1, content in g["buckets"]:
+            assert set(content) <= {"KV", "weights"}
+
+
 def test_workload_graphs_present():
     vm = build_view_model(_payload())
     wl = [g for g in vm["graphs"] if g["section"] == "workload"]

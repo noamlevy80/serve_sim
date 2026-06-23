@@ -678,12 +678,13 @@ def test_memory_timeline_content_decomposes_occupancy():
     # The content breakdown always sums to the reported occupancy.
     for r in rows:
         assert r["occupancy_bytes"] == pytest.approx(sum(r["content"].values()))
-    # While weights are resident, the first-tier content names them by model.
+    # While weights are resident, the first-tier content carries a "weights" band
+    # (broken down only by KV vs weights, no per-model detail).
     first_tier = [r for r in rows
                   if r["role"] == "first_tier" and r["occupancy_bytes"] > 0]
     assert first_tier
-    assert any(any(k.startswith("weights:") for k in r["content"])
-               for r in first_tier)
+    assert any("weights" in r["content"] for r in first_tier)
+    assert all(set(r["content"]) <= {"KV", "weights"} for r in rows)
 
 
 def test_memory_timeline_tracks_offloaded_kv_residency():
@@ -715,10 +716,10 @@ def test_memory_timeline_tracks_offloaded_kv_residency():
                for d in result.decisions), "expected a KV offload to floating memory"
 
     rows = memory_timeline(result, 16)
-    # A floating memory holds the offloaded KV for at least one bucket, keyed
-    # by the owning sequence.
+    # A floating memory holds the offloaded KV for at least one bucket, recorded
+    # under the "KV" content band.
     floating = [r for r in rows if r["role"] in ("node", "second_tier")]
-    assert any(any(k.startswith("kv:") for k in r["content"]) for r in floating)
+    assert any("KV" in r["content"] and r["content"]["KV"] > 0 for r in floating)
 
 
 def test_workload_timeline_walks_the_turn_lifecycle():
