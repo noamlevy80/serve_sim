@@ -370,10 +370,14 @@ def _workload_graphs(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         rows = by_workload[w]
         label = rows[0].get("sequence") or w
         graphs.append(_discrete_graph(
-            f"wl:{w}:device", f"Device computing -- {w}", "workload", w,
+            f"wl:{w}:device", f"Engine group -- {w}", "workload", w,
             _merge_segments(rows, lambda r: (
-                (r["device"], f"Device: {r['device']}", f"dev:{r['device']}")
-                if r.get("device") else None))))
+                (r["group"],
+                 f"{r['group']} ({len(r['devices'])} devices):\n"
+                 + "\n".join(r["devices"]) if r.get("devices")
+                 else f"Group {r['group']}",
+                 f"group:{r['group']}")
+                if r.get("group") else None)))) 
         graphs.append(_discrete_graph(
             f"wl:{w}:turn", f"Current turn -- {w}", "workload", w,
             _merge_segments(rows, lambda r: (

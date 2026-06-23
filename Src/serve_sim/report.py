@@ -255,7 +255,8 @@ def device_summaries(result: RunResult) -> list[dict[str, Any]]:
         busy = _union_length([(e.start, e.end) for e in dev_events
                               if e.phase != "kernel_launch"])
         transfers = [e for e in dev_events
-                     if e.phase in ("transfer", "weight_transfer", "expert_transfer")]
+                     if e.phase in ("transfer", "weight_transfer", "expert_transfer")
+                     and e.bytes_read > 0]
         peak_mem = _peak_occupancy(result, name)
         states = _state_seconds(dev_events, 0.0, makespan)
         summary = {
@@ -680,7 +681,8 @@ def _turn_state_at(
     State follows the turn lifecycle: not-arrived -> in-queue -> (KV fetch ->)
     prefill -> decode -> done. While dispatched, the active event phase covering
     ``t`` decides the sub-state; between phases it falls back to prefill before
-    first token and decode after.
+    first token and decode after. ``device`` is the representative device serving
+    the turn at ``t`` (the full engine group is reported separately).
     """
 
     if t < record.arrival_time:
@@ -718,8 +720,9 @@ def workload_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str
 
     One row per workload per time bucket. A workload is a multi-turn conversation
     (or a standalone request); at each instant exactly one turn is current. The
-    row reports that turn's index, its serving device and its lifecycle state
-    (not-arrived / in-queue / KV-fetch / prefill / decode / done).
+    row reports that turn's index, its serving device, the full engine group it
+    runs on (a stable ``group`` id plus the ``devices`` list) and its lifecycle
+    state (not-arrived / in-queue / KV-fetch / prefill / decode / done).
     """
 
     makespan = result.makespan or 0.0
@@ -737,6 +740,25 @@ def workload_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str
     for turns in workloads.values():
         turns.sort(key=lambda r: r.turn_index)
 
+    group_ids: dict[tuple[str, ...], str] = {}
+
+    def _group_id(devices: tuple[str, ...]) -> str:
+        if not devices:
+            return ""
+        if devices not in group_ids:
+            group_ids[devices] = f"G{len(group_ids)}"
+        return group_ids[devices]
+
+    def _slot(request_id: int) -> tuple[str, ...]:
+        evs = events_by_request.get(request_id, [])
+        return tuple(sorted({e.device for e in evs if e.device}))
+
+    # A turn runs on one engine replica (a fixed slot of devices); the slot is the
+    # union of every device that serves the turn across its lifetime.
+    slots: dict[int, tuple[str, ...]] = {}
+
+    _ACTIVE = {"kv_fetch", "prefill", "decode"}
+
     rows: list[dict[str, Any]] = []
     for b in range(num_buckets):
         t0 = b * width
@@ -745,6 +767,12 @@ def workload_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str
             current = _current_turn(turns, t0)
             events = events_by_request.get(current.request_id, [])
             state, device = _turn_state_at(current, events, t0)
+            if state in _ACTIVE:
+                devices = slots.setdefault(
+                    current.request_id, _slot(current.request_id)
+                )
+            else:
+                devices = ()
             rows.append({
                 "bucket": b,
                 "time_start": t0,
@@ -755,6 +783,8 @@ def workload_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str
                             or label,
                 "state": state,
                 "device": device,
+                "group": _group_id(devices),
+                "devices": list(devices),
             })
     return rows
 
@@ -782,7 +812,8 @@ def summarize(result: RunResult) -> dict[str, Any]:
     makespan = result.makespan or 0.0
     isolated = _isolated(result.events)
     transfers = [e for e in isolated
-                 if e.phase in ("transfer", "weight_transfer", "expert_transfer")]
+                 if e.phase in ("transfer", "weight_transfer", "expert_transfer")
+                 and e.bytes_read > 0]
     devices = device_summaries(result)
     memories = memory_summaries(result)
 
@@ -1101,8 +1132,9 @@ def write_outputs(
         _write_csv(
             out / "workload_timeline.csv",
             ["bucket", "time_start", "time_end", "workload", "turn", "sequence",
-             "state", "device"],
-            work_timeline,
+             "state", "device", "group", "devices_json"],
+            [{**row, "devices_json": json.dumps(row.get("devices", []))}
+             for row in work_timeline],
         )
     with _phase(f"build+write viz.json ({viz_buckets} buckets)"):
         with open(out / "viz.json", "w", encoding="utf-8") as handle:

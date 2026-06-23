@@ -1248,6 +1248,38 @@ class Simulator:
                             rescaled=is_rescaled,
                         )
                     )
+                    # A routed-expert fetch streams to the whole engine (the
+                    # ranks share the prefetch and none can start the group until
+                    # it lands), so every *other* device of the slot is stalled
+                    # waiting for experts -- not idle. Log a zero-cost waiting
+                    # marker on each (no bytes/bandwidth, so memory and DMA
+                    # accounting stay attributed to the representative event) so
+                    # the per-device state reflects what the device is doing.
+                    if ev.phase == "expert_transfer" and 0 <= ev.device_index < len(device_names):
+                        for idx, other_name in enumerate(device_names):
+                            if idx == ev.device_index:
+                                continue
+                            result.events.append(
+                                EventRecord(
+                                    job_index=job_index,
+                                    batch_index=b_index,
+                                    job_phase=job_phase,
+                                    request_ids=request_ids,
+                                    group_index=ev.group_index,
+                                    phase="expert_transfer",
+                                    device=other_name,
+                                    memory=mem_name,
+                                    model=model_name,
+                                    flops=0.0,
+                                    bytes_read=0.0,
+                                    compute_time=0.0,
+                                    bandwidth_time=0.0,
+                                    duration=ev.duration,
+                                    start=ev.start,
+                                    end=ev.end,
+                                    rescaled=is_rescaled,
+                                )
+                            )
 
             # First-token time: completion of the earliest decode step.
             decode_events = [e for e in rescaled if e.phase == "decode"]

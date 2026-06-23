@@ -840,6 +840,38 @@ def test_moe_experts_stream_from_home_ram():
     assert loads[0].source_devices == (ram_name,)
 
 
+def test_expert_fetch_stalls_the_whole_engine_group():
+    # Experts stream to the entire engine slot, so every device in the slot is
+    # waiting (not idle) during the fetch. The representative device carries the
+    # real byte traffic; the others get zero-cost markers covering the same span.
+    from serve_sim.model import toy_moe_model
+
+    model = toy_moe_model()
+    system = make_streaming_system(2)  # a two-device slot in one node
+    strat = StrategyConfig(
+        max_batch_size=1, model_weight_loading=True, tensor_parallel=2
+    )
+    req = Request(0, model, 64, 8, 0.0)
+
+    result = Simulator(system, strat).run([req])
+
+    experts = [e for e in result.events if e.phase == "expert_transfer"]
+    assert experts, "expected routed-expert streaming events"
+    devices = {e.device for e in experts}
+    assert len(devices) == 2, "expert fetch should stall every device in the slot"
+    # Exactly one device per fetch carries the bytes; the rest are waiting markers.
+    carriers = [e for e in experts if e.bytes_read > 0]
+    waiters = [e for e in experts if e.bytes_read == 0]
+    assert carriers and waiters
+    assert all(e.compute_time == 0.0 and e.bandwidth_time == 0.0 for e in waiters)
+    # A waiting marker mirrors the span of its representative fetch.
+    for w in waiters:
+        assert any(
+            c.start == w.start and c.end == w.end and c.device != w.device
+            for c in carriers
+        )
+
+
 def test_moe_experts_stream_from_nvm_without_home():
     # No node can home the 39 MB model (10 MB RAM), so the device loads only its
     # resident non-expert weights from the NVM and streams the experts from it.

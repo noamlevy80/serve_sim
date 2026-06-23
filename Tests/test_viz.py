@@ -141,6 +141,22 @@ def test_workload_graphs_present():
     assert {"device", "turn", "state"} <= suffixes
 
 
+def test_engine_group_graph_labels_groups_and_lists_devices_on_hover():
+    # The per-workload device graph shows the engine group id on the bar and the
+    # full device list in the hover tooltip (segment[3]).
+    vm = build_view_model(_payload())
+    dev = next(g for g in vm["graphs"]
+               if g["section"] == "workload" and g["id"].endswith(":device"))
+    assert dev["kind"] == "discrete"
+    labelled = [s for s in dev["segments"] if s[2]]
+    assert labelled, "expected at least one labelled engine-group segment"
+    for seg in labelled:
+        abbrev, full, key = seg[2], seg[3], seg[4]
+        assert abbrev.startswith("G")  # group id on the bar
+        assert key == f"group:{abbrev}"  # colour keyed by the group
+        assert "devices" in full or full  # device list / group name on hover
+
+
 def test_graph_tree_mirrors_graph_hierarchy():
     vm = build_view_model(_payload())
     tree = vm["graph_tree"]

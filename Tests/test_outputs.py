@@ -739,6 +739,17 @@ def test_workload_timeline_walks_the_turn_lifecycle():
     assert {r["turn"] for r in w0} >= {0, 1}
     assert any(r["state"] == "decode" for r in w0)
     assert any(r["state"] == "decode" and r["device"] for r in w0)
+    # Each row also carries the full engine group: a stable id plus the device
+    # list. A decode row's representative device is one of its group's devices.
+    assert {"group", "devices"} <= set(rows[0])
+    dec = next(r for r in w0 if r["state"] == "decode" and r["device"])
+    assert dec["group"]
+    assert dec["device"] in dec["devices"]
+    # The group id is stable: the same device set always maps to the same id.
+    groups = {tuple(r["devices"]): r["group"] for r in rows if r["devices"]}
+    for r in rows:
+        if r["devices"]:
+            assert groups[tuple(r["devices"])] == r["group"]
 
 
 def test_workload_timeline_marks_late_arrivals_not_arrived():
