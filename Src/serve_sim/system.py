@@ -171,6 +171,31 @@ class System:
             for key in order
         ]
 
+    def device_inventory(self) -> list[dict[str, Any]]:
+        """Every compute device with its static specs, in node order.
+
+        The compute-side companion to :meth:`memory_inventory`: one entry per
+        compute device with its FLOP ceiling and the static capacity/bandwidth of
+        its first-tier memory, so reports can render absolute values and the
+        ``max`` reference lines without re-deriving topology. Each entry has:
+        ``name``, ``node``, ``peak_flops_fp16``, ``first_tier_memory``,
+        ``first_tier_capacity_bytes`` and ``first_tier_bandwidth_bytes_per_s``.
+        """
+
+        entries: list[dict[str, Any]] = []
+        for node in self.nodes:
+            for device in node.compute_devices:
+                first = device.first_tier_memory
+                entries.append({
+                    "name": device.name,
+                    "node": node.name,
+                    "peak_flops_fp16": device.peak_flops_fp16,
+                    "first_tier_memory": first.name,
+                    "first_tier_capacity_bytes": first.capacity_bytes,
+                    "first_tier_bandwidth_bytes_per_s": first.bandwidth_bytes_per_s,
+                })
+        return entries
+
     def _node_index_of_memory(self, memory: MemoryDevice) -> int | None:
         """Index of the node that hosts ``memory`` (by identity), else ``None``.
 

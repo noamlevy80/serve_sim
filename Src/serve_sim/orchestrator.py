@@ -251,6 +251,8 @@ class RequestRecord:
     output_tokens: int
     batch_index: int
     first_token_time: float | None = None
+    workload_id: int = -1
+    turn_index: int = 0
 
     @property
     def queue_delay(self) -> float:
@@ -307,6 +309,7 @@ class EventRecord:
     phase: str  # event phase: prefill / decode / transfer / kernel_launch
     device: str  # device name ("" for the no-device sentinel)
     memory: str  # name of the memory whose bandwidth this event consumed ("" if none)
+    model: str  # name of the model this event serves ("" if none)
     flops: float
     bytes_read: float
     compute_time: float
@@ -329,6 +332,9 @@ class JobRecord:
     start: float
     end: float
     per_device_bytes: float  # reserved weights + KV per device (0 if unknown)
+    weight_bytes_per_device: float = 0.0  # weight portion of the reservation
+    kv_bytes_per_device: float = 0.0  # KV portion of the reservation
+    model: str = ""  # name of the model the job serves
 
 
 @dataclass(frozen=True)
@@ -387,6 +393,7 @@ class DecisionRecord:
     source_turn_index: int | None = None
     source_devices: tuple[str, ...] = ()
     batch_members: tuple[tuple[int, int], ...] = ()
+    bytes_moved: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -412,6 +419,32 @@ class MemoryRecord:
     role: str
     node: str
     attached_devices: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DeviceRecord:
+    """A compute device's static specs, for the per-device utilization report.
+
+    The compute-side companion to :class:`MemoryRecord`: captured from the system
+    topology so reports can render absolute compute/bandwidth/capacity values and
+    their ``max`` reference lines without re-deriving the hardware.
+
+    Attributes:
+        name: Compute device identifier.
+        node: Owning node name.
+        peak_flops_fp16: Nominal FP16 FLOP/s ceiling.
+        first_tier_memory: Name of the first-tier memory.
+        first_tier_capacity_bytes: First-tier memory capacity.
+        first_tier_bandwidth_bytes_per_s: First-tier memory bandwidth ceiling.
+    """
+
+    name: str
+    node: str
+    peak_flops_fp16: float
+    first_tier_memory: str
+    first_tier_capacity_bytes: float
+    first_tier_bandwidth_bytes_per_s: float
+
 
 
 @dataclass(frozen=True)
@@ -469,6 +502,7 @@ def _decision(
     source_turn_index: int | None = None,
     source_devices: Sequence[str] = (),
     batch_members: Sequence[tuple[int, int]] = (),
+    bytes_moved: float = 0.0,
 ) -> "DecisionRecord":
     """Build a :class:`DecisionRecord` for ``request`` from the dispatch context."""
 
@@ -487,6 +521,7 @@ def _decision(
         source_turn_index=source_turn_index,
         source_devices=tuple(source_devices),
         batch_members=tuple(batch_members),
+        bytes_moved=bytes_moved,
     )
 
 
@@ -539,6 +574,7 @@ class RunResult:
     jobs: list[JobRecord] = field(default_factory=list)
     memories: list[MemoryRecord] = field(default_factory=list)
     decisions: list[DecisionRecord] = field(default_factory=list)
+    device_specs: list[DeviceRecord] = field(default_factory=list)
 
     @property
     def makespan(self) -> float:
@@ -773,6 +809,8 @@ class Simulator:
                             output_tokens=req.output_tokens,
                             batch_index=b_index,
                             first_token_time=first_token_time,
+                            workload_id=req.workload_id,
+                            turn_index=req.turn_index,
                         )
                     )
                     # Offload this turn's KV to floating memory so a later
@@ -987,6 +1025,8 @@ class Simulator:
                                 output_tokens=req.output_tokens,
                                 batch_index=b_index,
                                 first_token_time=first_token_time,
+                                workload_id=req.workload_id,
+                                turn_index=req.turn_index,
                             )
                         )
                         # Offload this turn's KV to floating memory for later
@@ -1150,6 +1190,7 @@ class Simulator:
             request_ids = tuple(req.request_id for req in reqs)
             devices = slot.devices
             device_names = tuple(d.name for d in devices)
+            model_name = getattr(reqs[0].model, "name", "")
             original = arbiter.job_original_events(job_index)
             rescaled = arbiter.job_rescaled_events(job_index)
 
@@ -1171,6 +1212,7 @@ class Simulator:
                             phase=ev.phase,
                             device=dev_name,
                             memory=mem_name,
+                            model=model_name,
                             flops=ev.flops,
                             bytes_read=ev.bytes_read,
                             compute_time=ev.compute_time,
@@ -1195,6 +1237,11 @@ class Simulator:
             kv_tokens = sum(req.prompt_tokens + req.output_tokens for req in reqs)
             per_device_bytes = self._job_footprint(
                 reqs[0].model, pp, ep, tp, kv_tokens, b_index)
+            weight_bytes = min(
+                per_device_bytes,
+                self._weight_footprint(reqs[0].model, pp, ep, tp),
+            )
+            kv_bytes = max(0.0, per_device_bytes - weight_bytes)
             result.jobs.append(
                 JobRecord(
                     job_index=job_index,
@@ -1205,6 +1252,9 @@ class Simulator:
                     start=start,
                     end=end,
                     per_device_bytes=per_device_bytes,
+                    weight_bytes_per_device=weight_bytes,
+                    kv_bytes_per_device=kv_bytes,
+                    model=model_name,
                 )
             )
 
@@ -1225,6 +1275,18 @@ class Simulator:
                 attached_devices=entry["attached_devices"],
             )
             for entry in self.system.memory_inventory()
+        ]
+        result.device_specs = [
+            DeviceRecord(
+                name=entry["name"],
+                node=entry["node"],
+                peak_flops_fp16=entry["peak_flops_fp16"],
+                first_tier_memory=entry["first_tier_memory"],
+                first_tier_capacity_bytes=entry["first_tier_capacity_bytes"],
+                first_tier_bandwidth_bytes_per_s=entry[
+                    "first_tier_bandwidth_bytes_per_s"],
+            )
+            for entry in self.system.device_inventory()
         ]
         self._check_memory_capacity(result)
 
@@ -1371,6 +1433,19 @@ class Simulator:
             return reserve
         try:
             return float(self._planner_for(model).footprint(pp, ep, kv_tokens, tp))
+        except (ValueError, ZeroDivisionError):
+            return 0.0
+
+    def _weight_footprint(self, model: object, pp: int, ep: int, tp: int) -> float:
+        """Reserved per-device *weight* bytes for a job (KV-free footprint), or 0.
+
+        The weight portion is the planner footprint with no KV tokens; subtracting
+        it from the full footprint yields the KV portion, so a job's reservation
+        can be split into weights vs KV for the per-memory content breakdown.
+        """
+
+        try:
+            return float(self._planner_for(model).footprint(pp, ep, 0, tp))
         except (ValueError, ZeroDivisionError):
             return 0.0
 
@@ -1863,7 +1938,7 @@ class Simulator:
             now, "kv_transfer", req, (store.memory.name,), batch_index,
             tokens=context_tokens, source_request_id=req.request_id,
             source_workload_id=req.workload_id, source_turn_index=req.turn_index,
-            source_devices=device_names))
+            source_devices=device_names, bytes_moved=store.num_bytes))
 
     def _admit_kv_move(
         self,

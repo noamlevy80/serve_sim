@@ -373,7 +373,72 @@ The simulator produces a run report aggregated over the test suite.
 These are written as `run_report.json`/`run_report.txt`, `requests.csv`, `orchestration_decisions.csv`, `device_summary.csv`, `device_timeline.csv`, `events_before_rescaling.csv` and `events_after_rescaling.csv`, alongside an echo of the input `config.json`.
 
 ## Visualization tool
-TBD
+A web based visualization tool shall show the results of the run.
+It will be implemented via FLASK and have a seperate entry point then the simulator runtime.
+
+The tools will have a tabbed webpage appearance. Each tab shall be vertically scrollable to show all the content contained within.
+
+The visualtion tool will display numbers in concise easy to read notation, using no more than 3 integer digits + no more than one decimal and a letter to denote the magnitude for example:
+2.4P, 10T, 1.2G, 128M, 10.1K, 12m, 75.4u, 1.2n
+
+The following tabs shall exist:
+
+### Summary Tab
+This will display an AI-Perf style summary of the run with detailed tables showing aggregate values for the run, workload, system, and simulated performance.
+
+### Timeline Tab
+The timeline shall show a set of graphs all with the same horizontal axis of time.
+
+The graphs will display in a matrix of 1,2,3, or 4 columns (a selector at the top of the tab chooses the matrix configuration) and as many lines as needed, at the order specified in the list below (filling row and then column), however it shall be possible to rearrange graphs, by dragging and dropping (the graph shall pin to a location in the display matrix and shift elements to other pinned locations)
+
+Graphs that display discrete object shall display as bars, choose different colors for different states, abbreviations on the graph and detailed text on mouse hover.
+When a state does not exist (example - transfer source when no transfer is happening) - the graph shall be empty in that range.
+When a state represents the same object on different graphs (a device ID, a sequence ID, etc.) it shall be the same color.
+
+Graphs that represent values shall have absolute values on the left, and relative values on the right. The horizontal line of max value shall be displayed, but not used to autoscale the graph (so for example if the whole graph is in 0-0.01 max range, the line will not be visible)
+
+The tab will also allow scaling of the horizontal (time) axis by a couple of sliders at the top of the tab. This will affect all the graphs in the tab the same way. The default display is the full simulation span.
+
+#### Graph selection section
+On the left there will be a panel that shows a hierarchical list (arranged as below, the lowest level being the individual devices and workloads) of the graphs displayed and allows by clicking to remove or enable a graph.
+The list is compacted, and each part is expandable by clicking on a "+" next to it or contractable by clicking on a "-".
+Clicking on the actual name of the graph hides it or displays it.
+Clicking on the name of the hierarchy displays or hides all the graphs under it (overriding anything done inside the hierarchy)
+The section is seperately vertically scrollable and (if needed) also horizontally (in case the names don't fit)
+The section takes 20% of the screen width.
+
+The default for all graphs is displayed.
+
+#### List of timeline graphs
+1. For each compute Device:
+1.1 Compute (with both absolute and relative to max)
+1.2 Bandwidth used of the 1st tier device (with both absolute and relative to max)
+1.3 Capacity of the 1st tier device (with both absolute and relative to max)
+1.4 Reason idle (the most dominant of the reasons in the reporting section above)
+1.5 Transfer source (the device from which an incoming transfer is happening)
+1.6 Transfer object (KV of which sequence, weights)
+2. For each independent memory device:
+2.1 Bandwidth used (with both absolute and relative to max)
+2.2 Capacity used (with both absolute and relative to max) - broken down to content (weights of model X, KV of series Y)
+2.3 Transfer source (the device from which an incoming transfer is happening)
+3. For each workload:
+3.1 Device computing workload
+3.2 Current turn
+3.3 State (of current turn sequence): Not arrived, In queue, KV Fetch, Prefill, Decode, Done
+
+### Running the tool
+Each run writes a self-contained `viz.json` into its output directory (alongside
+the CSVs). The visualization tool is launched separately from the simulator:
+
+    python run_viz.py                      # serves the latest run under Outputs/
+    python run_viz.py Outputs/<run-dir>    # serves a specific run
+    python run_viz.py Outputs/<run-dir> --port 8000
+
+All derivation (summary tables and the declarative timeline-graph descriptors)
+is done in Python (`serve_sim.viz.graphs.build_view_model`); the browser only
+renders that view model, so the entire visualization is described, and testable,
+textually.
+
 
 
 

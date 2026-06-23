@@ -1,0 +1,183 @@
+"""Visualization tool tests: the engineering formatter, the view-model
+derivation and the Flask app route.
+
+All graph derivation lives in :mod:`serve_sim.viz.graphs` so it is unit-testable
+without a browser. These tests build a real run payload via
+:func:`serve_sim.report.build_viz_payload`, turn it into a view model and assert
+the graph descriptors are well formed; they also smoke-test the Flask route.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from serve_sim.model import toy_model
+from serve_sim.orchestrator import Request, Simulator, StrategyConfig
+from serve_sim.report import build_viz_payload, write_outputs
+from serve_sim.viz import build_view_model, eng_format
+from serve_sim.viz.app import create_app
+from serve_sim.viz.graphs import build_summary_tables
+
+from test_outputs import make_system
+
+
+# --- engineering-notation formatter ---------------------------------------------
+
+@pytest.mark.parametrize("value, expected", [
+    (2.4e15, "2.4P"),
+    (1e13, "10T"),
+    (1.2e9, "1.2G"),
+    (128e6, "128M"),
+    (10100, "10.1K"),
+    (0.012, "12m"),
+    (75.4e-6, "75.4u"),
+    (1.2e-9, "1.2n"),
+    (0, "0"),
+    (-5e6, "-5M"),
+])
+def test_eng_format_matches_prd_examples(value, expected):
+    assert eng_format(value) == expected
+
+
+def test_eng_format_handles_non_numbers():
+    assert eng_format(None) == ""
+    assert eng_format(float("nan")) == "NaN"
+
+
+# --- view model -----------------------------------------------------------------
+
+def _payload(num_buckets=16):
+    model = toy_model()
+    system = make_system(2)
+    reqs = [Request(i, model, 32, 4) for i in range(3)]
+    result = Simulator(
+        system, StrategyConfig(allow_pdd=True, max_batch_size=2)).run(reqs)
+    return build_viz_payload(result, run_id="viz", num_buckets=num_buckets)
+
+
+def test_view_model_top_level_shape():
+    vm = build_view_model(_payload())
+    assert vm["run_id"] == "viz"
+    assert vm["makespan_s"] > 0
+    assert vm["summary_tables"]
+    assert vm["graphs"]
+    titles = {t["title"] for t in vm["summary_tables"]}
+    assert {"Run", "Throughput", "Devices", "Memories"} <= titles
+
+
+def test_each_device_has_its_six_graphs():
+    vm = build_view_model(_payload())
+    by_group: dict[str, list[str]] = {}
+    for g in vm["graphs"]:
+        if g["section"] == "compute_device":
+            by_group.setdefault(g["group"], []).append(g["id"])
+    assert by_group
+    for ids in by_group.values():
+        suffixes = {gid.rsplit(":", 1)[1] for gid in ids}
+        assert {"compute", "bandwidth", "capacity", "reason",
+                "xfer_obj"} <= suffixes
+        assert any(gid.endswith("xfer_src") for gid in ids)
+
+
+def test_value_graphs_carry_buckets_and_static_max():
+    vm = build_view_model(_payload())
+    compute = next(g for g in vm["graphs"] if g["id"].endswith(":compute"))
+    assert compute["kind"] == "value"
+    assert compute["unit"] == "FLOP/s"
+    assert compute["max_value"] and compute["max_value"] > 0
+    assert compute["buckets"]
+    for b in compute["buckets"]:
+        assert len(b) == 3 and b[0] <= b[1]
+
+
+def test_discrete_segments_are_merged_and_within_span():
+    vm = build_view_model(_payload())
+    makespan = vm["makespan_s"]
+    reason = next(g for g in vm["graphs"] if g["id"].endswith(":reason"))
+    assert reason["kind"] == "discrete"
+    assert reason["segments"]
+    for seg in reason["segments"]:
+        assert len(seg) == 5
+        t0, t1 = seg[0], seg[1]
+        assert 0 <= t0 < t1 <= makespan + 1e-9
+    # Merging means no two adjacent segments share a colour key at a shared edge.
+    for a, b in zip(reason["segments"], reason["segments"][1:]):
+        assert not (a[1] == b[0] and a[4] == b[4])
+
+
+def test_memory_capacity_graph_is_stacked_with_keys():
+    vm = build_view_model(_payload())
+    stacked = [g for g in vm["graphs"]
+               if g["section"] == "memory_device" and g["kind"] == "stacked"]
+    assert stacked
+    g = stacked[0]
+    assert g["id"].endswith(":capacity")
+    assert "keys" in g and isinstance(g["keys"], list)
+    for b in g["buckets"]:
+        assert len(b) == 3 and isinstance(b[2], dict)
+
+
+def test_workload_graphs_present():
+    vm = build_view_model(_payload())
+    wl = [g for g in vm["graphs"] if g["section"] == "workload"]
+    assert wl
+    suffixes = {g["id"].rsplit(":", 1)[1] for g in wl}
+    assert {"device", "turn", "state"} <= suffixes
+
+
+def test_graph_tree_mirrors_graph_hierarchy():
+    vm = build_view_model(_payload())
+    tree = vm["graph_tree"]
+    labels = [cat["label"] for cat in tree]
+    assert labels == ["Compute Devices", "Memory Devices", "Workloads"]
+
+    # Every leaf id refers to a real graph, and every graph appears exactly once.
+    graph_ids = {g["id"] for g in vm["graphs"]}
+    leaf_ids = [leaf["id"] for cat in tree
+                for grp in cat["children"] for leaf in grp["graphs"]]
+    assert sorted(leaf_ids) == sorted(graph_ids)
+    # The panel groups by graph type first: the middle level is the graph type
+    # (title prefix) and each leaf is labelled by its device/workload.
+    by_id = {g["id"]: g for g in vm["graphs"]}
+    for cat in tree:
+        for grp in cat["children"]:
+            for leaf in grp["graphs"]:
+                graph = by_id[leaf["id"]]
+                assert grp["label"] == graph["title"].split(" -- ", 1)[0]
+                assert leaf["label"] == graph["group"]
+
+
+def test_summary_tables_format_distributions():
+    payload = _payload()
+    tables = build_summary_tables(payload)
+    perf = next(t for t in tables if t["title"] == "Performance distributions")
+    assert perf["columns"] == ["Metric", "avg", "p50", "p90", "p99", "max"]
+    assert perf["rows"]
+
+
+# --- Flask app ------------------------------------------------------------------
+
+def test_app_serves_view_model(tmp_path):
+    model = toy_model()
+    system = make_system(2)
+    reqs = [Request(i, model, 32, 4) for i in range(2)]
+    result = Simulator(system, StrategyConfig(max_batch_size=2)).run(reqs)
+    out = write_outputs(result, tmp_path / "run", run_id="served", viz_buckets=8)
+
+    app = create_app(out)
+    client = app.test_client()
+
+    page = client.get("/")
+    assert page.status_code == 200
+    assert b"serve_sim" in page.data
+
+    api = client.get("/api/view-model")
+    assert api.status_code == 200
+    vm = api.get_json()
+    assert vm["run_id"] == "served"
+    assert vm["graphs"]
+
+
+def test_app_errors_without_viz_json(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        create_app(tmp_path)

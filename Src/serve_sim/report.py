@@ -26,8 +26,19 @@ PRD calls for and writes them under one run directory:
   fraction, bytes moved, peak occupancy and the compute devices it serves; this
   is the memory-side view of the topology, independent of the compute devices,
   so it stays meaningful if a memory is shared across compute devices.
-- ``device_timeline.csv`` -- per-device busy fraction, memory occupancy and the
-  execution-state breakdown over time (bucketed).
+- ``device_timeline.csv`` -- per-device busy fraction, memory occupancy, the
+  execution-state breakdown, achieved compute and first-tier bandwidth, and the
+  dominant transfer source/object over time (bucketed).
+- ``memory_timeline.csv`` -- per-memory-device bandwidth, occupancy, the content
+  breakdown (``content_json``: weights-by-model and KV bytes) and the dominant
+  transfer source/object over time (bucketed).
+- ``workload_timeline.csv`` -- per-workload current turn, lifecycle state
+  (not-arrived / in-queue / KV-fetch / prefill / decode / done) and serving
+  device over time (bucketed).
+- ``viz.json`` -- a single GUI-ready payload bundling the summary, the device and
+  memory specs/aggregates, and the device, memory and workload timelines at a
+  finer bucket resolution; built by :func:`build_viz_payload` so the
+  visualization tool stays a pure renderer.
 
 Memory occupancy is the per-device *reserved* footprint (weights + KV) of the
 jobs active at each instant, as sized by the parallelism planner; it is a
@@ -44,6 +55,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .orchestrator import (
     DecisionRecord,
+    DeviceRecord,
     EventRecord,
     JobRecord,
     RequestRecord,
@@ -223,11 +235,14 @@ def device_summaries(result: RunResult) -> list[dict[str, Any]]:
 
     makespan = result.makespan or 0.0
     rescaled = _rescaled(result.events)
+    specs = {d.name: d for d in result.device_specs}
     names = sorted({e.device for e in rescaled if e.device} |
-                   {d for j in result.jobs for d in j.devices})
+                   {d for j in result.jobs for d in j.devices} |
+                   set(specs))
 
     summaries: list[dict[str, Any]] = []
     for name in names:
+        spec = specs.get(name)
         dev_events = [e for e in rescaled if e.device == name]
         compute_seconds = sum(e.compute_time for e in dev_events
                               if e.phase in _COMPUTE_PHASES)
@@ -241,6 +256,13 @@ def device_summaries(result: RunResult) -> list[dict[str, Any]]:
         states = _state_seconds(dev_events, 0.0, makespan)
         summary = {
             "device": name,
+            "node": spec.node if spec else "",
+            "peak_flops_fp16": spec.peak_flops_fp16 if spec else 0.0,
+            "first_tier_memory": spec.first_tier_memory if spec else "",
+            "first_tier_capacity_bytes":
+                spec.first_tier_capacity_bytes if spec else 0.0,
+            "first_tier_bandwidth_bytes_per_s":
+                spec.first_tier_bandwidth_bytes_per_s if spec else 0.0,
             "busy_fraction": busy / makespan if makespan else 0.0,
             "compute_util": compute_seconds / makespan if makespan else 0.0,
             "bandwidth_util": bandwidth_seconds / makespan if makespan else 0.0,
@@ -275,27 +297,109 @@ def _occupancy_at(jobs: Sequence[JobRecord], device: str, t: float) -> float:
                if device in j.devices and j.start <= t < j.end)
 
 
+_TRANSFER_PHASES = ("transfer", "weight_transfer", "expert_transfer")
+
+
+def _overlap(event: EventRecord, t0: float, t1: float) -> float:
+    """Wall-clock seconds of ``event`` falling inside ``[t0, t1]``."""
+
+    return max(0.0, min(event.end, t1) - max(event.start, t0))
+
+
+def _overlap_fraction(event: EventRecord, t0: float, t1: float) -> float:
+    """Fraction of ``event``'s duration that falls inside ``[t0, t1]``."""
+
+    if event.duration <= 0:
+        return 1.0 if event.start >= t0 and event.start < t1 else 0.0
+    return _overlap(event, t0, t1) / event.duration
+
+
+def _sequence_by_request(records: Sequence[RequestRecord]) -> dict[int, str]:
+    """Map each request id to its ``w<workload>t<turn>`` sequence label."""
+
+    return {
+        r.request_id: _sequence_id(r.workload_id, r.turn_index)
+        for r in records
+    }
+
+
+def _transfer_object_label(event: EventRecord, seq_by_request: Mapping[int, str]) -> str:
+    """Human label for what a transfer event moves (weights / experts / KV)."""
+
+    if event.phase == "weight_transfer":
+        return f"weights:{event.model}" if event.model else "weights"
+    if event.phase == "expert_transfer":
+        return f"experts:{event.model}" if event.model else "experts"
+    if event.phase == "transfer":
+        seq = next((seq_by_request.get(rid, "") for rid in event.request_ids
+                    if seq_by_request.get(rid)), "")
+        return f"kv:{seq}" if seq else "kv"
+    return ""
+
+
+def _dominant_transfer(
+    events: Sequence[EventRecord], t0: float, t1: float
+) -> EventRecord | None:
+    """The transfer-family event covering the most of ``[t0, t1]`` (or None)."""
+
+    best: EventRecord | None = None
+    best_overlap = 0.0
+    for e in events:
+        if e.phase not in _TRANSFER_PHASES:
+            continue
+        ov = _overlap(e, t0, t1)
+        if ov > best_overlap:
+            best, best_overlap = e, ov
+    return best
+
+
 def device_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, Any]]:
-    """Per-device busy fraction and memory occupancy over time (bucketed)."""
+    """Per-device busy fraction, occupancy, state and throughput over time.
+
+    Each row is one device in one time bucket. Beyond the busy fraction, memory
+    occupancy and execution-state breakdown, it carries the achieved compute
+    (FLOP/s) and first-tier bandwidth (bytes/s) in the bucket and a discrete
+    label for any incoming transfer (its source memory and what it moves), so the
+    visualization can plot absolute values against the device's static ceilings.
+    """
 
     makespan = result.makespan or 0.0
     if makespan <= 0 or num_buckets < 1:
         return []
     width = makespan / num_buckets
     rescaled = _rescaled(result.events)
+    specs = {d.name: d for d in result.device_specs}
+    seq_by_request = _sequence_by_request(result.records)
     names = sorted({e.device for e in rescaled if e.device} |
-                   {d for j in result.jobs for d in j.devices})
+                   {d for j in result.jobs for d in j.devices} |
+                   set(specs))
+    events_by_device: dict[str, list[EventRecord]] = {}
+    for e in rescaled:
+        if e.device:
+            events_by_device.setdefault(e.device, []).append(e)
 
     rows: list[dict[str, Any]] = []
     for b in range(num_buckets):
         t0 = b * width
         t1 = (b + 1) * width
         for name in names:
-            dev_events = [e for e in rescaled if e.device == name]
+            spec = specs.get(name)
+            first_tier = spec.first_tier_memory if spec else ""
+            dev_events = [e for e in events_by_device.get(name, [])
+                          if e.end > t0 and e.start < t1]
             busy_events = [e for e in dev_events if e.phase != "kernel_launch"]
-            overlap = sum(min(e.end, t1) - max(e.start, t0)
-                          for e in busy_events
-                          if e.end > t0 and e.start < t1)
+            overlap = sum(_overlap(e, t0, t1) for e in busy_events)
+            compute_events = [e for e in dev_events if e.phase in _COMPUTE_PHASES]
+            bucket_flops = sum(e.flops * _overlap_fraction(e, t0, t1)
+                               for e in compute_events)
+            bucket_compute_s = sum(e.compute_time * _overlap_fraction(e, t0, t1)
+                                   for e in compute_events)
+            first_tier_events = [e for e in dev_events if e.memory == first_tier]
+            bucket_bytes = sum(e.bytes_read * _overlap_fraction(e, t0, t1)
+                               for e in first_tier_events)
+            bucket_bw_s = sum(e.bandwidth_time * _overlap_fraction(e, t0, t1)
+                              for e in first_tier_events)
+            dom = _dominant_transfer(dev_events, t0, t1)
             row = {
                 "bucket": b,
                 "time_start": t0,
@@ -303,6 +407,14 @@ def device_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, 
                 "device": name,
                 "busy_fraction": overlap / width if width else 0.0,
                 "memory_bytes": _occupancy_at(result.jobs, name, t0),
+                "compute_flops_per_s": bucket_flops / width if width else 0.0,
+                "compute_seconds": bucket_compute_s,
+                "first_tier_bytes_per_s": bucket_bytes / width if width else 0.0,
+                "bandwidth_seconds": bucket_bw_s,
+                "transfer_source": dom.memory if dom else "",
+                "transfer_object": (
+                    _transfer_object_label(dom, seq_by_request) if dom else ""
+                ),
             }
             states = _state_seconds(dev_events, t0, t1)
             for state in DEVICE_STATES:
@@ -380,6 +492,273 @@ def memory_summaries(result: RunResult) -> list[dict[str, Any]]:
     return summaries
 
 
+def _floating_kv_residency(
+    result: RunResult,
+) -> dict[str, list[tuple[float, float, str, float]]]:
+    """Reconstruct KV residency in floating memories from the decision log.
+
+    A completed sequence's KV is offloaded to a floating memory (a ``kv_transfer``
+    decision targeting that single memory, tagged with the bytes moved) and later
+    evicted (a ``kv_eviction`` decision naming the same memory and sequence). The
+    pair bounds a residency interval ``[store, evict)`` (open to the makespan if
+    never evicted). Returns, per memory name, the list of
+    ``(start, end, sequence_label, bytes)`` intervals.
+    """
+
+    makespan = result.makespan or 0.0
+    stores: dict[tuple[str, int, int], tuple[float, float]] = {}
+    evicts: dict[tuple[str, int, int], float] = {}
+    for d in result.decisions:
+        if len(d.devices) != 1:
+            continue
+        key = (d.devices[0], d.workload_id, d.turn_index)
+        if d.kind == "kv_transfer" and d.bytes_moved > 0:
+            stores[key] = (d.time, d.bytes_moved)
+        elif d.kind == "kv_eviction":
+            evicts[key] = d.time
+
+    intervals: dict[str, list[tuple[float, float, str, float]]] = {}
+    for (mem, w, t), (start, num_bytes) in stores.items():
+        end = evicts.get((mem, w, t), makespan)
+        label = _sequence_id(w, t) or f"w{w}t{t}"
+        intervals.setdefault(mem, []).append((start, max(start, end), label, num_bytes))
+    return intervals
+
+
+def _first_tier_content_at(
+    result: RunResult, attached: set[str], t: float
+) -> tuple[dict[str, float], float]:
+    """Reserved first-tier content at instant ``t`` across ``attached`` devices.
+
+    Returns ``(weights_by_model, kv_bytes)`` summed over the jobs active at ``t``
+    on the attached devices, splitting each job's per-device reservation into its
+    weight portion (keyed by model) and its KV portion.
+    """
+
+    weights: dict[str, float] = {}
+    kv_bytes = 0.0
+    for j in result.jobs:
+        if not (j.start <= t < j.end):
+            continue
+        count = sum(1 for d in j.devices if d in attached)
+        if count == 0:
+            continue
+        weights[j.model] = weights.get(j.model, 0.0) + j.weight_bytes_per_device * count
+        kv_bytes += j.kv_bytes_per_device * count
+    return weights, kv_bytes
+
+
+def memory_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, Any]]:
+    """Per-memory bandwidth, occupancy-by-content and incoming transfer over time.
+
+    One row per memory per time bucket. Carries the achieved bandwidth (bytes/s)
+    in the bucket, the occupancy decomposed by content (model weights on a
+    first-tier memory; resident KV per sequence on a floating memory), and a
+    discrete label for the dominant incoming transfer (its source and object), so
+    the visualization can stack occupancy by content and plot bandwidth against
+    the memory's static ceiling.
+    """
+
+    makespan = result.makespan or 0.0
+    if makespan <= 0 or num_buckets < 1:
+        return []
+    width = makespan / num_buckets
+    rescaled = _rescaled(result.events)
+    seq_by_request = _sequence_by_request(result.records)
+    first_tier_of = {d.name: d.first_tier_memory for d in result.device_specs}
+    residency = _floating_kv_residency(result)
+    events_by_memory: dict[str, list[EventRecord]] = {}
+    for e in rescaled:
+        if e.memory:
+            events_by_memory.setdefault(e.memory, []).append(e)
+    events_by_device: dict[str, list[EventRecord]] = {}
+    for e in rescaled:
+        if e.device:
+            events_by_device.setdefault(e.device, []).append(e)
+
+    rows: list[dict[str, Any]] = []
+    for b in range(num_buckets):
+        t0 = b * width
+        t1 = (b + 1) * width
+        for mem in result.memories:
+            attached = set(mem.attached_devices)
+            mem_events = [e for e in events_by_memory.get(mem.name, [])
+                          if e.end > t0 and e.start < t1]
+            bucket_bytes = sum(e.bytes_read * _overlap_fraction(e, t0, t1)
+                               for e in mem_events)
+            bucket_bw_s = sum(e.bandwidth_time * _overlap_fraction(e, t0, t1)
+                              for e in mem_events)
+
+            content: dict[str, float] = {}
+            if mem.role == "first_tier":
+                weights, kv_bytes = _first_tier_content_at(result, attached, t0)
+                for model, b_ in weights.items():
+                    if b_ > 0:
+                        content[f"weights:{model}"] = b_
+                if kv_bytes > 0:
+                    content["kv"] = kv_bytes
+            elif mem.role in ("node", "second_tier"):
+                for start, end, label, num_bytes in residency.get(mem.name, []):
+                    if start <= t0 < end:
+                        content[f"kv:{label}"] = content.get(
+                            f"kv:{label}", 0.0) + num_bytes
+            occupancy = sum(content.values())
+
+            # Incoming transfer: into a first-tier memory it is the dominant
+            # transfer on its attached devices (the source is the event's
+            # memory); into a floating memory it is the dominant transfer that
+            # streamed *to* it (the source is the moving device).
+            source = ""
+            obj = ""
+            if mem.role == "first_tier":
+                dev_events = [e for d in attached
+                              for e in events_by_device.get(d, [])
+                              if e.end > t0 and e.start < t1]
+                dom = _dominant_transfer(dev_events, t0, t1)
+                if dom is not None:
+                    source = dom.memory
+                    obj = _transfer_object_label(dom, seq_by_request)
+            else:
+                dom = _dominant_transfer(mem_events, t0, t1)
+                if dom is not None:
+                    source = dom.device
+                    obj = _transfer_object_label(dom, seq_by_request)
+
+            rows.append({
+                "bucket": b,
+                "time_start": t0,
+                "time_end": t1,
+                "memory": mem.name,
+                "role": mem.role,
+                "node": mem.node,
+                "bandwidth_bytes_per_s": bucket_bytes / width if width else 0.0,
+                "bandwidth_seconds": bucket_bw_s,
+                "bandwidth_util": bucket_bw_s / width if width else 0.0,
+                "occupancy_bytes": occupancy,
+                "content": content,
+                "transfer_source": source,
+                "transfer_object": obj,
+            })
+    return rows
+
+
+# State of a workload's current turn at an instant, in lifecycle order.
+WORKLOAD_STATES = (
+    "not_arrived", "in_queue", "kv_fetch", "prefill", "decode", "done",
+)
+
+
+def _events_by_request(events: Sequence[EventRecord]) -> dict[int, list[EventRecord]]:
+    by_request: dict[int, list[EventRecord]] = {}
+    for e in events:
+        for rid in e.request_ids:
+            by_request.setdefault(rid, []).append(e)
+    return by_request
+
+
+def _turn_state_at(
+    record: RequestRecord, events: Sequence[EventRecord], t: float
+) -> tuple[str, str]:
+    """The (state, device) of a single turn at instant ``t``.
+
+    State follows the turn lifecycle: not-arrived -> in-queue -> (KV fetch ->)
+    prefill -> decode -> done. While dispatched, the active event phase covering
+    ``t`` decides the sub-state; between phases it falls back to prefill before
+    first token and decode after.
+    """
+
+    if t < record.arrival_time:
+        return "not_arrived", ""
+    if t < record.dispatch_time:
+        return "in_queue", ""
+    if t >= record.completion_time:
+        return "done", ""
+    covering = [e for e in events if e.start <= t < e.end]
+    decode = next((e for e in covering if e.phase == "decode"), None)
+    if decode is not None:
+        return "decode", decode.device
+    prefill = next((e for e in covering if e.phase == "prefill"), None)
+    if prefill is not None:
+        return "prefill", prefill.device
+    transfer = next((e for e in covering if e.phase in _TRANSFER_PHASES), None)
+    if transfer is not None:
+        return "kv_fetch", transfer.device
+    ft = record.first_token_time
+    if ft is not None and t >= ft:
+        return "decode", ""
+    return "prefill", ""
+
+
+def _workload_key(record: RequestRecord) -> tuple[int, str]:
+    """A stable (sort-key, label) for a record's workload (or itself if standalone)."""
+
+    if record.workload_id >= 0:
+        return record.workload_id, f"w{record.workload_id}"
+    return 1_000_000 + record.request_id, f"r{record.request_id}"
+
+
+def workload_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, Any]]:
+    """Per-workload current-turn, serving device and lifecycle state over time.
+
+    One row per workload per time bucket. A workload is a multi-turn conversation
+    (or a standalone request); at each instant exactly one turn is current. The
+    row reports that turn's index, its serving device and its lifecycle state
+    (not-arrived / in-queue / KV-fetch / prefill / decode / done).
+    """
+
+    makespan = result.makespan or 0.0
+    if makespan <= 0 or num_buckets < 1:
+        return []
+    width = makespan / num_buckets
+    events_by_request = _events_by_request(_rescaled(result.events))
+
+    workloads: dict[str, list[RequestRecord]] = {}
+    labels: dict[str, int] = {}
+    for r in result.records:
+        sort_key, label = _workload_key(r)
+        workloads.setdefault(label, []).append(r)
+        labels[label] = sort_key
+    for turns in workloads.values():
+        turns.sort(key=lambda r: r.turn_index)
+
+    rows: list[dict[str, Any]] = []
+    for b in range(num_buckets):
+        t0 = b * width
+        for label in sorted(workloads, key=lambda x: labels[x]):
+            turns = workloads[label]
+            current = _current_turn(turns, t0)
+            events = events_by_request.get(current.request_id, [])
+            state, device = _turn_state_at(current, events, t0)
+            rows.append({
+                "bucket": b,
+                "time_start": t0,
+                "time_end": (b + 1) * width,
+                "workload": label,
+                "turn": current.turn_index,
+                "sequence": _sequence_id(current.workload_id, current.turn_index)
+                            or label,
+                "state": state,
+                "device": device,
+            })
+    return rows
+
+
+def _current_turn(turns: Sequence[RequestRecord], t: float) -> RequestRecord:
+    """The turn of a workload that is current at instant ``t``.
+
+    Turns are serialized, so at most one covers ``[arrival, completion)``; before
+    the first arrival the first turn is current (not-arrived) and after the last
+    completion the last turn is current (done).
+    """
+
+    for r in turns:
+        if r.arrival_time <= t < r.completion_time:
+            return r
+    if t < turns[0].arrival_time:
+        return turns[0]
+    return turns[-1]
+
+
 def summarize(result: RunResult) -> dict[str, Any]:
     """Aggregate run report over the whole suite."""
 
@@ -428,7 +807,8 @@ def summarize(result: RunResult) -> dict[str, Any]:
 
 def _write_csv(path: Path, fieldnames: Sequence[str], rows: Iterable[Mapping[str, Any]]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(fieldnames))
+        writer = csv.DictWriter(handle, fieldnames=list(fieldnames),
+                                extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
@@ -472,7 +852,7 @@ def _batch_sequence_ids(members: Sequence[tuple[int, int]]) -> str:
 
 _DECISION_FIELDS = (
     "time", "time_started", "time_completed", "kind", "request_id", "sequence",
-    "model", "devices", "batch_index", "tokens", "source_sequence",
+    "model", "devices", "batch_index", "tokens", "bytes_moved", "source_sequence",
     "source_request_id", "source_devices",
 )
 
@@ -498,6 +878,7 @@ def _decision_rows(decisions: Sequence[DecisionRecord]) -> list[dict[str, Any]]:
             "devices": " ".join(d.devices),
             "batch_index": d.batch_index,
             "tokens": d.tokens,
+            "bytes_moved": d.bytes_moved,
             "source_sequence": _sequence_id(d.source_workload_id, d.source_turn_index),
             "source_request_id": (
                 "" if d.source_request_id is None else d.source_request_id
@@ -509,7 +890,7 @@ def _decision_rows(decisions: Sequence[DecisionRecord]) -> list[dict[str, Any]]:
 
 _EVENT_FIELDS = (
     "job_index", "batch_index", "job_phase", "request_ids", "group_index",
-    "phase", "device", "memory", "flops", "bytes_read", "compute_time",
+    "phase", "device", "memory", "model", "flops", "bytes_read", "compute_time",
     "bandwidth_time", "duration", "start", "end",
 )
 
@@ -600,6 +981,7 @@ def write_outputs(
     run_id: str = "run",
     config: Mapping[str, Any] | None = None,
     time_buckets: int = 64,
+    viz_buckets: int = 256,
 ) -> Path:
     """Write all raw outputs for ``result`` under ``out_dir`` and return the path."""
 
@@ -610,6 +992,8 @@ def write_outputs(
     devices = device_summaries(result)
     memories = memory_summaries(result)
     timeline = device_timeline(result, time_buckets)
+    mem_timeline = memory_timeline(result, time_buckets)
+    work_timeline = workload_timeline(result, time_buckets)
 
     with open(out / "run_report.json", "w", encoding="utf-8") as handle:
         json.dump(
@@ -634,7 +1018,9 @@ def write_outputs(
                _event_rows(_rescaled(result.events)))
     _write_csv(
         out / "device_summary.csv",
-        ["device", "busy_fraction", "compute_util", "bandwidth_util",
+        ["device", "node", "peak_flops_fp16", "first_tier_memory",
+         "first_tier_capacity_bytes", "first_tier_bandwidth_bytes_per_s",
+         "busy_fraction", "compute_util", "bandwidth_util",
          "peak_memory_bytes", "num_transfers", "transfer_bytes",
          *(f"{state}_fraction" for state in DEVICE_STATES)],
         devices,
@@ -649,11 +1035,54 @@ def write_outputs(
     _write_csv(
         out / "device_timeline.csv",
         ["bucket", "time_start", "time_end", "device", "busy_fraction",
-         "memory_bytes", *(f"{state}_fraction" for state in DEVICE_STATES)],
+         "memory_bytes", "compute_flops_per_s", "compute_seconds",
+         "first_tier_bytes_per_s", "bandwidth_seconds", "transfer_source",
+         "transfer_object", *(f"{state}_fraction" for state in DEVICE_STATES)],
         timeline,
     )
+    _write_csv(
+        out / "memory_timeline.csv",
+        ["bucket", "time_start", "time_end", "memory", "role", "node",
+         "bandwidth_bytes_per_s", "bandwidth_seconds", "bandwidth_util",
+         "occupancy_bytes", "content_json", "transfer_source", "transfer_object"],
+        [{**row, "content_json": json.dumps(row["content"], sort_keys=True)}
+         for row in mem_timeline],
+    )
+    _write_csv(
+        out / "workload_timeline.csv",
+        ["bucket", "time_start", "time_end", "workload", "turn", "sequence",
+         "state", "device"],
+        work_timeline,
+    )
+    with open(out / "viz.json", "w", encoding="utf-8") as handle:
+        json.dump(build_viz_payload(result, run_id=run_id, num_buckets=viz_buckets),
+                  handle)
     if config is not None:
         with open(out / "config.json", "w", encoding="utf-8") as handle:
             json.dump(dict(config), handle, indent=2)
 
     return out
+
+
+def build_viz_payload(
+    result: RunResult, *, run_id: str = "run", num_buckets: int = 256,
+) -> dict[str, Any]:
+    """Bundle every GUI-ready series into one JSON-serializable payload.
+
+    The visualization tool consumes only this payload, so all derivation lives
+    here (testable in Python) and the GUI is a pure renderer. Carries the run
+    summary, the static device/memory specs and aggregates, and the bucketed
+    device, memory and workload timelines.
+    """
+
+    return {
+        "run_id": run_id,
+        "makespan_s": result.makespan or 0.0,
+        "num_buckets": num_buckets,
+        "summary": summarize(result),
+        "devices": device_summaries(result),
+        "memories": memory_summaries(result),
+        "device_timeline": device_timeline(result, num_buckets),
+        "memory_timeline": memory_timeline(result, num_buckets),
+        "workload_timeline": workload_timeline(result, num_buckets),
+    }

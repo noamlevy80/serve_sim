@@ -3,3 +3,4 @@ requests
 datasets
 pyarrow
 tiktoken
+flask

@@ -41,6 +41,6 @@
   "arrival_variance_sec2": 0.001,
   "max_turns_per_workload": 6,
 
-  "report_time_buckets": 64,
+  "report_time_buckets": 256,
   "random_seed": 7
 }

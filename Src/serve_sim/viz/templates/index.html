@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>serve_sim &middot; {{ run_id }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <header>
+    <h1>serve_sim visualization</h1>
+    <span class="run-id" id="run-id">{{ run_id }}</span>
+    <nav class="tabs">
+      <button class="tab active" data-tab="summary">Summary</button>
+      <button class="tab" data-tab="timeline">Timeline</button>
+    </nav>
+  </header>
+
+  <main>
+    <section id="summary" class="tab-panel active">
+      <div id="summary-tables"></div>
+    </section>
+
+    <section id="timeline" class="tab-panel">
+      <div class="controls">
+        <div class="control">
+          <label>Columns</label>
+          <div class="cols" id="col-selector">
+            <button data-cols="1">1</button>
+            <button data-cols="2" class="active">2</button>
+            <button data-cols="3">3</button>
+            <button data-cols="4">4</button>
+          </div>
+        </div>
+        <div class="control grow">
+          <label>Time window <span id="window-label"></span></label>
+          <input type="range" id="slider-start" min="0" max="1000" value="0" />
+          <input type="range" id="slider-end" min="0" max="1000" value="1000" />
+        </div>
+      </div>
+      <div class="timeline-body">
+        <aside id="graph-tree" class="tree-panel"></aside>
+        <div id="graph-grid" class="grid cols-2"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="tooltip" class="tooltip" hidden></div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

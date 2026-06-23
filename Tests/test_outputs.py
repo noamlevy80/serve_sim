@@ -19,14 +19,23 @@ from serve_sim.model import toy_model
 from serve_sim.orchestrator import EventRecord, Request, Simulator, StrategyConfig
 from serve_sim.report import (
     _decision_rows,
+    build_viz_payload,
     device_summaries,
     device_timeline,
     memory_summaries,
+    memory_timeline,
     summarize,
+    workload_timeline,
     write_outputs,
 )
-from serve_sim.report import DEVICE_STATES, _event_state, _state_seconds
+from serve_sim.report import (
+    DEVICE_STATES, WORKLOAD_STATES, _event_state, _state_seconds,
+)
 from serve_sim.system import Network, Node, System
+from serve_sim.tokenizer import WhitespaceTokenizer
+from serve_sim.workload import build_workload_from_rows
+
+from conftest import make_row
 
 
 # --- helpers --------------------------------------------------------------------
@@ -171,7 +180,7 @@ def _event(phase, start, end, *, compute_time=0.0, bandwidth_time=0.0, device="g
     """A minimal rescaled EventRecord for classifier unit tests."""
     return EventRecord(
         job_index=0, batch_index=0, job_phase="full", request_ids=(0,),
-        group_index=0, phase=phase, device=device, memory="",
+        group_index=0, phase=phase, device=device, memory="", model="m",
         flops=0.0, bytes_read=0.0,
         compute_time=compute_time, bandwidth_time=bandwidth_time,
         duration=end - start, start=start, end=end, rescaled=True,
@@ -576,6 +585,7 @@ def test_write_outputs_creates_all_files(tmp_path):
         "orchestration_decisions.csv",
         "events_before_rescaling.csv", "events_after_rescaling.csv",
         "device_summary.csv", "memory_summary.csv", "device_timeline.csv",
+        "memory_timeline.csv", "workload_timeline.csv", "viz.json",
         "config.json",
     ]
     for name in expected:
@@ -614,3 +624,176 @@ def test_empty_run_writes_files(tmp_path):
     assert report["report"]["num_requests"] == 0
     assert report["report"]["makespan_s"] == 0.0
     assert (out / "requests.csv").exists()
+
+
+# --- visualization timelines ----------------------------------------------------
+
+def test_device_summary_carries_static_specs():
+    model = toy_model()
+    system = make_system(2)
+    reqs = [Request(i, model, 32, 4) for i in range(2)]
+    result = Simulator(system, StrategyConfig(max_batch_size=2)).run(reqs)
+
+    devices = device_summaries(result)
+    by_name = {d["device"]: d for d in devices}
+    for d in devices:
+        assert {"node", "peak_flops_fp16", "first_tier_memory",
+                "first_tier_capacity_bytes",
+                "first_tier_bandwidth_bytes_per_s"} <= set(d)
+    g0 = by_name["g0"]
+    assert g0["peak_flops_fp16"] == 100e12
+    assert g0["first_tier_memory"] == "g0-mem"
+    assert g0["first_tier_capacity_bytes"] == 80e9
+    assert g0["node"] == "node-0"
+
+
+def test_device_timeline_carries_compute_and_transfer_columns():
+    model = toy_model()
+    system = make_system(2)
+    reqs = [Request(i, model, 32, 4) for i in range(2)]
+    result = Simulator(
+        system, StrategyConfig(allow_pdd=True, max_batch_size=2)).run(reqs)
+
+    rows = device_timeline(result, 8)
+    assert rows
+    assert {"compute_flops_per_s", "compute_seconds", "first_tier_bytes_per_s",
+            "bandwidth_seconds", "transfer_source",
+            "transfer_object"} <= set(rows[0])
+    # Real compute work lands in some bucket, and rates are never negative.
+    assert any(r["compute_seconds"] > 0 for r in rows)
+    assert all(r["compute_flops_per_s"] >= 0 for r in rows)
+    assert all(r["first_tier_bytes_per_s"] >= 0 for r in rows)
+
+
+def test_memory_timeline_content_decomposes_occupancy():
+    model = toy_model()
+    system = make_system(1)
+    reqs = [Request(i, model, 32, 4) for i in range(2)]
+    result = Simulator(system, StrategyConfig(max_batch_size=2)).run(reqs)
+
+    rows = memory_timeline(result, 8)
+    assert rows
+    assert {"bandwidth_bytes_per_s", "occupancy_bytes", "content",
+            "transfer_source", "transfer_object"} <= set(rows[0])
+    # The content breakdown always sums to the reported occupancy.
+    for r in rows:
+        assert r["occupancy_bytes"] == pytest.approx(sum(r["content"].values()))
+    # While weights are resident, the first-tier content names them by model.
+    first_tier = [r for r in rows
+                  if r["role"] == "first_tier" and r["occupancy_bytes"] > 0]
+    assert first_tier
+    assert any(any(k.startswith("weights:") for k in r["content"])
+               for r in first_tier)
+
+
+def test_memory_timeline_tracks_offloaded_kv_residency():
+    model = toy_model()
+    system = make_system(1)
+    sys_msg = {"role": "system", "content": "you are a helpful coding agent always"}
+    user_msg = {"role": "user", "content": "please refactor this module for me today"}
+
+    def msg_request(rid, messages, *, workload_id, arrival_time=0.0):
+        workload = build_workload_from_rows(
+            [make_row(f"s{workload_id}", "m", messages, output_length=4)]
+        )
+        return Request.from_workload(
+            rid, workload, model, WhitespaceTokenizer(),
+            arrival_time=arrival_time, turn_index=0, workload_id=workload_id,
+        )
+
+    # Conversation 0 completes early; its KV is offloaded to floating memory and
+    # stays resident while conversation 1 (arriving much later) runs.
+    first = msg_request(0, [dict(sys_msg), dict(user_msg)], workload_id=0)
+    second = msg_request(
+        1,
+        [dict(sys_msg), dict(user_msg),
+         {"role": "assistant", "content": "second conversation tail differs here"}],
+        workload_id=1, arrival_time=1000.0,
+    )
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run([first, second])
+    assert any(d.kind == "kv_transfer" and d.source_request_id == 0
+               for d in result.decisions), "expected a KV offload to floating memory"
+
+    rows = memory_timeline(result, 16)
+    # A floating memory holds the offloaded KV for at least one bucket, keyed
+    # by the owning sequence.
+    floating = [r for r in rows if r["role"] in ("node", "second_tier")]
+    assert any(any(k.startswith("kv:") for k in r["content"]) for r in floating)
+
+
+def test_workload_timeline_walks_the_turn_lifecycle():
+    model = toy_model()
+    system = make_system(1)
+    reqs = [Request(i, model, 32, 4, workload_id=0, turn_index=i) for i in range(2)]
+    result = Simulator(system, StrategyConfig(max_batch_size=4)).run(reqs)
+
+    rows = workload_timeline(result, 32)
+    assert rows
+    assert {"workload", "turn", "sequence", "state", "device"} <= set(rows[0])
+    states = {r["state"] for r in rows}
+    assert states <= set(WORKLOAD_STATES)
+    # The single workload's serialized turns both appear, reaching decode on a
+    # named device.
+    w0 = [r for r in rows if r["workload"] == "w0"]
+    assert {r["turn"] for r in w0} >= {0, 1}
+    assert any(r["state"] == "decode" for r in w0)
+    assert any(r["state"] == "decode" and r["device"] for r in w0)
+
+
+def test_workload_timeline_marks_late_arrivals_not_arrived():
+    model = toy_model()
+    system = make_system(1)
+    reqs = [Request(0, model, 32, 4, arrival_time=0.0),
+            Request(1, model, 32, 4, arrival_time=5.0)]
+    result = Simulator(system, StrategyConfig(max_batch_size=2)).run(reqs)
+
+    rows = workload_timeline(result, 32)
+    # Before its arrival the second request reads as not-arrived in early buckets.
+    assert any(r["state"] == "not_arrived" for r in rows if r["time_start"] < 5.0)
+
+
+def test_build_viz_payload_bundles_every_series():
+    model = toy_model()
+    system = make_system(2)
+    reqs = [Request(i, model, 32, 4) for i in range(2)]
+    result = Simulator(
+        system, StrategyConfig(allow_pdd=True, max_batch_size=2)).run(reqs)
+
+    payload = build_viz_payload(result, run_id="viz", num_buckets=12)
+    assert payload["run_id"] == "viz"
+    assert payload["num_buckets"] == 12
+    assert payload["makespan_s"] == pytest.approx(result.makespan)
+    for key in ("summary", "devices", "memories", "device_timeline",
+                "memory_timeline", "workload_timeline"):
+        assert key in payload
+    # The payload is JSON round-trippable (the GUI consumes it as JSON).
+    assert json.loads(json.dumps(payload))["run_id"] == "viz"
+    # Timelines are bucketed to the requested resolution.
+    assert {r["bucket"] for r in payload["device_timeline"]} == set(range(12))
+
+
+def test_write_outputs_emits_parseable_viz_files(tmp_path):
+    model = toy_model()
+    system = make_system(2)
+    reqs = [Request(i, model, 32, 4) for i in range(3)]
+    result = Simulator(
+        system, StrategyConfig(allow_pdd=True, max_batch_size=2)).run(reqs)
+
+    out = write_outputs(result, tmp_path / "viz", run_id="viz",
+                        time_buckets=8, viz_buckets=16)
+
+    with open(out / "memory_timeline.csv", newline="") as handle:
+        mem_rows = list(csv.DictReader(handle))
+    assert mem_rows
+    assert "content_json" in mem_rows[0]
+    json.loads(mem_rows[0]["content_json"])  # the content column is valid JSON
+
+    with open(out / "workload_timeline.csv", newline="") as handle:
+        work_rows = list(csv.DictReader(handle))
+    assert work_rows
+    assert {"workload", "turn", "state", "device"} <= set(work_rows[0])
+
+    payload = json.loads((out / "viz.json").read_text())
+    assert payload["num_buckets"] == 16
+    assert payload["device_timeline"]
+
