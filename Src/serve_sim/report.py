@@ -18,13 +18,16 @@ PRD calls for and writes them under one run directory:
   event log, as generated in isolation and after the arbiter rescales events for
   resource contention.
 - ``device_summary.csv`` -- per-device compute/bandwidth utilization, busy
-  fraction, peak memory occupancy and DMA transfer totals.
+  fraction, peak memory occupancy, DMA transfer totals and the per-device
+  execution-state breakdown (fraction of the run spent compute-bound,
+  bandwidth-bound, waiting on KV / weights / experts, in kernel-launch overhead,
+  or idle).
 - ``memory_summary.csv`` -- per-memory-device bandwidth utilization, busy
   fraction, bytes moved, peak occupancy and the compute devices it serves; this
   is the memory-side view of the topology, independent of the compute devices,
   so it stays meaningful if a memory is shared across compute devices.
-- ``device_timeline.csv`` -- per-device busy fraction and memory occupancy over
-  time (bucketed).
+- ``device_timeline.csv`` -- per-device busy fraction, memory occupancy and the
+  execution-state breakdown over time (bucketed).
 
 Memory occupancy is the per-device *reserved* footprint (weights + KV) of the
 jobs active at each instant, as sized by the parallelism planner; it is a
@@ -129,6 +132,92 @@ def _isolated(events: Sequence[EventRecord]) -> list[EventRecord]:
     return [e for e in events if not e.rescaled]
 
 
+# Per-device execution-state taxonomy (finer than busy/idle). At any instant a
+# device is attributed to exactly one state, so the states partition the run and
+# their fractions sum to 1. Listed in *priority* order: when events overlap on a
+# device (e.g. a transfer prefetching while a forward pass runs), the
+# higher-priority (earlier-listed) state wins that wall-clock interval. ``idle``
+# is the time no event covers. Note: a "waiting for tensors" state (inter-stage
+# activations / tensor-parallel collectives) is not yet modelled as events, so
+# it is not emitted.
+DEVICE_STATES = (
+    "compute_bound",     # running a forward pass, compute-bound
+    "bandwidth_bound",   # running a forward pass, memory-bandwidth-bound
+    "waiting_kv",        # stalled fetching KV cache
+    "waiting_weights",   # stalled staging (non-expert) model weights
+    "waiting_experts",   # stalled streaming routed MoE experts
+    "kernel_launch",     # kernel-launch latency overhead
+    "idle",              # no work assigned
+)
+
+# Priority index per state (lower wins); ``idle`` is handled as the leftover.
+_STATE_PRIORITY = {state: i for i, state in enumerate(DEVICE_STATES)
+                   if state != "idle"}
+
+
+def _event_state(event: EventRecord) -> str:
+    """The device execution state an event represents."""
+
+    if event.phase in _COMPUTE_PHASES:
+        return ("compute_bound" if event.compute_time >= event.bandwidth_time
+                else "bandwidth_bound")
+    if event.phase == "transfer":
+        return "waiting_kv"
+    if event.phase == "weight_transfer":
+        return "waiting_weights"
+    if event.phase == "expert_transfer":
+        return "waiting_experts"
+    if event.phase == "kernel_launch":
+        return "kernel_launch"
+    return "idle"
+
+
+def _state_seconds(
+    events: Sequence[EventRecord], window_start: float, window_end: float
+) -> dict[str, float]:
+    """Partition ``[window_start, window_end]`` across device states by priority.
+
+    Each instant is attributed to the single highest-priority state among the
+    events covering it; instants no event covers are ``idle``. Compute/bandwidth
+    bound is the event's intrinsic classification (``compute_time`` vs
+    ``bandwidth_time``), preserved through arbiter rescaling. Returns seconds per
+    state, summing to the window width.
+    """
+
+    span = max(0.0, window_end - window_start)
+    seconds = {state: 0.0 for state in DEVICE_STATES}
+    if span <= 0:
+        return seconds
+
+    intervals: list[tuple[float, float, int, str]] = []
+    for event in events:
+        state = _event_state(event)
+        if state == "idle":
+            continue
+        start = max(window_start, event.start)
+        end = min(window_end, event.end)
+        if end > start:
+            intervals.append((start, end, _STATE_PRIORITY[state], state))
+
+    if not intervals:
+        seconds["idle"] = span
+        return seconds
+
+    points = sorted({window_start, window_end}
+                    | {p for s, e, _, _ in intervals for p in (s, e)})
+    covered = 0.0
+    for t0, t1 in zip(points, points[1:]):
+        if t1 <= t0:
+            continue
+        active = [(pr, st) for s, e, pr, st in intervals if s <= t0 and e >= t1]
+        if active:
+            _, state = min(active)
+            seconds[state] += t1 - t0
+            covered += t1 - t0
+    seconds["idle"] = max(0.0, span - covered)
+    return seconds
+
+
 def device_summaries(result: RunResult) -> list[dict[str, Any]]:
     """Per-device utilization, peak memory occupancy and DMA totals."""
 
@@ -149,7 +238,8 @@ def device_summaries(result: RunResult) -> list[dict[str, Any]]:
         transfers = [e for e in dev_events
                      if e.phase in ("transfer", "weight_transfer", "expert_transfer")]
         peak_mem = _peak_occupancy(result, name)
-        summaries.append({
+        states = _state_seconds(dev_events, 0.0, makespan)
+        summary = {
             "device": name,
             "busy_fraction": busy / makespan if makespan else 0.0,
             "compute_util": compute_seconds / makespan if makespan else 0.0,
@@ -157,7 +247,12 @@ def device_summaries(result: RunResult) -> list[dict[str, Any]]:
             "peak_memory_bytes": peak_mem,
             "num_transfers": len(transfers),
             "transfer_bytes": sum(e.bytes_read for e in transfers),
-        })
+        }
+        for state in DEVICE_STATES:
+            summary[f"{state}_fraction"] = (
+                states[state] / makespan if makespan else 0.0
+            )
+        summaries.append(summary)
     return summaries
 
 
@@ -196,19 +291,23 @@ def device_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, 
         t0 = b * width
         t1 = (b + 1) * width
         for name in names:
-            dev_events = [e for e in rescaled
-                          if e.device == name and e.phase != "kernel_launch"]
+            dev_events = [e for e in rescaled if e.device == name]
+            busy_events = [e for e in dev_events if e.phase != "kernel_launch"]
             overlap = sum(min(e.end, t1) - max(e.start, t0)
-                          for e in dev_events
+                          for e in busy_events
                           if e.end > t0 and e.start < t1)
-            rows.append({
+            row = {
                 "bucket": b,
                 "time_start": t0,
                 "time_end": t1,
                 "device": name,
                 "busy_fraction": overlap / width if width else 0.0,
                 "memory_bytes": _occupancy_at(result.jobs, name, t0),
-            })
+            }
+            states = _state_seconds(dev_events, t0, t1)
+            for state in DEVICE_STATES:
+                row[f"{state}_fraction"] = states[state] / width if width else 0.0
+            rows.append(row)
     return rows
 
 
@@ -473,6 +572,15 @@ def _report_text(report: Mapping[str, Any], devices: Sequence[Mapping[str, Any]]
             f"peak_mem={d['peak_memory_bytes']:.6g} "
             f"transfers={d['num_transfers']}"
         )
+        lines.append(
+            f"  {'':<16} states: cmp={d['compute_bound_fraction']:.3f} "
+            f"bw={d['bandwidth_bound_fraction']:.3f} "
+            f"kv={d['waiting_kv_fraction']:.3f} "
+            f"wts={d['waiting_weights_fraction']:.3f} "
+            f"exp={d['waiting_experts_fraction']:.3f} "
+            f"klaunch={d['kernel_launch_fraction']:.3f} "
+            f"idle={d['idle_fraction']:.3f}"
+        )
     lines.append("")
     lines.append("Per-memory:")
     for m in memories:
@@ -527,7 +635,8 @@ def write_outputs(
     _write_csv(
         out / "device_summary.csv",
         ["device", "busy_fraction", "compute_util", "bandwidth_util",
-         "peak_memory_bytes", "num_transfers", "transfer_bytes"],
+         "peak_memory_bytes", "num_transfers", "transfer_bytes",
+         *(f"{state}_fraction" for state in DEVICE_STATES)],
         devices,
     )
     _write_csv(
@@ -540,7 +649,7 @@ def write_outputs(
     _write_csv(
         out / "device_timeline.csv",
         ["bucket", "time_start", "time_end", "device", "busy_fraction",
-         "memory_bytes"],
+         "memory_bytes", *(f"{state}_fraction" for state in DEVICE_STATES)],
         timeline,
     )
     if config is not None:

@@ -16,7 +16,7 @@ import pytest
 
 from serve_sim.hardware import ComputeDevice, MemoryDevice
 from serve_sim.model import toy_model
-from serve_sim.orchestrator import Request, Simulator, StrategyConfig
+from serve_sim.orchestrator import EventRecord, Request, Simulator, StrategyConfig
 from serve_sim.report import (
     _decision_rows,
     device_summaries,
@@ -25,6 +25,7 @@ from serve_sim.report import (
     summarize,
     write_outputs,
 )
+from serve_sim.report import DEVICE_STATES, _event_state, _state_seconds
 from serve_sim.system import Network, Node, System
 
 
@@ -157,6 +158,179 @@ def test_device_summaries_and_timeline_shapes():
     timeline = device_timeline(result, num_buckets=buckets)
     assert len(timeline) == buckets * len(devices)
     assert {row["device"] for row in timeline} == {d["device"] for d in devices}
+
+
+# --- per-device execution-state breakdown --------------------------------------
+
+
+def _state_keys():
+    return [f"{state}_fraction" for state in DEVICE_STATES]
+
+
+def _event(phase, start, end, *, compute_time=0.0, bandwidth_time=0.0, device="g0"):
+    """A minimal rescaled EventRecord for classifier unit tests."""
+    return EventRecord(
+        job_index=0, batch_index=0, job_phase="full", request_ids=(0,),
+        group_index=0, phase=phase, device=device, memory="",
+        flops=0.0, bytes_read=0.0,
+        compute_time=compute_time, bandwidth_time=bandwidth_time,
+        duration=end - start, start=start, end=end, rescaled=True,
+    )
+
+
+def test_event_state_classifies_each_phase():
+    # Forward passes split on compute_time vs bandwidth_time.
+    assert _event_state(
+        _event("prefill", 0, 1, compute_time=0.8, bandwidth_time=0.2)
+    ) == "compute_bound"
+    assert _event_state(
+        _event("decode", 0, 1, compute_time=0.2, bandwidth_time=0.8)
+    ) == "bandwidth_bound"
+    # A tie counts as compute-bound (>= rule).
+    assert _event_state(
+        _event("prefill", 0, 1, compute_time=0.5, bandwidth_time=0.5)
+    ) == "compute_bound"
+    # Data-movement phases map to their wait states.
+    assert _event_state(_event("transfer", 0, 1)) == "waiting_kv"
+    assert _event_state(_event("weight_transfer", 0, 1)) == "waiting_weights"
+    assert _event_state(_event("expert_transfer", 0, 1)) == "waiting_experts"
+    assert _event_state(_event("kernel_launch", 0, 1)) == "kernel_launch"
+
+
+def test_state_seconds_partitions_window_with_idle_gap():
+    # A compute event [0,1], a KV fetch [1,2], then an idle gap [2,4].
+    events = [
+        _event("prefill", 0.0, 1.0, compute_time=1.0, bandwidth_time=0.2),
+        _event("transfer", 1.0, 2.0),
+    ]
+    seconds = _state_seconds(events, 0.0, 4.0)
+
+    assert seconds["compute_bound"] == pytest.approx(1.0)
+    assert seconds["waiting_kv"] == pytest.approx(1.0)
+    assert seconds["idle"] == pytest.approx(2.0)
+    # The partition is exhaustive: every second is attributed exactly once.
+    assert sum(seconds.values()) == pytest.approx(4.0)
+
+
+def test_state_seconds_charges_higher_priority_on_overlap():
+    # Compute and a prefetch overlap on [0,1]; compute outranks waiting.
+    events = [
+        _event("decode", 0.0, 1.0, compute_time=0.9, bandwidth_time=0.1),
+        _event("transfer", 0.0, 1.0),
+    ]
+    seconds = _state_seconds(events, 0.0, 1.0)
+
+    assert seconds["compute_bound"] == pytest.approx(1.0)
+    assert seconds["waiting_kv"] == pytest.approx(0.0)
+    assert sum(seconds.values()) == pytest.approx(1.0)
+
+
+def test_device_state_breakdown_partitions_the_run():
+    model = toy_model()
+    system = make_system(1)
+    reqs = [Request(i, model, 32, 4, arrival_time=float(i)) for i in range(2)]
+
+    result = Simulator(
+        system, StrategyConfig(max_batch_size=1, model_weight_loading=True)
+    ).run(reqs)
+    devices = device_summaries(result)
+
+    assert devices
+    for d in devices:
+        fractions = [d[k] for k in _state_keys()]
+        for f in fractions:
+            assert 0.0 <= f <= 1.0 + 1e-9
+        # The states partition the run, so the fractions sum to one.
+        assert sum(fractions) == pytest.approx(1.0, abs=1e-6)
+        # Some compute happened, and weights were streamed in.
+        assert d["compute_bound_fraction"] + d["bandwidth_bound_fraction"] > 0.0
+        assert d["waiting_weights_fraction"] > 0.0
+
+
+def test_device_timeline_state_breakdown_partitions_each_bucket():
+    model = toy_model()
+    system = make_system(2)
+    reqs = [Request(i, model, 32, 4) for i in range(2)]
+
+    result = Simulator(
+        system, StrategyConfig(allow_pdd=True, max_batch_size=1)
+    ).run(reqs)
+
+    timeline = device_timeline(result, num_buckets=6)
+    keys = _state_keys()
+    for row in timeline:
+        fractions = [row[k] for k in keys]
+        for f in fractions:
+            assert 0.0 <= f <= 1.0 + 1e-9
+        assert sum(fractions) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_compute_and_bandwidth_states_account_for_all_forward_work():
+    model = toy_model()
+    system = make_system(1)
+    req = Request(0, model, prompt_tokens=64, output_tokens=8)
+
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run([req])
+    g0 = next(d for d in device_summaries(result) if d["device"] == "g0")
+
+    # With no transfers or launch overhead, every busy second is a forward pass,
+    # split between the two compute states; together they cover the busy time.
+    compute_states = g0["compute_bound_fraction"] + g0["bandwidth_bound_fraction"]
+    assert compute_states > 0.0
+    assert compute_states == pytest.approx(g0["busy_fraction"], abs=1e-9)
+    assert compute_states == pytest.approx(1.0 - g0["idle_fraction"], abs=1e-9)
+
+
+def test_waiting_experts_state_appears_for_moe_streaming():
+    from serve_sim.model import toy_moe_model
+
+    model = toy_moe_model()
+    system = make_system(1)
+    reqs = [Request(i, model, 32, 4) for i in range(2)]
+
+    result = Simulator(
+        system, StrategyConfig(max_batch_size=1, model_weight_loading=True)
+    ).run(reqs)
+    devices = device_summaries(result)
+
+    # Routed experts stream in on demand, distinct from the base weight load.
+    assert any(d["waiting_experts_fraction"] > 0.0 for d in devices)
+
+
+def test_idle_state_appears_with_a_temporal_gap():
+    model = toy_model()
+    system = make_system(1)
+    # Two requests on one device, the second arriving long after the first
+    # retires, so the device sits idle in between.
+    reqs = [
+        Request(0, model, prompt_tokens=32, output_tokens=4, arrival_time=0.0),
+        Request(1, model, prompt_tokens=32, output_tokens=4, arrival_time=100.0),
+    ]
+
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run(reqs)
+    g0 = next(d for d in device_summaries(result) if d["device"] == "g0")
+
+    assert g0["idle_fraction"] > 0.0
+
+
+def test_written_csvs_carry_state_columns(tmp_path):
+    model = toy_model()
+    system = make_system(1)
+    req = Request(0, model, 32, 4)
+
+    result = Simulator(
+        system, StrategyConfig(max_batch_size=1, model_weight_loading=True)
+    ).run([req])
+    write_outputs(result, tmp_path)
+
+    state_cols = set(_state_keys())
+    with open(tmp_path / "device_summary.csv", newline="") as f:
+        summary_header = set(next(csv.reader(f)))
+    with open(tmp_path / "device_timeline.csv", newline="") as f:
+        timeline_header = set(next(csv.reader(f)))
+
+    assert state_cols <= summary_header
+    assert state_cols <= timeline_header
 
 
 # --- memory-device report ------------------------------------------------------
