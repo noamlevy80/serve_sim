@@ -63,6 +63,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tokenizer=tokenizer,
         progress=progress,
         build_progress=build_progress,
+        verbose=not args.quiet,
     )
 
     report = summarize(result)

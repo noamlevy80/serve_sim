@@ -302,6 +302,7 @@ def run_from_config(
     tokenizer: Tokenizer | None = None,
     progress: ProgressCallback | None = None,
     build_progress: BuildProgressCallback | None = None,
+    verbose: bool = False,
 ) -> tuple[RunResult, Path]:
     """Run a simulation described by ``config_path`` and write its outputs.
 
@@ -349,11 +350,15 @@ def run_from_config(
 
     run_id = run_id or cfg.get("run_id") or f"run-{datetime.now():%Y%m%d-%H%M%S}"
     root = Path(output_root or cfg.get("output_root", "Outputs"))
+    if verbose:
+        print(f"[epilogue] writing outputs ({len(result.events)} events, "
+              f"{len(result.decisions)} decisions) ...", file=sys.stderr, flush=True)
     out_dir = write_outputs(
         result,
         root / run_id,
         run_id=run_id,
         config=cfg,
         time_buckets=int(cfg.get("report_time_buckets", 64)),
+        verbose=verbose,
     )
     return result, out_dir
