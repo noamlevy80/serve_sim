@@ -20,8 +20,8 @@
     "models": ["deepseek-v3.2", "gemma-4-31b", "nemotron-3-ultra"]
   },
 
-  "max_concurrency": 8,
-  "target_concurrency": 4,
+  "max_batch_size": 8,
+  "max_concurrency": 4,
   "concurrency_window_sec": 0.5,
 
   "allow_pdd": true,

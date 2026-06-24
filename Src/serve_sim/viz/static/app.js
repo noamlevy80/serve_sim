@@ -490,7 +490,10 @@ function attachHover(canvas, g, rect) {
     let text = null;
     if (g.kind === "discrete") {
       const seg = g.segments.find((s) => t >= s[0] && t < s[1]);
-      if (seg) text = seg[3];
+      if (seg) {
+        const span = `${formatEng(seg[0])}s – ${formatEng(seg[1])}s`;
+        text = seg[3] ? `${span}\n${seg[3]}` : span;
+      }
     } else {
       const b = g.buckets.find((s) => t >= s[0] && t < s[1]);
       if (b) {

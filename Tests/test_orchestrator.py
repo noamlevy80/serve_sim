@@ -175,14 +175,14 @@ def test_two_concurrent_batches_share_device():
     solo = solo_makespan(model, device, 64, 8)
 
     reqs = [Request(0, model, 64, 8, 0.0), Request(1, model, 64, 8, 0.0)]
-    strat = StrategyConfig(max_batch_size=1, target_concurrency=2)
+    strat = StrategyConfig(max_batch_size=1, max_concurrency=2)
     result = Simulator(system, strat).run(reqs)
 
     assert result.num_batches == 2
     assert result.makespan == pytest.approx(2 * solo)
 
 
-def test_target_concurrency_serializes_batches():
+def test_max_concurrency_serializes_batches():
     # Two requests, concurrency 1: the second waits for the first to finish.
     model = toy_model()
     system = make_system(1)
@@ -190,7 +190,7 @@ def test_target_concurrency_serializes_batches():
     solo = solo_makespan(model, device, 64, 8)
 
     reqs = [Request(0, model, 64, 8, 0.0), Request(1, model, 64, 8, 0.0)]
-    strat = StrategyConfig(max_batch_size=1, target_concurrency=1)
+    strat = StrategyConfig(max_batch_size=1, max_concurrency=1)
     result = Simulator(system, strat).run(reqs)
 
     r0, r1 = result.record_for(0), result.record_for(1)
@@ -205,7 +205,7 @@ def test_concurrency_one_with_single_arrival_is_solo():
     system = make_system(1)
     device = system.compute_devices[0]
     req = Request(0, model, 64, 8, 0.0)
-    strat = StrategyConfig(max_batch_size=1, target_concurrency=1)
+    strat = StrategyConfig(max_batch_size=1, max_concurrency=1)
     result = Simulator(system, strat).run([req])
     assert result.record_for(0).completion_time == pytest.approx(
         solo_makespan(model, device, 64, 8)
@@ -225,7 +225,7 @@ def test_two_batches_on_disjoint_slots_do_not_contend():
     solo = solo_makespan(model, device, 64, 8)
 
     reqs = [Request(0, model, 64, 8, 0.0), Request(1, model, 64, 8, 0.0)]
-    strat = StrategyConfig(max_batch_size=1, target_concurrency=2)
+    strat = StrategyConfig(max_batch_size=1, max_concurrency=2)
     result = Simulator(system, strat).run(reqs)
 
     assert result.num_batches == 2
@@ -244,7 +244,7 @@ def test_more_batches_than_slots_time_share():
     solo = solo_makespan(model, device, 64, 8)
 
     reqs = [Request(i, model, 64, 8, 0.0) for i in range(3)]
-    strat = StrategyConfig(max_batch_size=1, target_concurrency=3)
+    strat = StrategyConfig(max_batch_size=1, max_concurrency=3)
     result = Simulator(system, strat).run(reqs)
 
     assert result.num_batches == 3
@@ -263,7 +263,7 @@ def test_single_device_still_time_shares():
     solo = solo_makespan(model, device, 64, 8)
 
     reqs = [Request(0, model, 64, 8, 0.0), Request(1, model, 64, 8, 0.0)]
-    strat = StrategyConfig(max_batch_size=1, target_concurrency=2)
+    strat = StrategyConfig(max_batch_size=1, max_concurrency=2)
     result = Simulator(system, strat).run(reqs)
     assert result.record_for(0).completion_time == pytest.approx(2 * solo)
     assert result.record_for(1).completion_time == pytest.approx(2 * solo)
@@ -275,7 +275,7 @@ def test_slot_is_released_for_reuse():
     model = toy_model()
     system = make_system(2)
     reqs = [Request(i, model, 32, 4, arrival_time=0.0) for i in range(4)]
-    strat = StrategyConfig(max_batch_size=1, target_concurrency=2)
+    strat = StrategyConfig(max_batch_size=1, max_concurrency=2)
     result = Simulator(system, strat).run(reqs)
     assert len(result.records) == 4
     assert {r.request_id for r in result.records} == {0, 1, 2, 3}
@@ -291,7 +291,7 @@ def test_different_models_run_on_disjoint_slots():
     solo = solo_makespan(model_a, device, 64, 8)
 
     reqs = [Request(0, model_a, 64, 8, 0.0), Request(1, model_b, 64, 8, 0.0)]
-    strat = StrategyConfig(max_batch_size=4, target_concurrency=2)
+    strat = StrategyConfig(max_batch_size=4, max_concurrency=2)
     result = Simulator(system, strat).run(reqs)
 
     assert result.num_batches == 2
@@ -526,7 +526,7 @@ def test_batch_size_caps_group():
     system = make_system(1)
     reqs = [Request(i, model, 64, 8, 0.0) for i in range(5)]
     # Batch size 2 -> three batches (2 + 2 + 1).
-    strat = StrategyConfig(max_batch_size=2, max_window_duration=1e9, target_concurrency=10)
+    strat = StrategyConfig(max_batch_size=2, max_window_duration=1e9, max_concurrency=10)
     result = Simulator(system, strat).run(reqs)
     assert result.num_batches == 3
 
@@ -538,7 +538,7 @@ def test_all_requests_retire_exactly_once():
     model = toy_model()
     system = make_system(1)
     reqs = [Request(i, model, 32 + i, 4, arrival_time=float(i)) for i in range(6)]
-    strat = StrategyConfig(max_batch_size=2, max_window_duration=0.5, target_concurrency=4)
+    strat = StrategyConfig(max_batch_size=2, max_window_duration=0.5, max_concurrency=4)
     result = Simulator(system, strat).run(reqs)
 
     ids = sorted(r.request_id for r in result.records)
@@ -575,7 +575,7 @@ def test_strategy_validation():
     with pytest.raises(ValueError):
         StrategyConfig(max_window_duration=-1.0)
     with pytest.raises(ValueError):
-        StrategyConfig(target_concurrency=0)
+        StrategyConfig(max_concurrency=0)
     with pytest.raises(ValueError):
         StrategyConfig(pipeline_parallel=0)
 
@@ -675,7 +675,7 @@ def test_weight_loading_charged_once_for_resident_model():
     model = toy_model()
     system = make_system(1)
     strat = StrategyConfig(
-        max_batch_size=1, target_concurrency=1, model_weight_loading=True
+        max_batch_size=1, max_concurrency=1, model_weight_loading=True
     )
     reqs = [Request(0, model, 64, 8, 0.0), Request(1, model, 64, 8, 0.0)]
 
@@ -696,7 +696,7 @@ def test_weight_loading_reloads_when_slot_repurposed():
     model_b = toy_moe_model()
     system = make_system(1)
     strat = StrategyConfig(
-        max_batch_size=1, target_concurrency=1, model_weight_loading=True
+        max_batch_size=1, max_concurrency=1, model_weight_loading=True
     )
     reqs = [Request(0, model_a, 64, 8, 0.0), Request(1, model_b, 64, 8, 0.0)]
 
@@ -717,7 +717,7 @@ def test_weight_load_and_eviction_decisions_recorded():
     model_b = toy_moe_model()
     system = make_system(1)
     strat = StrategyConfig(
-        max_batch_size=1, target_concurrency=1, model_weight_loading=True
+        max_batch_size=1, max_concurrency=1, model_weight_loading=True
     )
     reqs = [Request(0, model_a, 64, 8, 0.0), Request(1, model_b, 64, 8, 0.0)]
 
@@ -745,7 +745,7 @@ def test_no_weight_decisions_without_weight_loading():
 
     model_b = toy_moe_model()
     system = make_system(1)
-    strat = StrategyConfig(max_batch_size=1, target_concurrency=1)
+    strat = StrategyConfig(max_batch_size=1, max_concurrency=1)
     reqs = [Request(0, model_a, 64, 8, 0.0), Request(1, model_b, 64, 8, 0.0)]
 
     result = Simulator(system, strat).run(reqs)
@@ -931,7 +931,7 @@ def test_home_node_ram_capacity_enforced_across_models():
     model_a = toy_moe_model()
     model_b = toy_moe_model()
     system = make_streaming_system(1, node_cap=50e6, dev_cap=80e9)
-    strat = StrategyConfig(max_batch_size=1, target_concurrency=2)
+    strat = StrategyConfig(max_batch_size=1, max_concurrency=2)
     reqs = [Request(0, model_a, 64, 8, 0.0), Request(1, model_b, 64, 8, 0.0)]
 
     with pytest.raises(MemoryCapacityExceeded) as exc:
@@ -1131,8 +1131,8 @@ def test_pdd_pipelines_requests_in_parallel():
     assert result.makespan == pytest.approx(one_pipeline)
 
 
-def test_pdd_target_concurrency_serializes_inflight():
-    # target_concurrency=1 keeps only one sequence in flight across both phases,
+def test_pdd_max_concurrency_serializes_inflight():
+    # max_concurrency=1 keeps only one sequence in flight across both phases,
     # so the second request cannot start prefill until the first has decoded.
     model = toy_model()
     system = make_system(4)
@@ -1144,7 +1144,7 @@ def test_pdd_target_concurrency_serializes_inflight():
 
     result = Simulator(
         system,
-        StrategyConfig(allow_pdd=True, max_batch_size=1, target_concurrency=1),
+        StrategyConfig(allow_pdd=True, max_batch_size=1, max_concurrency=1),
     ).run(reqs)
 
     prefill_ms = _phase_makespan(model, g0, 64, 8, "prefill")

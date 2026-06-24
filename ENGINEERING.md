@@ -251,9 +251,9 @@ Keys read by [runner.py](Src/serve_sim/runner.py) (`run_from_config` / `_strateg
 | `random_seed` | `None` | Seeds suite selection + event perturbation. |
 | `arrival_interval_sec` | `0.0` | Gap between successive workloads' first turns. |
 | `max_turns_per_workload` | `None` | Cap turns per conversation. |
-| `max_concurrency` | `8` | → `StrategyConfig.max_batch_size`. |
+| `max_batch_size` | `8` | → `StrategyConfig.max_batch_size`. Largest batch a single engine slot forms. |
 | `concurrency_window_sec` | `1.0` | → `max_window_duration`. |
-| `target_concurrency` | `None` | Max sequences in flight. |
+| `max_concurrency` | `None` | → `StrategyConfig.max_concurrency`. Total sequences in flight datacenter-wide. |
 | `allow_pdd` | `True` | Prefill/decode disaggregation path. |
 | `prefill_engine_fraction` | `0.5` | Slot split for PDD. |
 | `prefill_chunk_size` | `None` | Optional prefill chunking. |

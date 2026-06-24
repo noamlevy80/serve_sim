@@ -64,7 +64,7 @@ def _write_config(path: Path) -> None:
             "num_workloads": 2,
             "models": ["gemma-4-31b"],
         },
-        "max_concurrency": 4,
+        "max_batch_size": 4,
         "concurrency_window_sec": 0.5,
         "allow_pdd": False,
         "arrival_interval_sec": 0.0,

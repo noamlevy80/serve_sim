@@ -9,9 +9,9 @@
     "num_workloads": 4,
     "models": ["tiny-dense"]
   },
-  "max_concurrency": 1,
+  "max_batch_size": 1,
   "concurrency_window_sec": 0.5,
-  "target_concurrency": 1,
+  "max_concurrency": 1,
   "allow_pdd": false,
   "auto_parallelism": false,
   "pipeline_parallel": 1,

@@ -147,9 +147,9 @@ def _strategy_from_config(cfg: Mapping[str, Any]) -> StrategyConfig:
     """Map the PRD config parameters onto a :class:`StrategyConfig`."""
 
     return StrategyConfig(
-        max_batch_size=int(cfg.get("max_concurrency", 8)),
+        max_batch_size=int(cfg.get("max_batch_size", 8)),
         max_window_duration=float(cfg.get("concurrency_window_sec", 1.0)),
-        target_concurrency=cfg.get("target_concurrency"),
+        max_concurrency=cfg.get("max_concurrency"),
         pipeline_parallel=int(cfg.get("pipeline_parallel", 1)),
         expert_parallel=int(cfg.get("expert_parallel", 1)),
         tensor_parallel=int(cfg.get("tensor_parallel", 1)),

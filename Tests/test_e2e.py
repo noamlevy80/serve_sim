@@ -280,5 +280,5 @@ def test_concurrency_cap_serializes_the_pipeline(tmp_path):
 
     assert len(serial.records) == len(parallel.records)
     assert serial.makespan > parallel.makespan, (
-        "target_concurrency=1 should finish later than a high concurrency cap"
+        "max_concurrency=1 should finish later than a high concurrency cap"
     )

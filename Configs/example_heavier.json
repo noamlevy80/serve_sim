@@ -20,8 +20,8 @@
     "models": ["gemma-4-31b"]
   },
 
-  "max_concurrency": 16,
-  "target_concurrency": 8,
+  "max_batch_size": 4,
+  "max_concurrency": null,
   "concurrency_window_sec": 0.5,
 
   "allow_pdd": false,
@@ -30,16 +30,16 @@
   "model_weight_loading": true,
 
   "auto_parallelism": true,
-  "pipeline_parallel": 4,
-  "expert_parallel": 2,
+  "pipeline_parallel": 2,
+  "expert_parallel": 1,
   "tensor_parallel": 2,
-  "max_parallelism": 32,
+  "max_parallelism": 24,
 
   "prefill_chunk_size": null,
   "event_random_factor_range": 0.05,
   "arrival_interval_sec": 0.1,
   "arrival_variance_sec2": 0.001,
-  "max_turns_per_workload": 8,
+  "max_turns_per_workload": 4,
 
   "report_time_buckets": 256,
   "random_seed": 7

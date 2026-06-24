@@ -102,7 +102,7 @@ Network tests auto-skip if the dataset API is unreachable.
   devices (partition point set by `prefill_engine_fraction`). A request is
   prefilled on the prefill pool; on completion its KV cache is transferred (a
   modeled link-bandwidth delay) to the decode pool, where it is decoded. Prefill
-  and decode batch independently; `target_concurrency` counts a sequence as in
+  and decode batch independently; `max_concurrency` counts a sequence as in
   flight from prefill dispatch until decode completion. 11 offline tests
   (primitives) + 9 offline (orchestrator integration).
 - **Stage 20 — Outputs & CLI:** a run now captures the raw event log (each event
@@ -654,7 +654,7 @@ arrival, the open batch window's deadline, or the arbiter's next completion,
 then retires finished jobs, admits new arrivals, and dispatches batches. A batch
 groups consecutive same-model requests (by instance identity) up to the strategy
 max batch size, dispatching when the batch fills or the concurrency window times
-out; `target_concurrency` caps how many sequences may be in flight so excess
+out; `max_concurrency` caps how many sequences may be in flight so excess
 batches serialize behind completions. Each batch is turned into work shards and
 events and admitted to the shared `IncrementalArbiter`, so concurrent batches
 contend on the engine devices exactly as the fluid solver dictates. 18 offline
@@ -669,7 +669,7 @@ tests in [Tests/test_orchestrator.py](Tests/test_orchestrator.py).
   a partial batch waits for the window timeout before dispatching; a batched
   decode is cheaper than two solo runs because the batch shares the device.
 - **Concurrency control:** two concurrent batches share the device, while
-  `target_concurrency` serializes batches behind completions and a concurrency
+  `max_concurrency` serializes batches behind completions and a concurrency
   of one with a single arrival reduces to the solo case.
 - **Grouping:** different models dispatch in separate batches, the same model
   instance batches together, and the batch-size knob caps each group; every
@@ -829,7 +829,7 @@ pipeline:
 3. **Decode** on the decode pool, starting only after the transfer completes.
 
 Prefill and decode batch independently, each with its own window/fill policy.
-`target_concurrency` counts a sequence as in flight from prefill dispatch until
+`max_concurrency` counts a sequence as in flight from prefill dispatch until
 decode completion, so it caps total work across both phases; decode batches are
 never concurrency-gated (their sequences were already counted at prefill), which
 keeps the pipeline from deadlocking.
@@ -860,7 +860,7 @@ tests in [Tests/test_orchestrator.py](Tests/test_orchestrator.py).
 - **Parallel pipelining:** with two prefill and two decode slots, two requests run
   their pipelines fully in parallel, so the makespan is a single pipeline rather
   than two.
-- **Concurrency across phases:** `target_concurrency=1` keeps one sequence in
+- **Concurrency across phases:** `max_concurrency=1` keeps one sequence in
   flight end-to-end, so the second request cannot start prefill until the first
   has finished decoding.
 - **Flag off:** with `allow_pdd` off the simulator runs the original single-phase
@@ -1033,7 +1033,7 @@ Tests in [Tests/test_e2e.py](Tests/test_e2e.py).
 - **Multi-model suite:** a suite drawing two models resolves and serves both, and
   the input NVM streams weights for them.
 - **Concurrency-bound admission:** the same workloads finish sooner with a high
-  `target_concurrency` than with `target_concurrency = 1` (which serializes the
+  `max_concurrency` than with `max_concurrency = 1` (which serializes the
   pipeline), pinning down the admission-control behaviour that makes a run look
   under-utilized when the concurrency cap, not the hardware, is the bottleneck.
 

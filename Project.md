@@ -265,9 +265,9 @@ For each batch the orchestrator selects a *device set* (engine slot), not just a
 The orchestration eagerly decides on prefill-decode dissagregation if enabled.
 The orchestration eagerly decides on parallelism using a high-level roofline estimate: for the candidate device sets and parallelism degrees available at the time of issue, it estimates the batch's compute-bound and bandwidth-bound time (as the event generator would) and picks the option with the best expected outcome, subject to the device and memory-capacity constraints it knows about.
 
-**Memory is a hard constraint.** A single batch is rejected up front if its per-device footprint does not fit the serving device's memory. Beyond that, the simulator also enforces the *aggregate* constraint: the reserved footprint (weights + KV) of all jobs concurrently resident on a device may never exceed the memory available to it (its first tier, plus any second tier it can spill into). If a run would ever oversubscribe a device, the simulation aborts with an informative out-of-memory error naming the device, its peak reserved footprint, its capacity and the oversubscription factor, rather than reporting a physically impossible occupancy. The fix is to reduce concurrency (`target_concurrency`/`max_batch_size`), increase the parallelism degree (or enable `auto_parallelism`) to shard the footprint across more devices, give the device a second memory tier, or use a smaller model.
+**Memory is a hard constraint.** A single batch is rejected up front if its per-device footprint does not fit the serving device's memory. Beyond that, the simulator also enforces the *aggregate* constraint: the reserved footprint (weights + KV) of all jobs concurrently resident on a device may never exceed the memory available to it (its first tier, plus any second tier it can spill into). If a run would ever oversubscribe a device, the simulation aborts with an informative out-of-memory error naming the device, its peak reserved footprint, its capacity and the oversubscription factor, rather than reporting a physically impossible occupancy. The fix is to reduce concurrency (`max_concurrency`/`max_batch_size`), increase the parallelism degree (or enable `auto_parallelism`) to shard the footprint across more devices, give the device a second memory tier, or use a smaller model.
 
-When prefill-decode disaggregation is enabled (`allow_pdd`), the engine slots are split into two disjoint pools — a prefill pool and a decode pool — with the partition point set by `prefill_engine_fraction` (a fixed fraction for now; dynamic repartitioning is left as future work, since fixed partitions tend to be predictably suboptimal). A request is prefilled on the prefill pool; on completion its KV cache is moved to the decode pool as one modeled transfer of the prompt's KV bytes over the link between the two engines' memories, and decode begins only after that transfer completes. Prefill and decode batch independently, while target concurrency counts a sequence as in flight from prefill dispatch through decode completion.
+When prefill-decode disaggregation is enabled (`allow_pdd`), the engine slots are split into two disjoint pools — a prefill pool and a decode pool — with the partition point set by `prefill_engine_fraction` (a fixed fraction for now; dynamic repartitioning is left as future work, since fixed partitions tend to be predictably suboptimal). A request is prefilled on the prefill pool; on completion its KV cache is moved to the decode pool as one modeled transfer of the prompt's KV bytes over the link between the two engines' memories, and decode begins only after that transfer completes. Prefill and decode batch independently, while max concurrency counts a sequence as in flight from prefill dispatch through decode completion.
 
 Concretely, an engine slot is a *fixed device budget* (the parallelism degree); the search only chooses how to wire it into a `pipeline x expert` arrangement. Since a single batch has no pipeline overlap, the speed estimate favours expert parallelism (`time ~ max(compute, bandwidth) / expert_parallel`), while pipeline parallelism is what relieves memory: pipeline stages shard the layers, whereas expert parallelism shards only the routed experts and replicates the attention/dense/shared/LM-head weights and the KV cache across ranks. The search therefore takes the most expert-parallel arrangement that still fits each device's memory, reaching for more pipeline stages only when a batch would otherwise not fit. This search is opt-in (`auto_parallelism`); by default the configured pipeline/expert degrees are used as-is.
 
@@ -295,8 +295,9 @@ A batch can only run on an engine slot (device set) whose first-tier memory alre
 
 ### Strategy
 The orchestration strategy is configured by a few knobs:
-- Target concurrency: how many sequences the simulator tries to keep in flight, counted datacenter-wide across all in-flight batches.
-- Max batch size and max window duration: the batching window (see above), applied per batch.
+- Max batch size: the fundamental inference knob -- the largest batch a single engine slot forms and runs at once. This sets how wide each individual batch is.
+- Max concurrency: the high-level orchestration requirement -- the cap on the *total* sequences in flight datacenter-wide across all in-flight batches and engine slots. When several engine slots are available, setting max batch size below max concurrency lets the remaining budget spill into additional concurrent batches on other slots; setting them equal funnels all in-flight work into a single batch on a single slot.
+- Max window duration: the batching window (see above), applied per batch.
 - Allow PDD: whether prefill-decode disaggregation may be used.
 - Prefill engine fraction: when PDD is enabled, the share of engine slots devoted to prefill (the rest serve decode).
 - Max parallelism degrees: caps on pipeline and expert parallelism the roofline search may choose from.
@@ -304,10 +305,10 @@ The orchestration strategy is configured by a few knobs:
 - Model weight loading: whether model weights are streamed from the input NVM onto an engine slot on (re)placement (with per-slot single-model residency and displacement), or assumed pre-resident.
 
 ## List of simulation parameters (to appear in config.JSON)
-- max_concurrency (default 8)
-    max batch formed by orchestration (max batch size)
-- target_concurrency (default null)
-    how many sequences the simulator tries to keep in flight; null means unbounded (admit up to max_concurrency)
+- max_batch_size (default 8)
+    the fundamental inference knob: the largest batch a single engine slot forms and runs at once (the window fill threshold)
+- max_concurrency (default null)
+    high-level orchestration cap on the total sequences kept in flight datacenter-wide across all batches/slots; null means unbounded (admit up to max_batch_size per batch). Lower max_batch_size than max_concurrency to spread concurrent batches across multiple engine slots.
 - concurrency_window_sec (default 1)
     the max time the simulator waits incoming sequences before issuing a batch
 - allow_pdd (default true)

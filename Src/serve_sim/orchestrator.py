@@ -67,7 +67,7 @@ class MemoryCapacityExceeded(RuntimeError):
             f"{peak_bytes / 1e9:.2f} GB exceeds its {capacity_bytes / 1e9:.2f} GB "
             f"capacity ({over:.2f}x oversubscribed). The concurrent weights + KV "
             f"of the jobs placed on this device do not fit in its memory. Reduce "
-            f"target_concurrency or max_batch_size, raise the parallelism degree "
+            f"max_concurrency or max_batch_size, raise the parallelism degree "
             f"(or enable auto_parallelism) to shard the footprint across more "
             f"devices, give the device a second memory tier to spill into, or use "
             f"a smaller model."
@@ -79,10 +79,16 @@ class StrategyConfig:
     """The orchestration knobs (v0 subset).
 
     Attributes:
-        max_batch_size: Sequences per dispatched batch (window fill threshold).
+        max_batch_size: Sequences per dispatched batch -- the fundamental
+            inference knob that sets how wide a single engine slot batches work
+            (the window fill threshold).
         max_window_duration: Seconds a window stays open before dispatching
             whatever it has collected (``0`` dispatches as soon as work is ready).
-        target_concurrency: Max sequences in flight, or ``None`` for unbounded.
+        max_concurrency: High-level orchestration cap on the *total* sequences in
+            flight across all batches/slots at once, or ``None`` for unbounded.
+            With several engine slots available, lowering ``max_batch_size`` below
+            ``max_concurrency`` lets the remaining budget spill into additional
+            concurrent batches on other slots.
         pipeline_parallel: Fixed pipeline-parallel degree of the engine.
         expert_parallel: Fixed expert-parallel degree of the engine.
         tensor_parallel: Fixed tensor-parallel degree of the engine. Tensor
@@ -128,7 +134,7 @@ class StrategyConfig:
 
     max_batch_size: int = 1
     max_window_duration: float = 0.0
-    target_concurrency: int | None = None
+    max_concurrency: int | None = None
     pipeline_parallel: int = 1
     expert_parallel: int = 1
     tensor_parallel: int = 1
@@ -146,8 +152,8 @@ class StrategyConfig:
             raise ValueError("max_batch_size must be >= 1")
         if self.max_window_duration < 0:
             raise ValueError("max_window_duration must be non-negative")
-        if self.target_concurrency is not None and self.target_concurrency < 1:
-            raise ValueError("target_concurrency must be >= 1 when set")
+        if self.max_concurrency is not None and self.max_concurrency < 1:
+            raise ValueError("max_concurrency must be >= 1 when set")
         if self.pipeline_parallel < 1 or self.expert_parallel < 1:
             raise ValueError("parallelism degrees must be >= 1")
         if self.tensor_parallel < 1:
@@ -938,7 +944,7 @@ class Simulator:
         A request is prefilled on the prefill pool; on completion its KV cache is
         transferred (a modeled delay derived from the link bandwidth) to the
         decode pool, where it is decoded. Prefill and decode batch independently
-        (each with its own window/fill); ``target_concurrency`` counts a sequence
+        (each with its own window/fill); ``max_concurrency`` counts a sequence
         as in flight from prefill dispatch until decode completion.
         """
 
@@ -1512,10 +1518,10 @@ class Simulator:
         """
 
         strategy = self.strategy
-        if strategy.target_concurrency is None:
+        if strategy.max_concurrency is None:
             slots = strategy.max_batch_size
         else:
-            slots = strategy.target_concurrency - in_flight
+            slots = strategy.max_concurrency - in_flight
             if slots <= 0:
                 if in_flight > 0:
                     return None
@@ -1537,7 +1543,7 @@ class Simulator:
         """Pull up to ``max_batch_size`` same-model requests for decode.
 
         Unlike :meth:`_take_batch` this applies no concurrency gate: decode
-        sequences were already counted toward ``target_concurrency`` when their
+        sequences were already counted toward ``max_concurrency`` when their
         prefill was dispatched, so gating them again would deadlock.
         """
 
