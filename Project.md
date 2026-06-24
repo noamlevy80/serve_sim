@@ -418,10 +418,14 @@ The default for all graphs is displayed.
 1.4 Reason idle (the most dominant of the reasons in the reporting section above)
 1.5 Transfer source (the device from which an incoming transfer is happening)
 1.6 Transfer object (KV of which sequence, weights)
+1.7 Current task batch size (0 if device is idle)
+1.8 Effective device output token throughput (total tokens per second of current task) - if device is a rank in a parallelism group, this is the effective throughput of the part of the token generation the device is responsible for. When not decoding this is 0
+1.9 Effective device input token throughput, similar to 1.8 but for prefill; when not prefilling, this is 0.
 2. For each independent memory device:
 2.1 Bandwidth used (with both absolute and relative to max)
 2.2 Capacity used (with both absolute and relative to max) - broken down by content - KV and weights
 2.3 Transfer source (the device from which an incoming transfer is happening)
+2.4 Transfer object (KV of which sequence, weights)
 3. For each workload:
 3.1 Device computing workload
 3.2 Current turn

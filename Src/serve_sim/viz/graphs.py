@@ -298,6 +298,15 @@ def _device_graphs(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
             name, _merge_segments(rows, lambda r: (
                 _object_label(r["transfer_object"]) if r.get("transfer_object")
                 else None))))
+        graphs.append(_value_graph(
+            f"dev:{name}:batch", f"Task batch size -- {name}", "compute_device",
+            name, "seq", None, rows, "batch_size"))
+        graphs.append(_value_graph(
+            f"dev:{name}:out_tps", f"Output token throughput -- {name}",
+            "compute_device", name, "tok/s", None, rows, "decode_tokens_per_s"))
+        graphs.append(_value_graph(
+            f"dev:{name}:in_tps", f"Input token throughput -- {name}",
+            "compute_device", name, "tok/s", None, rows, "prefill_tokens_per_s"))
     return graphs
 
 
@@ -349,6 +358,11 @@ def _memory_graphs(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
             name, _merge_segments(rows, lambda r: (
                 (r["transfer_source"], f"Source: {r['transfer_source']}",
                  f"dev:{r['transfer_source']}") if r.get("transfer_source") else None))))
+        graphs.append(_discrete_graph(
+            f"mem:{name}:xfer_obj", f"Transfer object -- {name}", "memory_device",
+            name, _merge_segments(rows, lambda r: (
+                _object_label(r["transfer_object"]) if r.get("transfer_object")
+                else None))))
     return graphs
 
 

@@ -169,6 +169,36 @@ def test_device_summaries_and_timeline_shapes():
     assert {row["device"] for row in timeline} == {d["device"] for d in devices}
 
 
+def test_device_timeline_token_throughput_is_shared_across_the_group():
+    model = toy_model()
+    system = make_system(2)
+    reqs = [Request(0, model, 16, 4, 0.0), Request(1, model, 16, 4, 0.0)]
+
+    result = Simulator(system, StrategyConfig(max_batch_size=2, tensor_parallel=2)).run(reqs)
+
+    timeline = device_timeline(result, num_buckets=16)
+    by_bucket: dict[int, list[dict]] = {}
+    for row in timeline:
+        by_bucket.setdefault(row["bucket"], []).append(row)
+
+    decoded = prefilled = False
+    for rows in by_bucket.values():
+        # Token throughput is a property of the task, so every rank in the
+        # engine group reports the same value in a given bucket.
+        outs = {round(r["decode_tokens_per_s"], 6) for r in rows}
+        ins = {round(r["prefill_tokens_per_s"], 6) for r in rows}
+        assert len(outs) == 1
+        assert len(ins) == 1
+        decoded = decoded or next(iter(outs)) > 0
+        prefilled = prefilled or next(iter(ins)) > 0
+    assert decoded and prefilled
+
+    # The only batch holds two sequences, so each bucket is idle or shows it.
+    sizes = {row["batch_size"] for row in timeline}
+    assert sizes <= {0, 2}
+    assert 2 in sizes
+
+
 # --- per-device execution-state breakdown --------------------------------------
 
 

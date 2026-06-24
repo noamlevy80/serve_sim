@@ -361,6 +361,65 @@ def _dominant_transfer(
     return best
 
 
+def _phase_token_throughput(
+    events: Sequence[EventRecord],
+    result: RunResult,
+    num_buckets: int,
+    width: float,
+) -> tuple[dict[tuple[str, int], float], dict[tuple[str, int], float]]:
+    """Effective per-(device, bucket) decode and prefill token throughput.
+
+    A batch's token rate is a property of the whole task, not of any single rank,
+    so every device in the batch's engine group is credited the same value. For
+    each job the phase's token count (output tokens for decode, prompt tokens for
+    prefill) is spread evenly over that phase's wall-clock window -- ``[min start,
+    max end]`` of its rescaled events -- and the rate is prorated into the buckets
+    the window covers and attributed to every device the job ran on. Returns two
+    ``{(device, bucket): tokens_per_second}`` maps (decode, prefill).
+    """
+
+    jobs_by_index = {j.job_index: j for j in result.jobs}
+    tokens = {r.request_id: (r.prompt_tokens, r.output_tokens) for r in result.records}
+
+    def windows(phase: str) -> dict[int, tuple[float, float]]:
+        spans: dict[int, list[float]] = {}
+        for e in events:
+            if e.phase != phase:
+                continue
+            span = spans.get(e.job_index)
+            if span is None:
+                spans[e.job_index] = [e.start, e.end]
+            else:
+                span[0] = min(span[0], e.start)
+                span[1] = max(span[1], e.end)
+        return {idx: (s, e) for idx, (s, e) in spans.items()}
+
+    def distribute(phase: str, token_index: int) -> dict[tuple[str, int], float]:
+        acc: dict[tuple[str, int], float] = {}
+        if width <= 0:
+            return acc
+        for job_index, (start, end) in windows(phase).items():
+            job = jobs_by_index.get(job_index)
+            if job is None or end <= start:
+                continue
+            total = sum(tokens.get(rid, (0, 0))[token_index] for rid in job.request_ids)
+            if total <= 0:
+                continue
+            rate = total / (end - start)
+            first = max(0, int(start // width))
+            last = min(num_buckets - 1, int((end - 1e-12) // width))
+            for b in range(first, last + 1):
+                ov = max(0.0, min(end, (b + 1) * width) - max(start, b * width))
+                if ov <= 0:
+                    continue
+                contrib = rate * ov / width
+                for device in job.devices:
+                    acc[(device, b)] = acc.get((device, b), 0.0) + contrib
+        return acc
+
+    return distribute("decode", 1), distribute("prefill", 0)
+
+
 def device_timeline(
     result: RunResult, num_buckets: int = 64, *,
     progress: Callable[[float, float], None] | None = None,
@@ -370,8 +429,10 @@ def device_timeline(
     Each row is one device in one time bucket. Beyond the busy fraction, memory
     occupancy and execution-state breakdown, it carries the achieved compute
     (FLOP/s) and first-tier bandwidth (bytes/s) in the bucket, the first-tier
-    occupancy split into KV vs weights (``content``), and a discrete label for
-    any incoming transfer (its source memory and what it moves), so the
+    occupancy split into KV vs weights (``content``), a discrete label for any
+    incoming transfer (its source memory and what it moves), the current task's
+    batch size, and the effective decode (output) and prefill (input) token
+    throughput -- the same for every device in the task's engine group -- so the
     visualization can plot absolute values against the device's static ceilings.
     """
 
@@ -390,6 +451,14 @@ def device_timeline(
         if e.device:
             events_by_device.setdefault(e.device, []).append(e)
 
+    # Per-(device, bucket) effective token throughput. A task's token rate is a
+    # property of the whole batch, so every device in its engine group reports
+    # the same value: the batch's decode (output) or prefill (input) tokens
+    # spread over that phase's wall-clock window and prorated into each bucket.
+    decode_tps, prefill_tps = _phase_token_throughput(
+        rescaled, result, num_buckets, width
+    )
+
     rows: list[dict[str, Any]] = []
     for b in range(num_buckets):
         t0 = b * width
@@ -402,6 +471,11 @@ def device_timeline(
             busy_events = [e for e in dev_events if e.phase != "kernel_launch"]
             overlap = sum(_overlap(e, t0, t1) for e in busy_events)
             compute_events = [e for e in dev_events if e.phase in _COMPUTE_PHASES]
+            # 1.7 Current task batch size: the dominant compute event's batch.
+            batch_size = (
+                len(max(compute_events, key=lambda e: _overlap(e, t0, t1)).request_ids)
+                if compute_events else 0
+            )
             bucket_flops = sum(e.flops * _overlap_fraction(e, t0, t1)
                                for e in compute_events)
             bucket_compute_s = sum(e.compute_time * _overlap_fraction(e, t0, t1)
@@ -427,6 +501,9 @@ def device_timeline(
                 "busy_fraction": overlap / width if width else 0.0,
                 "memory_bytes": _occupancy_at(result.jobs, name, t0),
                 "content": content,
+                "batch_size": batch_size,
+                "decode_tokens_per_s": decode_tps.get((name, b), 0.0),
+                "prefill_tokens_per_s": prefill_tps.get((name, b), 0.0),
                 "compute_flops_per_s": bucket_flops / width if width else 0.0,
                 "compute_seconds": bucket_compute_s,
                 "first_tier_bytes_per_s": bucket_bytes / width if width else 0.0,
@@ -1171,7 +1248,8 @@ def write_outputs(
     _write_csv(
         out / "device_timeline.csv",
         ["bucket", "time_start", "time_end", "device", "busy_fraction",
-         "memory_bytes", "content_json", "compute_flops_per_s", "compute_seconds",
+         "memory_bytes", "content_json", "batch_size", "decode_tokens_per_s",
+         "prefill_tokens_per_s", "compute_flops_per_s", "compute_seconds",
          "first_tier_bytes_per_s", "bandwidth_seconds", "transfer_source",
          "transfer_object", *(f"{state}_fraction" for state in DEVICE_STATES)],
         [{**row, "content_json": json.dumps(row["content"], sort_keys=True)}
