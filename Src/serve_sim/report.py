@@ -904,9 +904,13 @@ def workload_graph(result: RunResult) -> dict[str, Any]:
     turn's completion and the next turn's arrival. Edges run from the sequence
     whose cached KV prefix was reused to the sequence that reused it; reuse within
     one conversation is implied and left undrawn, so only cross-workload links
-    appear. Workloads occupy stacked horizontal lanes ordered by arrival, and each
-    node carries logical ``t0``/``t1`` (time) and ``lane``/``sub`` (vertical)
-    coordinates the renderer maps to pixels.
+    appear. Because the shared prefix is a run of leading messages that each
+    conversation already carries from its first turn, a cross-conversation link is
+    anchored at both turn-0 input nodes and drawn once rather than repeated at
+    every later turn that re-fetches the same inherited prefix. Workloads occupy
+    stacked horizontal lanes ordered by arrival, and each node carries logical
+    ``t0``/``t1`` (time) and ``lane``/``sub`` (vertical) coordinates the renderer
+    maps to pixels.
     """
 
     makespan = result.makespan or 0.0
@@ -991,8 +995,15 @@ def workload_graph(result: RunResult) -> dict[str, Any]:
             continue
         if d.source_workload_id == d.workload_id:
             continue
-        src = node_by_seq.get((d.source_workload_id, d.source_turn_index))
-        dst = node_by_request.get(d.request_id)
+        # The shared prefix is a run of leading messages, so it is present in both
+        # conversations from their very first turn and is carried forward along
+        # each lane implicitly. Anchor the cross-conversation link at both turn-0
+        # input nodes and draw it once, rather than redrawing it at every later
+        # turn that merely re-fetches the same already-inherited prefix.
+        src = (node_by_seq.get((d.source_workload_id, 0))
+               or node_by_seq.get((d.source_workload_id, d.source_turn_index)))
+        dst = (node_by_seq.get((d.workload_id, 0))
+               or node_by_request.get(d.request_id))
         if not src or not dst or src == dst:
             continue
         key = (src, dst)
