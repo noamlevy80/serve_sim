@@ -42,17 +42,51 @@ const STATE = { vm: null, cols: 2, t0: 0, t1: 1, order: [], drag: null,
 const PAD = { l: 40, r: 42, t: 8, b: 14 };
 
 async function boot() {
-  const resp = await fetch("api/view-model");
+  await loadRun(null);     // fetch + render the default run
+  setupTabs();
+  setupControls();
+  await setupRunPicker();
+  window.addEventListener("resize", () => renderGrid());
+}
+
+// Fetch a run's view model (the default when ``run`` is null) and (re)render.
+async function loadRun(run) {
+  const url = run ? `api/view-model?run=${encodeURIComponent(run)}` : "api/view-model";
+  const resp = await fetch(url);
   STATE.vm = await resp.json();
   STATE.t0 = 0;
   STATE.t1 = STATE.vm.makespan_s || 1;
   STATE.order = STATE.vm.graphs.map((g) => g.id);
+  STATE.hidden = new Set();
+  document.getElementById("run-id").textContent = STATE.vm.run_id;
+  const start = document.getElementById("slider-start");
+  const end = document.getElementById("slider-end");
+  if (start && end) { start.value = 0; end.value = 1000; }
+  const label = document.getElementById("window-label");
+  if (label) label.textContent = `${formatEng(STATE.t0)}s – ${formatEng(STATE.t1)}s`;
   renderSummary();
-  setupTabs();
-  setupControls();
   renderTree();
   renderGrid();
-  window.addEventListener("resize", () => renderGrid());
+}
+
+// Populate the run dropdown and switch runs on selection.
+async function setupRunPicker() {
+  const sel = document.getElementById("run-select");
+  if (!sel) return;
+  try {
+    const data = await (await fetch("api/runs")).json();
+    sel.innerHTML = "";
+    for (const name of data.runs) {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      if (name === data.current) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.addEventListener("change", () => loadRun(sel.value));
+  } catch (e) {
+    sel.hidden = true;     // single-run launch with no listing -- hide the picker
+  }
 }
 
 // --- tabs -----------------------------------------------------------------------

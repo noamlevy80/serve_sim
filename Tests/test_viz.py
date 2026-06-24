@@ -213,3 +213,32 @@ def test_app_serves_view_model(tmp_path):
 def test_app_errors_without_viz_json(tmp_path):
     with pytest.raises(FileNotFoundError):
         create_app(tmp_path)
+
+
+def test_app_lists_and_selects_sibling_runs(tmp_path):
+    model = toy_model()
+    system = make_system(2)
+    reqs = [Request(i, model, 32, 4) for i in range(2)]
+
+    outputs = tmp_path / "Outputs"
+    runs = {}
+    for name in ("run-a", "run-b"):
+        result = Simulator(system, StrategyConfig(max_batch_size=2)).run(reqs)
+        runs[name] = write_outputs(
+            result, outputs / name, run_id=name, viz_buckets=8)
+
+    app = create_app(runs["run-a"])
+    client = app.test_client()
+
+    listing = client.get("/api/runs").get_json()
+    assert set(listing["runs"]) == {"run-a", "run-b"}
+    assert listing["current"] == "run-a"
+
+    # The default run loads, and any sibling can be selected by name.
+    assert client.get("/api/view-model").get_json()["run_id"] == "run-a"
+    other = client.get("/api/view-model?run=run-b").get_json()
+    assert other["run_id"] == "run-b"
+
+    # Unknown / traversal names are rejected.
+    assert client.get("/api/view-model?run=does-not-exist").status_code == 404
+    assert client.get("/api/view-model?run=../secret").status_code == 404

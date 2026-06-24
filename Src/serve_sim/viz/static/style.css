@@ -32,6 +32,19 @@ header {
 header h1 { font-size: 16px; margin: 0; font-weight: 600; }
 .run-id { color: var(--muted); font-size: 13px; font-family: monospace; }
 
+.run-picker { display: flex; align-items: center; gap: 6px; }
+.run-picker > span { color: var(--muted); font-size: 13px; }
+.run-picker select {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 13px;
+  font-family: monospace;
+  cursor: pointer;
+}
+
 nav.tabs { margin-left: auto; display: flex; gap: 6px; }
 .tab {
   background: transparent;
