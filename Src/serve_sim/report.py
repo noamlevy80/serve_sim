@@ -52,10 +52,9 @@ import csv
 import json
 import sys
 import time
-from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .orchestrator import (
     DecisionRecord,
@@ -234,7 +233,9 @@ def _state_seconds(
     return seconds
 
 
-def device_summaries(result: RunResult) -> list[dict[str, Any]]:
+def device_summaries(
+    result: RunResult, *, progress: Callable[[float, float], None] | None = None
+) -> list[dict[str, Any]]:
     """Per-device utilization, peak memory occupancy and DMA totals."""
 
     makespan = result.makespan or 0.0
@@ -280,6 +281,8 @@ def device_summaries(result: RunResult) -> list[dict[str, Any]]:
                 states[state] / makespan if makespan else 0.0
             )
         summaries.append(summary)
+        if progress is not None:
+            progress(len(summaries), len(names))
     return summaries
 
 
@@ -358,7 +361,10 @@ def _dominant_transfer(
     return best
 
 
-def device_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, Any]]:
+def device_timeline(
+    result: RunResult, num_buckets: int = 64, *,
+    progress: Callable[[float, float], None] | None = None,
+) -> list[dict[str, Any]]:
     """Per-device busy fraction, occupancy, state and throughput over time.
 
     Each row is one device in one time bucket. Beyond the busy fraction, memory
@@ -434,6 +440,8 @@ def device_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, 
             for state in DEVICE_STATES:
                 row[f"{state}_fraction"] = states[state] / width if width else 0.0
             rows.append(row)
+        if progress is not None:
+            progress(b + 1, num_buckets)
     return rows
 
 
@@ -562,7 +570,10 @@ def _first_tier_content_at(
     return weights, kv_bytes
 
 
-def memory_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, Any]]:
+def memory_timeline(
+    result: RunResult, num_buckets: int = 64, *,
+    progress: Callable[[float, float], None] | None = None,
+) -> list[dict[str, Any]]:
     """Per-memory bandwidth, occupancy-by-content and incoming transfer over time.
 
     One row per memory per time bucket. Carries the achieved bandwidth (bytes/s)
@@ -656,6 +667,8 @@ def memory_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str, 
                 "transfer_source": source,
                 "transfer_object": obj,
             })
+        if progress is not None:
+            progress(b + 1, num_buckets)
     return rows
 
 
@@ -805,7 +818,9 @@ def _current_turn(turns: Sequence[RequestRecord], t: float) -> RequestRecord:
     return turns[-1]
 
 
-def summarize(result: RunResult) -> dict[str, Any]:
+def summarize(
+    result: RunResult, *, progress: Callable[[float, float], None] | None = None
+) -> dict[str, Any]:
     """Aggregate run report over the whole suite."""
 
     records = result.records
@@ -814,7 +829,7 @@ def summarize(result: RunResult) -> dict[str, Any]:
     transfers = [e for e in isolated
                  if e.phase in ("transfer", "weight_transfer", "expert_transfer")
                  and e.bytes_read > 0]
-    devices = device_summaries(result)
+    devices = device_summaries(result, progress=progress)
     memories = memory_summaries(result)
 
     total_output = sum(r.output_tokens for r in records)
@@ -852,13 +867,18 @@ def summarize(result: RunResult) -> dict[str, Any]:
 # --- writing --------------------------------------------------------------------
 
 
-def _write_csv(path: Path, fieldnames: Sequence[str], rows: Iterable[Mapping[str, Any]]) -> None:
+def _write_csv(
+    path: Path, fieldnames: Sequence[str], rows: Iterable[Mapping[str, Any]],
+    *, progress: Callable[[float, float], None] | None = None, total: int = 0,
+) -> None:
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(fieldnames),
                                 extrasaction="ignore")
         writer.writeheader()
-        for row in rows:
+        for i, row in enumerate(rows, 1):
             writer.writerow(row)
+            if progress is not None and total and (i % 8192 == 0 or i == total):
+                progress(i, total)
 
 
 def _request_rows(records: Sequence[RequestRecord]) -> list[dict[str, Any]]:
@@ -942,14 +962,12 @@ _EVENT_FIELDS = (
 )
 
 
-def _event_rows(events: Sequence[EventRecord]) -> list[dict[str, Any]]:
-    rows = []
+def _event_rows(events: Sequence[EventRecord]) -> Iterable[dict[str, Any]]:
     for e in events:
         row = asdict(e)
         row.pop("rescaled")
         row["request_ids"] = " ".join(str(r) for r in e.request_ids)
-        rows.append(row)
-    return rows
+        yield row
 
 
 def _format_distribution(name: str, dist: Mapping[str, Any]) -> str:
@@ -1021,6 +1039,45 @@ def _report_text(report: Mapping[str, Any], devices: Sequence[Mapping[str, Any]]
     return "\n".join(lines) + "\n"
 
 
+class _Progress:
+    """A single-line, throttled percentage indicator for a long epilogue step.
+
+    ``update(done, total)`` advances the bar in place (overwriting the same line);
+    ``done()`` finalizes it with the elapsed wall time and a newline. Everything
+    is silent unless ``verbose`` is set. ``done``/``total`` may be floats so a
+    composite step can report a continuous fraction.
+    """
+
+    def __init__(self, label: str, verbose: bool, *, min_interval: float = 0.2):
+        self.label = label
+        self.verbose = verbose
+        self.min_interval = min_interval
+        self.start = time.perf_counter()
+        self._last_t = 0.0
+        self._last_pct = -1
+
+    def update(self, done: float, total: float) -> None:
+        if not self.verbose or total <= 0:
+            return
+        pct = int(max(0.0, min(1.0, done / total)) * 100)
+        now = time.perf_counter()
+        if pct <= self._last_pct or (
+            pct < 100 and now - self._last_t < self.min_interval
+        ):
+            return
+        self._last_pct = pct
+        self._last_t = now
+        print(f"\r  [epilogue] {self.label}: {pct:3d}%",
+              file=sys.stderr, end="", flush=True)
+
+    def done(self) -> None:
+        if not self.verbose:
+            return
+        elapsed = time.perf_counter() - self.start
+        print(f"\r  [epilogue] {self.label}: 100% ({elapsed:.3f}s)",
+              file=sys.stderr, flush=True)
+
+
 def write_outputs(
     result: RunResult,
     out_dir: str | Path,
@@ -1033,113 +1090,116 @@ def write_outputs(
 ) -> Path:
     """Write all raw outputs for ``result`` under ``out_dir`` and return the path.
 
-    When ``verbose`` is set, the elapsed time of each derivation and file-write
-    phase is printed to stderr, so a slow epilogue can be attributed to a specific
-    table (e.g. the timelines or the viz payload).
+    When ``verbose`` is set, each derivation/write step that is expensive enough
+    to matter shows a live progress percentage on stderr (so a slow epilogue can
+    be attributed to a specific table and the process is visibly alive); cheap
+    sub-second steps are written silently.
     """
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-
-    @contextmanager
-    def _phase(label: str):
-        if not verbose:
-            yield
-            return
-        start = time.perf_counter()
-        yield
-        print(f"  [epilogue] {label}: {time.perf_counter() - start:.3f}s",
-              file=sys.stderr, flush=True)
-
     overall = time.perf_counter()
-    with _phase("summarize"):
-        report = summarize(result)
-    with _phase("device_summaries"):
-        devices = device_summaries(result)
-    with _phase("memory_summaries"):
-        memories = memory_summaries(result)
-    with _phase(f"device_timeline ({time_buckets} buckets)"):
-        timeline = device_timeline(result, time_buckets)
-    with _phase(f"memory_timeline ({time_buckets} buckets)"):
-        mem_timeline = memory_timeline(result, time_buckets)
-    with _phase(f"workload_timeline ({time_buckets} buckets)"):
-        work_timeline = workload_timeline(result, time_buckets)
 
-    with _phase("write run_report.json/.txt"):
-        with open(out / "run_report.json", "w", encoding="utf-8") as handle:
-            json.dump(
-                {"run_id": run_id, "report": report, "devices": devices,
-                 "memories": memories},
-                handle, indent=2)
-        with open(out / "run_report.txt", "w", encoding="utf-8") as handle:
-            handle.write(_report_text(report, devices, memories, run_id))
+    def _tracked(label: str, fn):
+        """Run ``fn(progress)`` under a progress bar and return its result."""
 
-    with _phase("write requests.csv"):
-        _write_csv(
-            out / "requests.csv",
-            ["request_id", "arrival_time", "dispatch_time", "first_token_time",
-             "completion_time", "prompt_tokens", "output_tokens", "batch_index",
-             "queue_delay", "latency", "ttft", "tpot", "tps"],
-            _request_rows(result.records),
-        )
-    with _phase(f"write orchestration_decisions.csv ({len(result.decisions)} rows)"):
-        _write_csv(out / "orchestration_decisions.csv", _DECISION_FIELDS,
-                   _decision_rows(result.decisions))
-    with _phase(f"write events_before_rescaling.csv ({len(result.events)} rows)"):
-        _write_csv(out / "events_before_rescaling.csv", _EVENT_FIELDS,
-                   _event_rows(_isolated(result.events)))
-    with _phase(f"write events_after_rescaling.csv ({len(result.events)} rows)"):
-        _write_csv(out / "events_after_rescaling.csv", _EVENT_FIELDS,
-                   _event_rows(_rescaled(result.events)))
-    with _phase("write device_summary.csv"):
-        _write_csv(
-            out / "device_summary.csv",
-            ["device", "node", "peak_flops_fp16", "first_tier_memory",
-             "first_tier_capacity_bytes", "first_tier_bandwidth_bytes_per_s",
-             "busy_fraction", "compute_util", "bandwidth_util",
-             "peak_memory_bytes", "num_transfers", "transfer_bytes",
-             *(f"{state}_fraction" for state in DEVICE_STATES)],
-            devices,
-        )
-    with _phase("write memory_summary.csv"):
-        _write_csv(
-            out / "memory_summary.csv",
-            ["memory", "role", "node", "attached_devices", "capacity_bytes",
-             "bandwidth_bytes_per_s", "busy_fraction", "bandwidth_util",
-             "num_events", "bytes_moved", "peak_memory_bytes", "occupancy_fraction"],
-            memories,
-        )
-    with _phase("write device_timeline.csv"):
-        _write_csv(
-            out / "device_timeline.csv",
-            ["bucket", "time_start", "time_end", "device", "busy_fraction",
-             "memory_bytes", "content_json", "compute_flops_per_s", "compute_seconds",
-             "first_tier_bytes_per_s", "bandwidth_seconds", "transfer_source",
-             "transfer_object", *(f"{state}_fraction" for state in DEVICE_STATES)],
-            [{**row, "content_json": json.dumps(row["content"], sort_keys=True)}
-             for row in timeline],
-        )
-    with _phase("write memory_timeline.csv"):
-        _write_csv(
-            out / "memory_timeline.csv",
-            ["bucket", "time_start", "time_end", "memory", "role", "node",
-             "bandwidth_bytes_per_s", "bandwidth_seconds", "bandwidth_util",
-             "occupancy_bytes", "content_json", "transfer_source", "transfer_object"],
-            [{**row, "content_json": json.dumps(row["content"], sort_keys=True)}
-             for row in mem_timeline],
-        )
-    with _phase("write workload_timeline.csv"):
-        _write_csv(
-            out / "workload_timeline.csv",
-            ["bucket", "time_start", "time_end", "workload", "turn", "sequence",
-             "state", "device", "group", "devices_json"],
-            [{**row, "devices_json": json.dumps(row.get("devices", []))}
-             for row in work_timeline],
-        )
-    with _phase(f"build+write viz.json ({viz_buckets} buckets)"):
-        with open(out / "viz.json", "w", encoding="utf-8") as handle:
-            json.dump(build_viz_payload(result, run_id=run_id, num_buckets=viz_buckets),
-                      handle)
+        bar = _Progress(label, verbose)
+        value = fn(bar.update)
+        bar.done()
+        return value
+
+    # --- derivations (the heavy ones report progress; cheap ones stay silent) ---
+    report = _tracked("summarize", lambda p: summarize(result, progress=p))
+    devices = _tracked("device_summaries",
+                       lambda p: device_summaries(result, progress=p))
+    memories = memory_summaries(result)
+    timeline = _tracked(
+        f"device_timeline ({time_buckets} buckets)",
+        lambda p: device_timeline(result, time_buckets, progress=p))
+    mem_timeline = _tracked(
+        f"memory_timeline ({time_buckets} buckets)",
+        lambda p: memory_timeline(result, time_buckets, progress=p))
+    work_timeline = workload_timeline(result, time_buckets)
+
+    # --- writes (cheap tables written silently) ---------------------------------
+    with open(out / "run_report.json", "w", encoding="utf-8") as handle:
+        json.dump(
+            {"run_id": run_id, "report": report, "devices": devices,
+             "memories": memories},
+            handle, indent=2)
+    with open(out / "run_report.txt", "w", encoding="utf-8") as handle:
+        handle.write(_report_text(report, devices, memories, run_id))
+
+    _write_csv(
+        out / "requests.csv",
+        ["request_id", "arrival_time", "dispatch_time", "first_token_time",
+         "completion_time", "prompt_tokens", "output_tokens", "batch_index",
+         "queue_delay", "latency", "ttft", "tpot", "tps"],
+        _request_rows(result.records),
+    )
+    _write_csv(out / "orchestration_decisions.csv", _DECISION_FIELDS,
+               _decision_rows(result.decisions))
+
+    num_events = len(result.events)
+    _tracked(
+        "write events_before_rescaling.csv",
+        lambda p: _write_csv(
+            out / "events_before_rescaling.csv", _EVENT_FIELDS,
+            _event_rows(_isolated(result.events)), progress=p, total=num_events))
+    _tracked(
+        "write events_after_rescaling.csv",
+        lambda p: _write_csv(
+            out / "events_after_rescaling.csv", _EVENT_FIELDS,
+            _event_rows(_rescaled(result.events)), progress=p, total=num_events))
+
+    _write_csv(
+        out / "device_summary.csv",
+        ["device", "node", "peak_flops_fp16", "first_tier_memory",
+         "first_tier_capacity_bytes", "first_tier_bandwidth_bytes_per_s",
+         "busy_fraction", "compute_util", "bandwidth_util",
+         "peak_memory_bytes", "num_transfers", "transfer_bytes",
+         *(f"{state}_fraction" for state in DEVICE_STATES)],
+        devices,
+    )
+    _write_csv(
+        out / "memory_summary.csv",
+        ["memory", "role", "node", "attached_devices", "capacity_bytes",
+         "bandwidth_bytes_per_s", "busy_fraction", "bandwidth_util",
+         "num_events", "bytes_moved", "peak_memory_bytes", "occupancy_fraction"],
+        memories,
+    )
+    _write_csv(
+        out / "device_timeline.csv",
+        ["bucket", "time_start", "time_end", "device", "busy_fraction",
+         "memory_bytes", "content_json", "compute_flops_per_s", "compute_seconds",
+         "first_tier_bytes_per_s", "bandwidth_seconds", "transfer_source",
+         "transfer_object", *(f"{state}_fraction" for state in DEVICE_STATES)],
+        [{**row, "content_json": json.dumps(row["content"], sort_keys=True)}
+         for row in timeline],
+    )
+    _write_csv(
+        out / "memory_timeline.csv",
+        ["bucket", "time_start", "time_end", "memory", "role", "node",
+         "bandwidth_bytes_per_s", "bandwidth_seconds", "bandwidth_util",
+         "occupancy_bytes", "content_json", "transfer_source", "transfer_object"],
+        [{**row, "content_json": json.dumps(row["content"], sort_keys=True)}
+         for row in mem_timeline],
+    )
+    _write_csv(
+        out / "workload_timeline.csv",
+        ["bucket", "time_start", "time_end", "workload", "turn", "sequence",
+         "state", "device", "group", "devices_json"],
+        [{**row, "devices_json": json.dumps(row.get("devices", []))}
+         for row in work_timeline],
+    )
+
+    payload = _tracked(
+        f"build+write viz.json ({viz_buckets} buckets)",
+        lambda p: build_viz_payload(
+            result, run_id=run_id, num_buckets=viz_buckets, progress=p))
+    with open(out / "viz.json", "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
     if config is not None:
         with open(out / "config.json", "w", encoding="utf-8") as handle:
             json.dump(dict(config), handle, indent=2)
@@ -1152,6 +1212,7 @@ def write_outputs(
 
 def build_viz_payload(
     result: RunResult, *, run_id: str = "run", num_buckets: int = 256,
+    progress: Callable[[float, float], None] | None = None,
 ) -> dict[str, Any]:
     """Bundle every GUI-ready series into one JSON-serializable payload.
 
@@ -1161,14 +1222,31 @@ def build_viz_payload(
     device, memory and workload timelines.
     """
 
+    def _sub(base: float, weight: float) -> Callable[[float, float], None] | None:
+        # Scale a sub-step's own progress into ``[base, base + weight]`` of the
+        # whole payload, so the caller sees one continuous percentage.
+        if progress is None:
+            return None
+        return lambda done, total: progress(
+            base + weight * (done / total if total else 1.0), 1.0)
+
+    summary = summarize(result, progress=_sub(0.00, 0.35))
+    devices = device_summaries(result, progress=_sub(0.35, 0.30))
+    memories = memory_summaries(result)
+    dev_timeline = device_timeline(result, num_buckets, progress=_sub(0.65, 0.23))
+    mem_timeline = memory_timeline(result, num_buckets, progress=_sub(0.88, 0.10))
+    work_timeline = workload_timeline(result, num_buckets)
+    if progress is not None:
+        progress(1.0, 1.0)
+
     return {
         "run_id": run_id,
         "makespan_s": result.makespan or 0.0,
         "num_buckets": num_buckets,
-        "summary": summarize(result),
-        "devices": device_summaries(result),
-        "memories": memory_summaries(result),
-        "device_timeline": device_timeline(result, num_buckets),
-        "memory_timeline": memory_timeline(result, num_buckets),
-        "workload_timeline": workload_timeline(result, num_buckets),
+        "summary": summary,
+        "devices": devices,
+        "memories": memories,
+        "device_timeline": dev_timeline,
+        "memory_timeline": mem_timeline,
+        "workload_timeline": work_timeline,
     }
