@@ -653,18 +653,20 @@ function drawWlEdge(ctx, x0, y0, x1, y1, color) {
   ctx.fillStyle = stroke;
   ctx.lineWidth = 3;
   ctx.lineCap = "round";
-  const mx = (x0 + x1) / 2;
+  // Horizontal tangents at both ends: every edge leaves the source's right side
+  // heading right and approaches the target's left side heading right, so the
+  // picture reads consistently regardless of relative position.
+  const reach = Math.max(24, Math.abs(x1 - x0) * 0.4);
   ctx.beginPath();
   ctx.moveTo(x0, y0);
-  ctx.bezierCurveTo(mx, y0, mx, y1, x1, y1);
+  ctx.bezierCurveTo(x0 + reach, y0, x1 - reach, y1, x1, y1);
   ctx.stroke();
-  // Arrowhead at the target end.
-  const ang = Math.atan2(y1 - y0, x1 - mx);
+  // Arrowhead entering the target's left side, pointing right.
   const a = 8;
   ctx.beginPath();
   ctx.moveTo(x1, y1);
-  ctx.lineTo(x1 - a * Math.cos(ang - 0.5), y1 - a * Math.sin(ang - 0.5));
-  ctx.lineTo(x1 - a * Math.cos(ang + 0.5), y1 - a * Math.sin(ang + 0.5));
+  ctx.lineTo(x1 - a, y1 - a * 0.6);
+  ctx.lineTo(x1 - a, y1 + a * 0.6);
   ctx.closePath();
   ctx.fill();
 }

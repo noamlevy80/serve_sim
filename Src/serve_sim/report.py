@@ -904,13 +904,13 @@ def workload_graph(result: RunResult) -> dict[str, Any]:
     turn's completion and the next turn's arrival. Edges run from the sequence
     whose cached KV prefix was reused to the sequence that reused it; reuse within
     one conversation is implied and left undrawn, so only cross-workload links
-    appear. Because the shared prefix is a run of leading messages that each
-    conversation already carries from its first turn, a cross-conversation link is
-    anchored at both turn-0 input nodes and drawn once rather than repeated at
-    every later turn that re-fetches the same inherited prefix. Workloads occupy
-    stacked horizontal lanes ordered by arrival, and each node carries logical
-    ``t0``/``t1`` (time) and ``lane``/``sub`` (vertical) coordinates the renderer
-    maps to pixels.
+    appear. A cross-conversation link is anchored at the source's turn-0 input
+    node (the leading-message prefix it already holds from its start) and at the
+    turn where the reuse actually fired in the reusing conversation, and is drawn
+    once at its earliest occurrence -- never earlier than the borrow, so arrows
+    never point backwards in time. Workloads occupy stacked horizontal lanes
+    ordered by arrival, and each node carries logical ``t0``/``t1`` (time) and
+    ``lane``/``sub`` (vertical) coordinates the renderer maps to pixels.
     """
 
     makespan = result.makespan or 0.0
@@ -986,7 +986,7 @@ def workload_graph(result: RunResult) -> dict[str, Any]:
 
     # Edges: KV-prefix reuse, directed existing-KV -> reusing sequence. Within one
     # conversation reuse is implied, so only cross-workload links are drawn.
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[int, int]] = set()
     edges: list[dict[str, str]] = []
     for d in result.decisions:
         if d.kind != "kv_reuse":
@@ -995,18 +995,18 @@ def workload_graph(result: RunResult) -> dict[str, Any]:
             continue
         if d.source_workload_id == d.workload_id:
             continue
-        # The shared prefix is a run of leading messages, so it is present in both
-        # conversations from their very first turn and is carried forward along
-        # each lane implicitly. Anchor the cross-conversation link at both turn-0
-        # input nodes and draw it once, rather than redrawing it at every later
-        # turn that merely re-fetches the same already-inherited prefix.
+        # The borrow can only happen once the source has run, so anchor the link
+        # at the turn where the reuse actually fired (never earlier, or the arrow
+        # would point backwards in time). The source supplies a leading-message
+        # prefix it already holds from its first turn, so anchor that end at the
+        # source's turn 0. Decisions are chronological, so keeping the first per
+        # conversation pair draws the link once, at its earliest occurrence.
         src = (node_by_seq.get((d.source_workload_id, 0))
                or node_by_seq.get((d.source_workload_id, d.source_turn_index)))
-        dst = (node_by_seq.get((d.workload_id, 0))
-               or node_by_request.get(d.request_id))
+        dst = node_by_request.get(d.request_id)
         if not src or not dst or src == dst:
             continue
-        key = (src, dst)
+        key = (d.source_workload_id, d.workload_id)
         if key in seen:
             continue
         seen.add(key)
