@@ -33,6 +33,7 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Sequence
 
 from .arbiter import IncrementalArbiter
+from .device_memory import DeviceHbmResidency, MemoryPolicy
 from .events import ComputeEvent, EventGenerator
 from .parallelism import ParallelismPlanner
 from .pdd import context_kv_bytes, kv_transfer_duration, split_work
@@ -130,6 +131,20 @@ class StrategyConfig:
             transfers, and evicts least-recently-used whole sequences when the
             floating pool is full. When ``False`` only the previous-turn reuse of
             the same conversation applies. Inert on systems with no node memory.
+        memory_policy: How a completed sequence's KV is retained and where reuse
+            fetches it from. ``"node_first"`` (default, legacy) offloads every
+            completed KV straight to node memory and re-fetches it from there on
+            reuse. The device-first policies instead keep KV resident on the
+            serving device's first-tier HBM, so a same-device reuse costs no
+            transfer and a cross-device reuse moves the KV device-to-device; node
+            memory is used only as a spill tier when HBM is full. ``"global_lru"``
+            lets retained KV and resident routed experts compete in one LRU over
+            the device's dynamic HBM; ``"partitioned"`` reserves a KV sub-region
+            and an expert sub-region (see ``hbm_kv_fraction``), each LRU-managed
+            in isolation.
+        hbm_kv_fraction: Under ``memory_policy="partitioned"``, the fraction of a
+            device's dynamic HBM region reserved for retained KV (the remainder is
+            the routed-expert region). Ignored by the other policies.
     """
 
     max_batch_size: int = 1
@@ -146,6 +161,8 @@ class StrategyConfig:
     event_random_factor_range: float = 0.0
     random_seed: int | None = None
     global_kv_cache: bool = True
+    memory_policy: str = "node_first"
+    hbm_kv_fraction: float = 0.5
 
     def __post_init__(self) -> None:
         if self.max_batch_size < 1:
@@ -164,6 +181,12 @@ class StrategyConfig:
             raise ValueError("prefill_engine_fraction must be in (0, 1)")
         if not 0.0 <= self.event_random_factor_range < 1.0:
             raise ValueError("event_random_factor_range must be in [0, 1)")
+        if self.memory_policy not in ("node_first", "global_lru", "partitioned"):
+            raise ValueError(
+                "memory_policy must be 'node_first', 'global_lru' or 'partitioned'"
+            )
+        if not 0.0 < self.hbm_kv_fraction < 1.0:
+            raise ValueError("hbm_kv_fraction must be in (0, 1)")
 
 
 @dataclass(frozen=True)
@@ -662,7 +685,41 @@ class Simulator:
         # System-wide persistent KV cache (cross-conversation prefix reuse, LRU
         # eviction, migration across floating memories). Inert when disabled or
         # when the system has no floating (node) memory to offload KV into.
-        self._kv = KVCacheManager(system) if self.strategy.global_kv_cache else None
+        # Per-device first-tier HBM residency, shared between retained KV and
+        # resident routed experts under the chosen memory policy. Empty (and
+        # unused) under the legacy ``node_first`` policy.
+        self._hbm: dict[int, DeviceHbmResidency] = self._build_hbm()
+        self._kv = (
+            KVCacheManager(system, self.strategy.memory_policy, self._hbm)
+            if self.strategy.global_kv_cache
+            else None
+        )
+
+    def _build_hbm(self) -> dict[int, "DeviceHbmResidency"]:
+        """Per compute device, the HBM residency for retained KV and experts.
+
+        Returns an empty map under the legacy ``node_first`` policy (no device
+        retention). Otherwise each device gets a residency sized to its first-tier
+        capacity, governed by the configured policy (one shared LRU under
+        ``global_lru``; reserved KV/expert sub-regions under ``partitioned``).
+        """
+
+        policy = self.strategy.memory_policy
+        if policy == "node_first":
+            return {}
+        mode = (
+            MemoryPolicy.PARTITIONED
+            if policy == "partitioned"
+            else MemoryPolicy.GLOBAL_LRU
+        )
+        hbm: dict[int, DeviceHbmResidency] = {}
+        for device in self.system.compute_devices:
+            hbm[id(device)] = DeviceHbmResidency(
+                device.first_tier_memory.capacity_bytes,
+                mode,
+                self.strategy.hbm_kv_fraction,
+            )
+        return hbm
 
     def _planner_for(self, model: object) -> ParallelismPlanner:
         key = id(model)
@@ -883,7 +940,7 @@ class Simulator:
                     break  # concurrency full; wait for a completion
                 in_flight += len(batch)
                 matches: dict[int, Match] = {}
-                kv_fetches: list[tuple[object, float]] | None = None
+                kv_fetches: list[tuple[object, float, object]] | None = None
                 if self._kv_active:
                     batch, matches = self._resolve_kv(batch, now)
                     kv_fetches = self._kv_fetches(batch, matches)
@@ -900,7 +957,7 @@ class Simulator:
                     match = matches.get(id(req))
                     if match is not None:
                         self._emit_kv_reuse(
-                            result, req, match, device_names, batch_index, now)
+                            result, req, match, slot, batch_index, now)
                     elif req.cached_tokens > 0:
                         result.decisions.append(_decision(
                             now, "kv_reuse", req, device_names, batch_index,
@@ -1110,7 +1167,7 @@ class Simulator:
                     break  # concurrency full; wait for a decode completion
                 in_flight += len(batch)
                 matches: dict[int, Match] = {}
-                kv_fetches: list[tuple[object, float]] | None = None
+                kv_fetches: list[tuple[object, float, object]] | None = None
                 if self._kv_active:
                     batch, matches = self._resolve_kv(batch, now)
                     kv_fetches = self._kv_fetches(batch, matches)
@@ -1130,7 +1187,7 @@ class Simulator:
                     match = matches.get(id(req))
                     if match is not None:
                         self._emit_kv_reuse(
-                            result, req, match, device_names, batch_index, now)
+                            result, req, match, slot, batch_index, now)
                     elif req.cached_tokens > 0:
                         result.decisions.append(_decision(
                             now, "kv_reuse", req, device_names, batch_index,
@@ -1567,7 +1624,7 @@ class Simulator:
         *,
         pool: EnginePool | None = None,
         phase: str = "full",
-        kv_fetches: list[tuple[object, float]] | None = None,
+        kv_fetches: list[tuple[object, float, object]] | None = None,
         result: "RunResult | None" = None,
         now: float = 0.0,
         batch_index: int = -1,
@@ -1634,6 +1691,20 @@ class Simulator:
             event_random_factor_range=self.strategy.event_random_factor_range,
             rng=self._rng,
         )
+        # Device-first policies keep routed experts resident on each rank's HBM
+        # across batches (sharing the pool with retained KV). The residency for
+        # ep rank ``r`` lives on that rank's stage-0 device (``r * tp``); a model
+        # swap on a device clears its experts (new weights overwrite them).
+        expert_residency = None
+        expert_index_bytes = None
+        if expert_trace is not None and self._hbm:
+            if placement.needs_weight_load:
+                for device in slot.devices:
+                    self._hbm[id(device)].clear_experts()
+            expert_index_bytes = generator.routed_expert_bytes_per_index / tp
+            expert_residency = [
+                self._hbm[id(slot.devices[r * tp])] for r in range(ep)
+            ]
         loads: list[ComputeEvent] = []
         if self.strategy.model_weight_loading and placement.needs_weight_load:
             loads = self._weight_load_events(model, slot, pp, ep, tp, home)
@@ -1649,7 +1720,14 @@ class Simulator:
                 expert_cache_capacity=expert_cap,
                 expert_source=expert_source,
                 expert_fetch_latency=expert_latency,
+                expert_residency=expert_residency,
+                expert_index_bytes=expert_index_bytes,
+                expert_now=now,
             )
+            if schedule.expert_evicted_kv and self._kv is not None:
+                self._reconcile_expert_kv_eviction(
+                    arbiter, slot, schedule.expert_evicted_kv,
+                    now, result, batch_index)
             if result is not None and expert_trace is not None:
                 self._emit_expert_decisions(
                     result, batch, slot, schedule, now, batch_index, expert_source.name)
@@ -1903,35 +1981,49 @@ class Simulator:
 
     def _kv_fetches(
         self, batch: list[Request], matches: dict[int, Match]
-    ) -> list[tuple[object, float]]:
-        """``(floating_memory, bytes)`` to fetch for each reused prefix in a batch."""
+    ) -> list[tuple[object, float, object]]:
+        """``(source_memory, bytes, source_device)`` for each reused prefix.
 
-        fetches: list[tuple[object, float]] = []
+        ``source_device`` is the compute device whose HBM holds the prefix under a
+        device-first policy, or ``None`` when it lives in node memory.
+        """
+
+        fetches: list[tuple[object, float, object]] = []
         for req in batch:
             match = matches.get(id(req))
             if match is not None and req.cached_tokens > 0:
                 num_bytes = float(context_kv_bytes(req.model, req.cached_tokens))
-                fetches.append((match.entry.memory, num_bytes))
+                fetches.append((match.entry.memory, num_bytes, match.entry.device))
         return fetches
 
     def _kv_fetch_events(
-        self, slot: EngineSlot, fetches: list[tuple[object, float]]
+        self, slot: EngineSlot, fetches: list[tuple[object, float, object]]
     ) -> list[ComputeEvent]:
-        """Transfer events that fetch reused prefixes from floating memory.
+        """Transfer events that fetch reused prefixes into the serving slot.
 
-        Each ``(floating_memory, bytes)`` becomes one ``transfer`` event reading
-        the cached prefix into a slot device's first-tier memory (round-robined
-        across the slot so several fetches parallelise). The link latency is
-        folded into ``bandwidth_time`` so the arbiter reproduces the duration
-        while contending the floating memory's bandwidth against all other
-        in-flight transfers; the batch's compute waits on the fetch.
+        Each ``(source_memory, bytes, source_device)`` becomes one ``transfer``
+        event reading the cached prefix into a slot device's first-tier memory
+        (round-robined across the slot so several fetches parallelise). A prefix
+        whose KV already resides on one of the slot's own devices needs no fetch
+        (it is in place), so it is skipped. The link latency is folded into
+        ``bandwidth_time`` so the arbiter reproduces the duration while contending
+        the source memory's bandwidth against all other in-flight transfers; the
+        batch's compute waits on the fetch.
         """
 
         events: list[ComputeEvent] = []
         num_devices = len(slot.devices)
-        for index, (source, num_bytes) in enumerate(fetches):
+        for index, (source, num_bytes, source_device) in enumerate(fetches):
+            # Same-slot residency: the prefix is already on a serving device's HBM,
+            # so reuse is in place with no transfer.
+            if source_device is not None and any(
+                source_device is d for d in slot.devices
+            ):
+                continue
             slot_index = index % num_devices
             destination = slot.devices[slot_index].first_tier_memory
+            if id(source) == id(destination):
+                continue
             link = self.system.link_between(source, destination)
             duration = transfer_duration(num_bytes, source, destination, link)
             events.append(
@@ -1956,17 +2048,20 @@ class Simulator:
         result: RunResult,
         req: Request,
         match: Match,
-        device_names: tuple[str, ...],
+        slot: EngineSlot,
         batch_index: int,
         now: float,
     ) -> None:
-        """Record the ``kv_reuse`` + ``kv_transfer`` decisions for a prefix hit.
+        """Record the ``kv_reuse`` (and, unless in place, ``kv_transfer``) decisions.
 
-        The reuse names the source sequence (its conversation/turn) and the
-        floating memory holding the prefix; the transfer is the physical fetch of
-        that prefix into the serving devices.
+        The reuse names the source sequence (its conversation/turn) and the memory
+        holding the prefix. A fetch ``kv_transfer`` is recorded only when the
+        prefix must be moved into the serving devices; a prefix already resident on
+        one of the slot's own devices (device-first in-place reuse) needs no move,
+        so only the reuse is recorded.
         """
 
+        device_names = tuple(d.name for d in slot.devices)
         source_memory = (match.entry.memory.name,)
         result.decisions.append(_decision(
             now, "kv_reuse", req, source_memory, batch_index,
@@ -1974,6 +2069,11 @@ class Simulator:
             source_workload_id=match.entry.workload_id,
             source_turn_index=match.entry.turn_index,
             source_devices=device_names))
+        in_place = match.entry.device is not None and any(
+            match.entry.device is d for d in slot.devices
+        )
+        if in_place:
+            return
         result.decisions.append(_decision(
             now, "kv_transfer", req, device_names, batch_index,
             tokens=req.cached_tokens,
@@ -1990,31 +2090,95 @@ class Simulator:
         result: RunResult,
         batch_index: int,
     ) -> None:
-        """Offload a finished sequence's KV to floating memory; record decisions.
+        """Retain a finished sequence's KV; record the resulting decisions.
 
-        Stores the full context (prompt + generated) KV in the global cache,
-        evicting LRU entries if the floating pool is full, and admits an
-        arbiter-accounted ``transfer`` for the device->floating move (so its
-        bandwidth contends with concurrent work). Emits a ``kv_eviction`` decision
-        per evicted entry and a ``kv_transfer`` decision for the offload.
+        Under ``node_first`` the KV is offloaded to a floating node memory and an
+        arbiter-accounted device->floating ``transfer`` is admitted (so its
+        bandwidth contends with concurrent work). Under a device-first policy the
+        KV stays on the serving device's HBM with no offload transfer; instead any
+        residents that retention spilled off HBM are moved device->node here. A
+        ``kv_eviction`` decision is emitted per entry dropped entirely, and a
+        ``kv_transfer`` decision per physical move.
         """
 
         context_tokens = req.prompt_tokens + req.output_tokens
         store = self._kv.store(
             req.model, req.tracker, req.workload_id, req.turn_index,
-            context_tokens, now,
+            context_tokens, now, device=slot.devices[0],
         )
         for victim in store.evicted:
             result.decisions.append(self._eviction_decision(now, victim))
+        # Residents spilled off HBM to make room are physically moved down to node
+        # memory (charged against the spilling, not the retired request). They were
+        # evicted from the storing device's own KV region, so its first tier is the
+        # source of each spill move.
+        for spilled in store.spilled:
+            self._admit_kv_move(
+                arbiter, slot.devices[0], spilled.memory, spilled.num_bytes)
+            result.decisions.append(_decision(
+                now, "kv_transfer", req, (spilled.memory.name,), batch_index,
+                tokens=spilled.context_tokens,
+                source_workload_id=spilled.workload_id,
+                source_turn_index=spilled.turn_index,
+                source_devices=(slot.devices[0].name,),
+                bytes_moved=spilled.num_bytes))
         if store.memory is None:
             return
         device_names = tuple(d.name for d in slot.devices)
-        self._admit_kv_move(arbiter, slot.devices[0], store.memory, store.num_bytes)
+        # A device-first retention keeps the KV on the producing device's own HBM
+        # -- it is already there, so no offload transfer is charged.
+        retained_on_device = store.memory is slot.devices[0].first_tier_memory and (
+            id(slot.devices[0]) in self._hbm
+        )
+        if not retained_on_device:
+            self._admit_kv_move(arbiter, slot.devices[0], store.memory, store.num_bytes)
         result.decisions.append(_decision(
             now, "kv_transfer", req, (store.memory.name,), batch_index,
             tokens=context_tokens, source_request_id=req.request_id,
             source_workload_id=req.workload_id, source_turn_index=req.turn_index,
             source_devices=device_names, bytes_moved=store.num_bytes))
+
+    def _reconcile_expert_kv_eviction(
+        self,
+        arbiter: IncrementalArbiter,
+        slot: EngineSlot,
+        residents: list,
+        now: float,
+        result: "RunResult | None",
+        batch_index: int,
+    ) -> None:
+        """Spill KV that this dispatch's expert admissions evicted off HBM.
+
+        Under ``global_lru`` routed experts and retained KV share a device's pool,
+        so making an expert resident can evict the least-recently-used KV. That KV
+        is only stored on the slot's lead device, so each spill is a lead-device ->
+        node move (or a drop if the node pool is full). Records the resulting
+        ``kv_transfer`` / ``kv_eviction`` decisions.
+        """
+
+        spilled, dropped = self._kv.spill_residents(residents, now)
+        source_device = slot.devices[0]
+        for entry in spilled:
+            self._admit_kv_move(arbiter, source_device, entry.memory, entry.num_bytes)
+        if result is None:
+            return
+        for entry in spilled:
+            result.decisions.append(DecisionRecord(
+                time=now,
+                kind="kv_transfer",
+                request_id=-1,
+                workload_id=entry.workload_id,
+                turn_index=entry.turn_index,
+                model=getattr(entry.model, "name", "model"),
+                devices=(entry.memory.name,),
+                batch_index=batch_index,
+                tokens=entry.context_tokens,
+                source_workload_id=entry.workload_id,
+                source_turn_index=entry.turn_index,
+                source_devices=(source_device.name,),
+                bytes_moved=entry.num_bytes))
+        for entry in dropped:
+            result.decisions.append(self._eviction_decision(now, entry))
 
     def _admit_kv_move(
         self,

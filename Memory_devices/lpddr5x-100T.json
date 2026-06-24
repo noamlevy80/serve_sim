@@ -1,0 +1,7 @@
+{
+  "name": "LPDDR5X 100TB",
+  "source": "Fictional",
+  "capacity_bytes": 100e12,
+  "bandwidth_bytes_per_s": 5.12e11,
+  "notes": "A 100TB memory pool with LPDDR5X bandwidth."
+}

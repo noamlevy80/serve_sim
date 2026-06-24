@@ -161,6 +161,8 @@ def _strategy_from_config(cfg: Mapping[str, Any]) -> StrategyConfig:
         event_random_factor_range=float(cfg.get("event_random_factor_range", 0.05)),
         random_seed=cfg.get("random_seed"),
         global_kv_cache=bool(cfg.get("global_kv_cache", True)),
+        memory_policy=str(cfg.get("memory_policy", "node_first")),
+        hbm_kv_fraction=float(cfg.get("hbm_kv_fraction", 0.5)),
     )
 
 

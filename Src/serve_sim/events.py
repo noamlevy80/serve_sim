@@ -39,9 +39,40 @@ import random
 from dataclasses import dataclass, field
 
 from .blocks import LayeredModel
+from .device_memory import DeviceHbmResidency
 from .hardware import ComputeDevice, MemoryDevice
 from .shards import WorkShard
 from .tiering import ExpertResidencyCache, GroupActivation
+
+
+class _RankExpertResidency:
+    """Per-ep-rank view over a device's persistent HBM residency.
+
+    Adapts a shared :class:`DeviceHbmResidency` (which survives across batches and
+    competes routed experts against retained KV) to the per-group
+    ``access_detail(active) -> (missed, evicted)`` protocol the event generator
+    uses for the legacy per-batch :class:`ExpertResidencyCache`. KV evicted by an
+    expert admission is accumulated in :attr:`evicted_kv` for the orchestrator to
+    spill to node memory.
+    """
+
+    def __init__(
+        self, residency: DeviceHbmResidency, index_bytes: float, now: float
+    ) -> None:
+        self._residency = residency
+        self._index_bytes = index_bytes
+        self._now = now
+        self.evicted_kv: list = []
+
+    def access_detail(
+        self, active: frozenset[int]
+    ) -> tuple[list[int], list[int]]:
+        missed, evicted_experts, evicted_kv = self._residency.access_experts(
+            active, self._index_bytes, self._now
+        )
+        self.evicted_kv.extend(evicted_kv)
+        return missed, evicted_experts
+
 
 
 @dataclass(frozen=True)
@@ -92,6 +123,9 @@ class EventSchedule:
     expert_experts_loaded: int = 0
     #: Total number of expert indices the residency LRU evicted.
     expert_evictions: int = 0
+    #: KV residents evicted from a device's HBM by expert admissions (only under
+    #: the shared global-LRU policy); the orchestrator spills these to node memory.
+    expert_evicted_kv: list = field(default_factory=list)
 
     @property
     def makespan(self) -> float:
@@ -158,6 +192,16 @@ class EventGenerator:
             ffn.routed_expert_params for ffn in model.moe_ffns()
         ) * model.param_dtype_bytes
 
+    @property
+    def routed_expert_bytes_per_index(self) -> float:
+        """HBM footprint of one routed-expert index (its weights across MoE layers).
+
+        This is the model-wide cost of making one expert index resident; under
+        tensor parallelism each device holds a ``1/tensor_parallel`` shard of it.
+        """
+
+        return self._moe_routed_bytes_per_miss
+
     def _device_index(self, stage: int, ep_rank: int, tp_rank: int = 0) -> int:
         """Grid device for a (pipeline stage, expert rank, tensor rank) triple.
 
@@ -200,6 +244,9 @@ class EventGenerator:
         expert_cache_capacity: int | None = None,
         expert_source: MemoryDevice | None = None,
         expert_fetch_latency: float = 0.0,
+        expert_residency: list[DeviceHbmResidency] | None = None,
+        expert_index_bytes: float | None = None,
+        expert_now: float = 0.0,
     ) -> EventSchedule:
         """Consolidate shards into events and time them.
 
@@ -218,6 +265,15 @@ class EventGenerator:
         indices are assumed identical across the whole model, so a fetch for an
         index moves that expert's weights from every MoE layer at once and the
         per-fetch byte count is independent of the pipeline/tensor split.
+
+        When ``expert_residency`` is given (one persistent
+        :class:`DeviceHbmResidency` per ep rank, sharing each device's HBM with
+        retained KV under a device-first policy) the routed experts stay resident
+        *across batches*, so a later batch on the same device reuses them instead
+        of re-fetching; ``expert_index_bytes`` is the per-index HBM footprint and
+        ``expert_now`` the recency stamp. Otherwise a fresh per-batch
+        :class:`ExpertResidencyCache` of ``expert_cache_capacity`` indices is used
+        (the legacy behaviour).
         """
 
         schedule = EventSchedule()
@@ -231,11 +287,11 @@ class EventGenerator:
             and self.model.num_moe_layers > 0
             and (expert_source is not None or self.devices[0].second_tier_memory is not None)
         )
-        caches: list[ExpertResidencyCache] = []
+        caches: list = []
         trace_by_group: dict[int, GroupActivation] = {}
         shared_tier2 = False
         if streaming:
-            if expert_cache_capacity is None:
+            if expert_residency is None and expert_cache_capacity is None:
                 raise ValueError(
                     "expert_cache_capacity is required for expert streaming"
                 )
@@ -255,7 +311,22 @@ class EventGenerator:
                     )
                 tier2_ids = {id(self.devices[r].second_tier_memory) for r in range(ep)}
                 shared_tier2 = ep > 1 and len(tier2_ids) == 1
-            caches = [ExpertResidencyCache(expert_cache_capacity) for _ in range(ep)]
+            if expert_residency is not None:
+                if expert_index_bytes is None:
+                    raise ValueError(
+                        "expert_index_bytes is required with expert_residency"
+                    )
+                if len(expert_residency) != ep:
+                    raise ValueError(
+                        "expert_residency must have one entry per expert-parallel "
+                        f"rank ({ep}); got {len(expert_residency)}"
+                    )
+                caches = [
+                    _RankExpertResidency(expert_residency[r], expert_index_bytes, expert_now)
+                    for r in range(ep)
+                ]
+            else:
+                caches = [ExpertResidencyCache(expert_cache_capacity) for _ in range(ep)]
             trace_by_group = {g.group_index: g for g in expert_trace}
 
         # Preserve group order; bucket shards by group, then by pipeline stage.
@@ -345,6 +416,10 @@ class EventGenerator:
                         stage_end = max(stage_end, event.end)
                         schedule.events.append(event)
                 clock = stage_end
+
+        if expert_residency is not None:
+            for cache in caches:
+                schedule.expert_evicted_kv.extend(cache.evicted_kv)
 
         return schedule
 

@@ -1,6 +1,6 @@
 {
   "run_id": null,
-  "system": "../Systems/dual-node-b200.json",
+  "system": "../Systems/b200-8-nodes.json",
   "models_dir": "../Models",
   "tokenizer": "tiktoken",
   "output_root": "Outputs",
@@ -16,30 +16,34 @@
     "name": "Example short randomized suite",
     "description": "Draws a handful of random multi-turn workloads from the cached source dataset and assigns each a model at random, for a quick end-to-end run.",
     "type": "randomized",
-    "num_workloads": 4,
-    "models": ["deepseek-v3.2", "gemma-4-31b", "nemotron-3-ultra"]
+    "num_workloads": 32,
+    "models": ["gemma-4-31b"]
   },
 
-  "max_batch_size": 8,
-  "max_concurrency": 4,
+  "max_batch_size": 4,
+  "max_concurrency": null,
   "concurrency_window_sec": 0.5,
 
-  "allow_pdd": true,
+  "allow_pdd": false,
   "prefill_engine_fraction": 0.5,
 
   "model_weight_loading": true,
 
-  "auto_parallelism": false,
-  "pipeline_parallel": 1,
+  "memory_policy": "global_lru",
+  "hbm_kv_fraction": 0.5,
+
+  "auto_parallelism": true,
+  "pipeline_parallel": 2,
   "expert_parallel": 1,
-  "tensor_parallel": 1,
-  "max_parallelism": 32,
+  "tensor_parallel": 2,
+  "max_parallelism": 24,
 
   "prefill_chunk_size": null,
   "event_random_factor_range": 0.05,
-  "arrival_interval_sec": 0.25,
+  "arrival_interval_sec": 0.1,
+  "arrival_variance_sec2": 0.001,
   "max_turns_per_workload": 4,
 
-  "report_time_buckets": 64,
+  "report_time_buckets": 256,
   "random_seed": 7
 }

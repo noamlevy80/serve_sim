@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .device_memory import DeviceHbmResidency, MemoryPolicy
 from .hardware import MemoryDevice
 from .pdd import context_kv_bytes
 from .system import System
@@ -34,7 +35,7 @@ from .system import System
 
 @dataclass
 class KVEntry:
-    """One stored sequence's KV cache, resident in a floating memory.
+    """One stored sequence's KV cache, resident in a floating or device memory.
 
     Attributes:
         workload_id: Source conversation identifier.
@@ -42,8 +43,11 @@ class KVEntry:
         model: The model the KV belongs to (entries of other models never match).
         tracker: The sequence tracker, used for message-aligned prefix matching.
         context_tokens: Full context length (prompt + generated) the KV covers.
-        num_bytes: Floating-memory footprint of the stored KV.
-        memory: The floating memory currently holding the entry.
+        num_bytes: Memory footprint of the stored KV.
+        memory: The memory currently holding the entry (a device first-tier HBM
+            under a device-first policy, else a floating node memory).
+        device: The compute device whose HBM holds the entry, or ``None`` when it
+            lives in a floating node memory.
         last_use: Simulation time of the most recent store or reuse (for LRU).
     """
 
@@ -55,6 +59,7 @@ class KVEntry:
     num_bytes: float
     memory: MemoryDevice
     last_use: float
+    device: object | None = None
 
 
 @dataclass(frozen=True)
@@ -69,22 +74,35 @@ class Match:
 class StoreResult:
     """Outcome of storing one sequence's KV.
 
-    ``memory`` is the floating memory the entry landed on (``None`` if the KV
-    could not be stored at all, e.g. no floating memory or it exceeds capacity);
-    ``num_bytes`` is the entry's floating footprint; ``evicted`` lists the entries
-    dropped (LRU) to make room.
+    ``memory`` is the memory the entry landed on (``None`` if the KV could not be
+    stored at all, e.g. no floating memory or it exceeds capacity); ``num_bytes``
+    is the entry's footprint; ``evicted`` lists entries dropped entirely (the node
+    pool was full); ``spilled`` lists entries pushed off device HBM down to a node
+    memory to make room (each carries its new memory in ``KVEntry.memory``).
     """
 
     memory: MemoryDevice | None
     num_bytes: float
     evicted: tuple[KVEntry, ...]
+    spilled: tuple[KVEntry, ...] = ()
 
 
 class KVCacheManager:
     """System-wide persistent KV cache with prefix reuse, migration and LRU."""
 
-    def __init__(self, system: System) -> None:
+    def __init__(
+        self,
+        system: System,
+        policy: str = "node_first",
+        hbm: dict[int, DeviceHbmResidency] | None = None,
+    ) -> None:
         self.system = system
+        self.policy = policy
+        # Per-device first-tier HBM residency, shared with the expert path so
+        # retained KV and resident experts contend under the chosen policy. Only
+        # populated for the device-first policies; ``node_first`` leaves it empty
+        # and behaves exactly as the legacy offload-to-node cache.
+        self._hbm = hbm if hbm is not None else {}
         # The floating pool: every node's CPU-managed memory (deduplicated by
         # identity). Device first-tier memory and the input NVM are excluded.
         floating: list[MemoryDevice] = []
@@ -99,10 +117,14 @@ class KVCacheManager:
         self._entries: list[KVEntry] = []
 
     @property
-    def enabled(self) -> bool:
-        """Whether there is any floating memory to hold KV (else inert)."""
+    def _device_first(self) -> bool:
+        return self.policy != "node_first" and bool(self._hbm)
 
-        return bool(self._floating)
+    @property
+    def enabled(self) -> bool:
+        """Whether there is anywhere to hold KV (node pool or device HBM)."""
+
+        return bool(self._floating) or bool(self._hbm)
 
     @property
     def entries(self) -> tuple[KVEntry, ...]:
@@ -112,6 +134,19 @@ class KVCacheManager:
         """Stored-KV bytes currently resident on ``memory``."""
 
         return self._used.get(id(memory), 0.0)
+
+    def spill_residents(self, residents, now: float) -> tuple[tuple[KVEntry, ...], tuple[KVEntry, ...]]:
+        """Spill KV that another tenant (e.g. experts) evicted off a device.
+
+        ``residents`` are the device-pool residents the expert path already
+        removed from HBM; each is migrated down to node memory (evicting node LRU
+        if the pool is full). Returns ``(spilled, dropped)`` :class:`KVEntry`
+        tuples -- those relocated to node and those that could not fit and were
+        dropped entirely.
+        """
+
+        spilled, dropped = self._spill_evicted(residents, now)
+        return tuple(spilled), tuple(dropped)
 
     # --- admission ----------------------------------------------------------
 
@@ -124,7 +159,7 @@ class KVCacheManager:
         nothing shares a prefix or KV reuse is inert.
         """
 
-        if not self._floating or tracker is None or getattr(tracker, "messages", None) is None:
+        if not self.enabled or tracker is None or getattr(tracker, "messages", None) is None:
             return None
         best: KVEntry | None = None
         best_len = 0
@@ -138,6 +173,8 @@ class KVCacheManager:
         if best is None or best_len <= 0:
             return None
         best.last_use = now
+        if best.device is not None and id(best.device) in self._hbm:
+            self._hbm[id(best.device)].touch_kv((best.workload_id, best.turn_index), now)
         return Match(entry=best, prefix_tokens=best_len)
 
     # --- completion ---------------------------------------------------------
@@ -150,34 +187,88 @@ class KVCacheManager:
         turn_index: int,
         context_tokens: int,
         now: float,
+        device: object | None = None,
     ) -> StoreResult:
-        """Offload a completed sequence's KV into a floating memory.
+        """Offload a completed sequence's KV; return where it landed.
 
-        Picks any floating memory with room (migrating across nodes by choice of
-        target rather than evicting), evicting least-recently-used entries only
-        when the whole floating pool cannot otherwise fit the new entry. Returns
-        the chosen memory and the entries evicted to make room.
+        Under ``node_first`` the KV goes straight to a floating node memory,
+        evicting least-recently-used entries only when the whole floating pool
+        cannot otherwise fit it. Under a device-first policy the KV is retained on
+        the serving ``device``'s HBM (no transfer -- it is already there); residents
+        the device's KV region evicts to make room are *spilled* down to node
+        memory, and only evicted entirely when the node pool is full too.
         """
 
-        if not self._floating or tracker is None:
+        if not self.enabled or tracker is None:
             return StoreResult(memory=None, num_bytes=0.0, evicted=())
         num_bytes = float(context_kv_bytes(model, context_tokens))
         if num_bytes <= 0:
             return StoreResult(memory=None, num_bytes=0.0, evicted=())
 
+        # A re-store of the same sequence replaces any prior copy.
+        self._drop_key(workload_id, turn_index)
+
+        if self._device_first and device is not None and id(device) in self._hbm:
+            return self._store_on_device(
+                model, tracker, workload_id, turn_index, context_tokens,
+                num_bytes, device, now,
+            )
+        return self._store_on_node(
+            model, tracker, workload_id, turn_index, context_tokens, num_bytes, now,
+        )
+
+    def _store_on_device(
+        self, model, tracker, workload_id, turn_index, context_tokens,
+        num_bytes, device, now,
+    ) -> StoreResult:
+        residency = self._hbm[id(device)]
+        admitted, evicted = residency.admit_kv(
+            (workload_id, turn_index), num_bytes, now
+        )
+        if not admitted:
+            # The block is larger than the device's whole KV region: fall back to
+            # holding it in node memory rather than dropping it.
+            return self._store_on_node(
+                model, tracker, workload_id, turn_index, context_tokens,
+                num_bytes, now,
+            )
+        entry = KVEntry(
+            workload_id=workload_id,
+            turn_index=turn_index,
+            model=model,
+            tracker=tracker,
+            context_tokens=context_tokens,
+            num_bytes=num_bytes,
+            memory=device.first_tier_memory,
+            last_use=now,
+            device=device,
+        )
+        self._entries.append(entry)
+        spilled, dropped = self._spill_evicted(evicted, now)
+        return StoreResult(
+            memory=device.first_tier_memory,
+            num_bytes=num_bytes,
+            evicted=tuple(dropped),
+            spilled=tuple(spilled),
+        )
+
+    def _store_on_node(
+        self, model, tracker, workload_id, turn_index, context_tokens,
+        num_bytes, now,
+    ) -> StoreResult:
+        if not self._floating:
+            return StoreResult(memory=None, num_bytes=num_bytes, evicted=())
         evicted: list[KVEntry] = []
-        memory = self._memory_with_room(num_bytes)
+        memory = self._node_with_room(num_bytes)
         while memory is None:
-            victim = self._lru_entry()
+            victim = self._lru_node_entry()
             if victim is None:
-                # Nothing left to evict and still no room: the entry is larger
-                # than any single floating memory; give up storing it.
                 return StoreResult(
                     memory=None, num_bytes=num_bytes, evicted=tuple(evicted)
                 )
             self._remove(victim)
             evicted.append(victim)
-            memory = self._memory_with_room(num_bytes)
+            memory = self._node_with_room(num_bytes)
 
         entry = KVEntry(
             workload_id=workload_id,
@@ -188,6 +279,7 @@ class KVCacheManager:
             num_bytes=num_bytes,
             memory=memory,
             last_use=now,
+            device=None,
         )
         self._entries.append(entry)
         self._used[id(memory)] += num_bytes
@@ -195,7 +287,53 @@ class KVCacheManager:
 
     # --- internals ----------------------------------------------------------
 
-    def _memory_with_room(self, num_bytes: float) -> MemoryDevice | None:
+    def _spill_evicted(self, evicted, now) -> tuple[list[KVEntry], list[KVEntry]]:
+        """Move HBM residents evicted by an admission down to node memory.
+
+        Each evicted resident names a stored entry; it is migrated to a floating
+        node memory (evicting node LRU entries if needed). Entries that cannot fit
+        the node pool at all are dropped. Returns ``(spilled, dropped)`` lists of
+        the affected :class:`KVEntry`.
+        """
+
+        spilled: list[KVEntry] = []
+        dropped: list[KVEntry] = []
+        for resident in evicted:
+            _, key = resident.key  # ("kv", (workload_id, turn_index))
+            entry = self._entry_for_key(key)
+            if entry is None:
+                continue
+            memory = self._node_with_room(entry.num_bytes)
+            while memory is None:
+                victim = self._lru_node_entry()
+                if victim is None or victim is entry:
+                    break
+                self._remove(victim)
+                dropped.append(victim)
+                memory = self._node_with_room(entry.num_bytes)
+            if memory is None:
+                self._entries.remove(entry)
+                dropped.append(entry)
+                continue
+            entry.memory = memory
+            entry.device = None
+            self._used[id(memory)] += entry.num_bytes
+            spilled.append(entry)
+        return spilled, dropped
+
+    def _entry_for_key(self, key) -> KVEntry | None:
+        workload_id, turn_index = key
+        for entry in self._entries:
+            if entry.workload_id == workload_id and entry.turn_index == turn_index:
+                return entry
+        return None
+
+    def _drop_key(self, workload_id: int, turn_index: int) -> None:
+        entry = self._entry_for_key((workload_id, turn_index))
+        if entry is not None:
+            self._remove(entry)
+
+    def _node_with_room(self, num_bytes: float) -> MemoryDevice | None:
         """First floating memory whose free capacity holds ``num_bytes``."""
 
         for memory in self._floating:
@@ -204,11 +342,15 @@ class KVCacheManager:
                 return memory
         return None
 
-    def _lru_entry(self) -> KVEntry | None:
-        if not self._entries:
+    def _lru_node_entry(self) -> KVEntry | None:
+        node_entries = [e for e in self._entries if e.device is None]
+        if not node_entries:
             return None
-        return min(self._entries, key=lambda e: e.last_use)
+        return min(node_entries, key=lambda e: e.last_use)
 
     def _remove(self, entry: KVEntry) -> None:
         self._entries.remove(entry)
-        self._used[id(entry.memory)] -= entry.num_bytes
+        if entry.device is not None and id(entry.device) in self._hbm:
+            self._hbm[id(entry.device)].remove_kv((entry.workload_id, entry.turn_index))
+        else:
+            self._used[id(entry.memory)] -= entry.num_bytes

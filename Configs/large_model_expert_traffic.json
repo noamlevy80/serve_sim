@@ -16,8 +16,8 @@
     "name": "Example short randomized suite",
     "description": "Draws a handful of random multi-turn workloads from the cached source dataset and assigns each a model at random, for a quick end-to-end run.",
     "type": "randomized",
-    "num_workloads": 32,
-    "models": ["gemma-4-31b"]
+    "num_workloads": 12,
+    "models": ["nemotron-3-ultra"]
   },
 
   "max_batch_size": 4,
@@ -29,11 +29,14 @@
 
   "model_weight_loading": true,
 
+  "memory_policy": "global_lru",
+  "hbm_kv_fraction": 0.5,
+
   "auto_parallelism": true,
   "pipeline_parallel": 2,
-  "expert_parallel": 1,
-  "tensor_parallel": 2,
-  "max_parallelism": 24,
+  "expert_parallel": 2,
+  "tensor_parallel": 4,
+  "max_parallelism": 16,
 
   "prefill_chunk_size": null,
   "event_random_factor_range": 0.05,

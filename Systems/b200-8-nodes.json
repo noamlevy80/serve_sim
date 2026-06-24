@@ -12,56 +12,56 @@
   "nodes": [
     {
       "name": "node-0",
-      "node_memory": "nvidia-grace-lpddr5x",
+      "node_memory": "lpddr5x-100T",
       "compute_devices": [
         { "device": "nvidia-b200", "count": 4 }
       ]
     },
     {
       "name": "node-1",
-      "node_memory": "nvidia-grace-lpddr5x",
+      "node_memory": "lpddr5x-100T",
       "compute_devices": [
         { "device": "nvidia-b200", "count": 4 }
       ]
     },
     {
       "name": "node-2",
-      "node_memory": "nvidia-grace-lpddr5x",
+      "node_memory": "lpddr5x-100T",
       "compute_devices": [
         { "device": "nvidia-b200", "count": 4 }
       ]
     },
     {
       "name": "node-3",
-      "node_memory": "nvidia-grace-lpddr5x",
+      "node_memory": "lpddr5x-100T",
       "compute_devices": [
         { "device": "nvidia-b200", "count": 4 }
       ]
     },
     {
       "name": "node-4",
-      "node_memory": "nvidia-grace-lpddr5x",
+      "node_memory": "lpddr5x-100T",
       "compute_devices": [
         { "device": "nvidia-b200", "count": 4 }
       ]
     },
     {
       "name": "node-5",
-      "node_memory": "nvidia-grace-lpddr5x",
+      "node_memory": "lpddr5x-100T",
       "compute_devices": [
         { "device": "nvidia-b200", "count": 4 }
       ]
     },
     {
       "name": "node-6",
-      "node_memory": "nvidia-grace-lpddr5x",
+      "node_memory": "lpddr5x-100T",
       "compute_devices": [
         { "device": "nvidia-b200", "count": 4 }
       ]
     },
     {
       "name": "node-7",
-      "node_memory": "nvidia-grace-lpddr5x",
+      "node_memory": "lpddr5x-100T",
       "compute_devices": [
         { "device": "nvidia-b200", "count": 4 }
       ]
