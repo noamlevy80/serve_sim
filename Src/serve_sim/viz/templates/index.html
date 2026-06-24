@@ -17,6 +17,7 @@
     <nav class="tabs">
       <button class="tab active" data-tab="summary">Summary</button>
       <button class="tab" data-tab="timeline">Timeline</button>
+      <button class="tab" data-tab="workload">Workload</button>
     </nav>
   </header>
 
@@ -45,6 +46,23 @@
       <div class="timeline-body">
         <aside id="graph-tree" class="tree-panel"></aside>
         <div id="graph-grid" class="grid cols-2"></div>
+      </div>
+    </section>
+
+    <section id="workload" class="tab-panel">
+      <div class="controls">
+        <div class="control">
+          <label>Legend</label>
+          <div class="wl-legend">
+            <span class="wl-key wl-prefill">Prefill (input)</span>
+            <span class="wl-key wl-decode">Decode (output)</span>
+            <span class="wl-key wl-tool">Tool call</span>
+            <span class="wl-key wl-edge">KV reuse &rarr;</span>
+          </div>
+        </div>
+      </div>
+      <div class="workload-body">
+        <canvas id="workload-canvas"></canvas>
       </div>
     </section>
   </main>

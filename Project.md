@@ -431,6 +431,18 @@ The default for all graphs is displayed.
 3.2 Current turn
 3.3 State (of current turn sequence): Not arrived, In queue, KV Fetch, Prefill, Decode, Done
 
+### Workload Tab
+The workload tab provides a visualization of the workloads that were used in the run.
+It is displayed as a graph. Each turn of each conversation, the input sequence and the output sequence, is a node. Tool calls are also a node.
+An edge connects nodes in which a common prefix was identified and therefore KV reuse was eventually done. The edge is directed from the existing KV to the sequence that reused the KV.
+There is no need to connect nodes of the same workload with edges, that is implied.
+
+Workloads are layed it horizontally from left to right, representing time, similar to the timeline tab. Each node is a block the width of which is the time from queuing to the first output token (prefill sequences) or the last output token (decode sequences); tool calls just represent the time in which they were invoked in the simulator and end when the tool response is available.
+
+When hovering over a block the number of tokens is shown, as well as the group ID that executed it, and the achieved TPS (decode) or TTFT (prefill). If it is a tool call, a simple description as provided in the dataset.
+
+The workloads are laid out below each other on the vertical axis, and are spaced out so that the about 16 workloads can fit in a normal screen height, with double vertical spacing so it is easy to see the edges.
+
 ### Running the tool
 Each run writes a self-contained `viz.json` into its output directory (alongside
 the CSVs). The visualization tool is launched separately from the simulator:

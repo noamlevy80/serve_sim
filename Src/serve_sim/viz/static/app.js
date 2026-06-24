@@ -46,7 +46,7 @@ async function boot() {
   setupTabs();
   setupControls();
   await setupRunPicker();
-  window.addEventListener("resize", () => renderGrid());
+  window.addEventListener("resize", () => { renderGrid(); renderWorkload(); });
 }
 
 // Fetch a run's view model (the default when ``run`` is null) and (re)render.
@@ -98,6 +98,7 @@ function setupTabs() {
       btn.classList.add("active");
       document.getElementById(btn.dataset.tab).classList.add("active");
       if (btn.dataset.tab === "timeline") renderGrid();
+      if (btn.dataset.tab === "workload") renderWorkload();
     });
   });
 }
@@ -508,6 +509,192 @@ function attachHover(canvas, g, rect) {
     }
     if (!text) { tip.hidden = true; return; }
     tip.textContent = text;
+    tip.style.whiteSpace = "pre";
+    tip.style.left = `${e.clientX + 12}px`;
+    tip.style.top = `${e.clientY + 12}px`;
+    tip.hidden = false;
+  };
+  canvas.onmouseleave = () => { document.getElementById("tooltip").hidden = true; };
+}
+
+// --- workload tab ---------------------------------------------------------------
+// A node-link graph: each turn is an input (prefill) and output (decode) block,
+// tool calls fill the gaps, and edges run from reused KV to the reusing sequence.
+const WL = { laneH: 34, padL: 96, padR: 24, padT: 22, padB: 8, rects: [] };
+// Darker block palette so the lighter, bolder reuse edges stand out on top.
+const WL_FILL = { prefill: "#1f4e9c", decode: "#1f7a3a", tool: "#8a6212" };
+
+function wlTimeToX(t, geom) {
+  const span = geom.span || 1;
+  return geom.x + (t / span) * geom.w;
+}
+
+function renderWorkload() {
+  const panel = document.getElementById("workload");
+  if (!panel || !panel.classList.contains("active")) return;
+  const wg = STATE.vm && STATE.vm.workload_graph;
+  const canvas = document.getElementById("workload-canvas");
+  if (!canvas || !wg) return;
+
+  // Size lanes so ~16 workloads fill one screen height (double-spaced); taller
+  // runs simply scroll within the panel.
+  WL.laneH = Math.max(36, Math.round((window.innerHeight - 150) / 16));
+
+  const lanes = Math.max(1, wg.num_lanes || 0);
+  const body = canvas.parentElement;
+  const cssW = body.clientWidth || 800;
+  const cssH = WL.padT + WL.padB + lanes * WL.laneH;
+  canvas.style.width = cssW + "px";
+  canvas.style.height = cssH + "px";
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = cssW * dpr;
+  canvas.height = cssH * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const geom = {
+    x: WL.padL, w: Math.max(20, cssW - WL.padL - WL.padR),
+    span: wg.makespan_s || 1,
+  };
+
+  // Lane backgrounds and workload labels.
+  ctx.font = "10px monospace";
+  ctx.textBaseline = "middle";
+  const laneLabel = {};
+  for (const n of wg.nodes) if (!(n.lane in laneLabel)) laneLabel[n.lane] = n.workload;
+  for (let i = 0; i < lanes; i++) {
+    const top = WL.padT + i * WL.laneH;
+    if (i % 2 === 0) {
+      ctx.fillStyle = "#161a23";
+      ctx.fillRect(0, top, cssW, WL.laneH);
+    }
+    ctx.fillStyle = "#9aa3b2";
+    ctx.textAlign = "left";
+    ctx.fillText(laneLabel[i] || "", 6, top + WL.laneH / 2);
+  }
+
+  // Time-axis ticks across the top.
+  for (let k = 0; k <= 5; k++) {
+    const t = (geom.span * k) / 5;
+    const x = wlTimeToX(t, geom);
+    ctx.strokeStyle = "#2a2f3d";
+    ctx.globalAlpha = 0.25;
+    ctx.beginPath();
+    ctx.moveTo(x, WL.padT - 4);
+    ctx.lineTo(x, cssH - WL.padB);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#6b7280";
+    ctx.textAlign = "center";
+    ctx.fillText(`${formatEng(t)}s`, x, WL.padT - 11);
+  }
+
+  // Node rectangles (remembered for hover and edge endpoints).
+  WL.rects = [];
+  const byId = {};
+  const nodeH = WL.laneH * 0.42;
+  for (const n of wg.nodes) {
+    const top = WL.padT + n.lane * WL.laneH;
+    const cy = top + WL.laneH / 2;
+    const x0 = wlTimeToX(n.t0, geom);
+    const x1 = wlTimeToX(n.t1, geom);
+    const w = Math.max(2, x1 - x0);
+    const rect = { x: x0, y: cy - nodeH / 2, w, h: nodeH, node: n, cx: x0 + w / 2, cy };
+    WL.rects.push(rect);
+    byId[n.id] = rect;
+  }
+
+  // Nodes first.
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (const rect of WL.rects) {
+    const n = rect.node;
+    ctx.fillStyle = WL_FILL[n.kind] || "#6b7280";
+    ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+    if (n.group) {
+      ctx.strokeStyle = colorFor(`group:${n.group}`);
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, rect.w - 1, rect.h - 1);
+    }
+    if (rect.w > 26 && n.text) {
+      ctx.fillStyle = "#eef2f8";
+      ctx.font = "9px sans-serif";
+      ctx.fillText(n.text, rect.cx, rect.cy);
+    }
+  }
+
+  // Edges on top (in front of the nodes) so they stay visible: existing KV ->
+  // reusing sequence. Each edge gets a slightly varied hue/brightness so
+  // overlapping links are easier to follow.
+  for (const e of wg.edges) {
+    const s = byId[e.source];
+    const d = byId[e.target];
+    if (!s || !d) continue;
+    drawWlEdge(ctx, s.x + s.w, s.cy, d.x, d.cy, wlEdgeColor(`${e.source}->${e.target}`));
+  }
+
+  attachWlHover(canvas);
+}
+
+// Deterministic per-edge variation around the base reuse-edge orange so the
+// lines differ slightly in hue and brightness without changing identity.
+function wlEdgeColor(key) {
+  let h = 0;
+  for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+  const hue = 24 + ((h % 31) - 15);          // base 24deg +/- 15
+  const light = 66 + (((h >> 5) % 23) - 11); // base 66% +/- 11
+  return `hsl(${hue}, 100%, ${light}%)`;
+}
+
+function drawWlEdge(ctx, x0, y0, x1, y1, color) {
+  const stroke = color || "#ff9d5c";
+  ctx.strokeStyle = stroke;
+  ctx.fillStyle = stroke;
+  ctx.lineWidth = 3;
+  ctx.lineCap = "round";
+  const mx = (x0 + x1) / 2;
+  ctx.beginPath();
+  ctx.moveTo(x0, y0);
+  ctx.bezierCurveTo(mx, y0, mx, y1, x1, y1);
+  ctx.stroke();
+  // Arrowhead at the target end.
+  const ang = Math.atan2(y1 - y0, x1 - mx);
+  const a = 8;
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x1 - a * Math.cos(ang - 0.5), y1 - a * Math.sin(ang - 0.5));
+  ctx.lineTo(x1 - a * Math.cos(ang + 0.5), y1 - a * Math.sin(ang + 0.5));
+  ctx.closePath();
+  ctx.fill();
+}
+
+function attachWlHover(canvas) {
+  const tip = document.getElementById("tooltip");
+  canvas.onmousemove = (e) => {
+    const r = canvas.getBoundingClientRect();
+    const px = e.clientX - r.left;
+    const py = e.clientY - r.top;
+    let hit = null;
+    for (const rect of WL.rects) {
+      if (px >= rect.x && px <= rect.x + rect.w && py >= rect.y && py <= rect.y + rect.h) {
+        hit = rect.node;
+        break;
+      }
+    }
+    if (!hit) { tip.hidden = true; return; }
+    const lines = [`${hit.sequence} (${hit.kind})`];
+    if (hit.kind === "tool") {
+      lines.push(hit.desc || "Tool call");
+    } else {
+      lines.push(`${formatEng(hit.tokens)} tokens`);
+      if (hit.group) lines.push(`group ${hit.group}`);
+      if (hit.kind === "decode" && hit.tps != null)
+        lines.push(`TPS ${formatEng(hit.tps)} tok/s`);
+      if (hit.kind === "prefill" && hit.ttft_s != null)
+        lines.push(`TTFT ${formatEng(hit.ttft_s)}s`);
+    }
+    tip.textContent = lines.join("\n");
     tip.style.whiteSpace = "pre";
     tip.style.left = `${e.clientX + 12}px`;
     tip.style.top = `${e.clientY + 12}px`;

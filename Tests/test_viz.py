@@ -160,6 +160,19 @@ def test_workload_graphs_present():
     assert {"device", "turn", "state"} <= suffixes
 
 
+def test_view_model_carries_workload_graph():
+    vm = build_view_model(_payload())
+    wg = vm["workload_graph"]
+    assert {"nodes", "edges", "num_lanes", "makespan_s"} <= set(wg)
+    assert wg["num_lanes"] >= 1
+    assert wg["nodes"]
+    kinds = {n["kind"] for n in wg["nodes"]}
+    assert {"prefill", "decode"} <= kinds
+    for n in wg["nodes"]:
+        assert {"id", "lane", "sub", "t0", "t1", "tokens", "group"} <= set(n)
+    assert isinstance(wg["edges"], list)
+
+
 def test_engine_group_graph_labels_groups_and_lists_devices_on_hover():
     # The per-workload device graph shows the engine group id on the bar and the
     # full device list in the hover tooltip (segment[3]).

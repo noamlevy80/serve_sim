@@ -210,3 +210,27 @@ table.summary tr:last-child td { border-bottom: none; }
   z-index: 100;
   max-width: 280px;
 }
+
+.workload-body {
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  max-height: calc(100vh - 150px);
+}
+#workload-canvas { display: block; }
+
+.wl-legend { display: flex; gap: 14px; align-items: center; font-size: 12px; }
+.wl-key { display: flex; align-items: center; gap: 5px; color: var(--muted); }
+.wl-key::before {
+  content: "";
+  width: 14px;
+  height: 10px;
+  border-radius: 2px;
+  display: inline-block;
+}
+.wl-key.wl-prefill::before { background: #1f4e9c; }
+.wl-key.wl-decode::before { background: #1f7a3a; }
+.wl-key.wl-tool::before { background: #8a6212; }
+.wl-key.wl-edge::before { background: #ff9d5c; height: 3px; }
+

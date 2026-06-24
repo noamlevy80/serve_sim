@@ -895,6 +895,120 @@ def _current_turn(turns: Sequence[RequestRecord], t: float) -> RequestRecord:
     return turns[-1]
 
 
+def workload_graph(result: RunResult) -> dict[str, Any]:
+    """Node-link model of the run's workloads for the workload tab.
+
+    Each turn contributes an *input* (prefill) node -- spanning queuing to its
+    first output token -- and an *output* (decode) node -- spanning the first to
+    the last output token. A *tool-call* node fills the client-side gap between a
+    turn's completion and the next turn's arrival. Edges run from the sequence
+    whose cached KV prefix was reused to the sequence that reused it; reuse within
+    one conversation is implied and left undrawn, so only cross-workload links
+    appear. Workloads occupy stacked horizontal lanes ordered by arrival, and each
+    node carries logical ``t0``/``t1`` (time) and ``lane``/``sub`` (vertical)
+    coordinates the renderer maps to pixels.
+    """
+
+    makespan = result.makespan or 0.0
+
+    workloads: dict[str, list[RequestRecord]] = {}
+    keys: dict[str, int] = {}
+    for r in result.records:
+        sort_key, label = _workload_key(r)
+        workloads.setdefault(label, []).append(r)
+        keys[label] = sort_key
+    for turns in workloads.values():
+        turns.sort(key=lambda r: r.turn_index)
+    order = sorted(workloads, key=lambda x: keys[x])
+    lane_of = {label: i for i, label in enumerate(order)}
+
+    # Stable engine-group id per turn (the union of devices that served it).
+    events_by_request = _events_by_request(_rescaled(result.events))
+    group_ids: dict[tuple[str, ...], str] = {}
+
+    def _group(request_id: int) -> str:
+        devices = tuple(sorted({
+            e.device for e in events_by_request.get(request_id, []) if e.device
+        }))
+        if not devices:
+            return ""
+        if devices not in group_ids:
+            group_ids[devices] = f"G{len(group_ids)}"
+        return group_ids[devices]
+
+    nodes: list[dict[str, Any]] = []
+    node_by_request: dict[int, str] = {}        # request id -> its input node id
+    node_by_seq: dict[tuple[int, int], str] = {}  # (workload, turn) -> input node id
+
+    for label in order:
+        lane = lane_of[label]
+        turns = workloads[label]
+        for i, r in enumerate(turns):
+            seq = _sequence_id(r.workload_id, r.turn_index) or f"{label}t{r.turn_index}"
+            group = _group(r.request_id)
+            first_token = (r.first_token_time if r.first_token_time is not None
+                           else r.completion_time)
+            in_id = f"{label}:t{r.turn_index}:in"
+            out_id = f"{label}:t{r.turn_index}:out"
+            node_by_request[r.request_id] = in_id
+            if r.workload_id >= 0:
+                node_by_seq[(r.workload_id, r.turn_index)] = in_id
+            nodes.append({
+                "id": in_id, "kind": "prefill", "workload": label, "lane": lane,
+                "sub": 0, "t0": r.arrival_time, "t1": first_token,
+                "turn": r.turn_index, "tokens": r.prompt_tokens, "group": group,
+                "ttft_s": r.ttft, "tps": None, "text": f"T{r.turn_index} in",
+                "sequence": seq, "desc": "",
+            })
+            nodes.append({
+                "id": out_id, "kind": "decode", "workload": label, "lane": lane,
+                "sub": 1, "t0": first_token, "t1": r.completion_time,
+                "turn": r.turn_index, "tokens": r.output_tokens, "group": group,
+                "ttft_s": None, "tps": r.tps, "text": f"T{r.turn_index} out",
+                "sequence": seq, "desc": "",
+            })
+            if i + 1 < len(turns):
+                nxt = turns[i + 1]
+                if nxt.arrival_time > r.completion_time + 1e-12:
+                    nodes.append({
+                        "id": f"{label}:t{r.turn_index}:tool", "kind": "tool",
+                        "workload": label, "lane": lane, "sub": 1,
+                        "t0": r.completion_time, "t1": nxt.arrival_time,
+                        "turn": r.turn_index, "tokens": 0, "group": "",
+                        "ttft_s": None, "tps": None, "text": "tool",
+                        "sequence": seq,
+                        "desc": f"Tool call before turn {nxt.turn_index}",
+                    })
+
+    # Edges: KV-prefix reuse, directed existing-KV -> reusing sequence. Within one
+    # conversation reuse is implied, so only cross-workload links are drawn.
+    seen: set[tuple[str, str]] = set()
+    edges: list[dict[str, str]] = []
+    for d in result.decisions:
+        if d.kind != "kv_reuse":
+            continue
+        if d.source_workload_id is None or d.source_workload_id < 0:
+            continue
+        if d.source_workload_id == d.workload_id:
+            continue
+        src = node_by_seq.get((d.source_workload_id, d.source_turn_index))
+        dst = node_by_request.get(d.request_id)
+        if not src or not dst or src == dst:
+            continue
+        key = (src, dst)
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append({"source": src, "target": dst})
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "num_lanes": len(order),
+        "makespan_s": makespan,
+    }
+
+
 def summarize(
     result: RunResult, *, progress: Callable[[float, float], None] | None = None
 ) -> dict[str, Any]:
@@ -1314,6 +1428,7 @@ def build_viz_payload(
     dev_timeline = device_timeline(result, num_buckets, progress=_sub(0.65, 0.23))
     mem_timeline = memory_timeline(result, num_buckets, progress=_sub(0.88, 0.10))
     work_timeline = workload_timeline(result, num_buckets)
+    work_graph = workload_graph(result)
     if progress is not None:
         progress(1.0, 1.0)
 
@@ -1327,4 +1442,5 @@ def build_viz_payload(
         "device_timeline": dev_timeline,
         "memory_timeline": mem_timeline,
         "workload_timeline": work_timeline,
+        "workload_graph": work_graph,
     }

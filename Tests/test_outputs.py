@@ -16,7 +16,9 @@ import pytest
 
 from serve_sim.hardware import ComputeDevice, MemoryDevice
 from serve_sim.model import toy_model
-from serve_sim.orchestrator import EventRecord, Request, Simulator, StrategyConfig
+from serve_sim.orchestrator import (
+    EventRecord, Request, RequestRecord, RunResult, Simulator, StrategyConfig,
+)
 from serve_sim.report import (
     _decision_rows,
     build_viz_payload,
@@ -25,6 +27,7 @@ from serve_sim.report import (
     memory_summaries,
     memory_timeline,
     summarize,
+    workload_graph,
     workload_timeline,
     write_outputs,
 )
@@ -769,6 +772,7 @@ def test_workload_timeline_walks_the_turn_lifecycle():
     assert {r["turn"] for r in w0} >= {0, 1}
     assert any(r["state"] == "decode" for r in w0)
     assert any(r["state"] == "decode" and r["device"] for r in w0)
+
     # Each row also carries the full engine group: a stable id plus the device
     # list. A decode row's representative device is one of its group's devices.
     assert {"group", "devices"} <= set(rows[0])
@@ -780,6 +784,85 @@ def test_workload_timeline_walks_the_turn_lifecycle():
     for r in rows:
         if r["devices"]:
             assert groups[tuple(r["devices"])] == r["group"]
+
+
+def test_workload_graph_emits_input_and_output_nodes_per_turn():
+    model = toy_model()
+    system = make_system(1)
+    reqs = [Request(i, model, 32, 4, workload_id=i, turn_index=0) for i in range(3)]
+    result = Simulator(system, StrategyConfig(max_batch_size=3)).run(reqs)
+
+    g = workload_graph(result)
+    assert g["num_lanes"] == 3
+    assert {n["lane"] for n in g["nodes"]} == {0, 1, 2}
+    kinds = [n["kind"] for n in g["nodes"]]
+    assert kinds.count("prefill") == 3
+    assert kinds.count("decode") == 3
+    for n in g["nodes"]:
+        assert n["t1"] >= n["t0"]
+        assert {"id", "kind", "sub", "tokens", "group", "sequence"} <= set(n)
+    # The input node spans queuing to the first token; the output node runs from
+    # the first token to the last.
+    by_id = {n["id"]: n for n in g["nodes"]}
+    rec0 = next(r for r in result.records if r.request_id == 0)
+    assert by_id["w0:t0:in"]["t1"] == pytest.approx(rec0.first_token_time)
+    assert by_id["w0:t0:out"]["t0"] == pytest.approx(rec0.first_token_time)
+    assert by_id["w0:t0:out"]["t1"] == pytest.approx(rec0.completion_time)
+    assert by_id["w0:t0:in"]["tokens"] == rec0.prompt_tokens
+    assert by_id["w0:t0:out"]["tokens"] == rec0.output_tokens
+
+
+def test_workload_graph_adds_tool_node_between_turns():
+    # The tool-call wait is the gap between a turn's completion and the next
+    # turn's arrival, so build two turns of one conversation with such a gap.
+    result = RunResult()
+    result.records = [
+        RequestRecord(0, 0.0, 0.0, 1.0, 32, 4, 0, first_token_time=0.5,
+                      workload_id=0, turn_index=0),
+        RequestRecord(1, 5.0, 5.0, 6.0, 32, 4, 1, first_token_time=5.5,
+                      workload_id=0, turn_index=1),
+    ]
+
+    g = workload_graph(result)
+    tools = [n for n in g["nodes"] if n["kind"] == "tool"]
+    assert len(tools) == 1
+    assert tools[0]["t0"] == pytest.approx(1.0)
+    assert tools[0]["t1"] == pytest.approx(5.0)
+    # A single conversation is one lane; reuse within it is implied, not drawn.
+    assert g["num_lanes"] == 1
+    assert g["edges"] == []
+
+
+def test_workload_graph_links_cross_workload_kv_reuse():
+    model = toy_model()
+    system = make_system(1)
+    sys_msg = {"role": "system", "content": "you are a helpful coding agent always"}
+    user_msg = {"role": "user", "content": "please refactor this module for me today"}
+
+    def msg_request(rid, messages, *, workload_id, arrival_time=0.0):
+        workload = build_workload_from_rows(
+            [make_row(f"s{workload_id}", "m", messages, output_length=4)]
+        )
+        return Request.from_workload(
+            rid, workload, model, WhitespaceTokenizer(),
+            arrival_time=arrival_time, turn_index=0, workload_id=workload_id,
+        )
+
+    first = msg_request(0, [dict(sys_msg), dict(user_msg)], workload_id=0)
+    second = msg_request(
+        1,
+        [dict(sys_msg), dict(user_msg),
+         {"role": "assistant", "content": "second conversation tail differs here"}],
+        workload_id=1, arrival_time=1000.0,
+    )
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run([first, second])
+
+    assert any(d.kind == "kv_reuse" and d.source_workload_id == 0
+               and d.workload_id == 1 for d in result.decisions)
+
+    g = workload_graph(result)
+    # The reuse draws one edge from conversation 0's input node to conversation 1's.
+    assert {"source": "w0:t0:in", "target": "w1:t0:in"} in g["edges"]
 
 
 def test_workload_timeline_marks_late_arrivals_not_arrived():

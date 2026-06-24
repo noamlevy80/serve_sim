@@ -415,6 +415,9 @@ def build_view_model(payload: Mapping[str, Any]) -> dict[str, Any]:
         "summary_tables": build_summary_tables(payload),
         "graphs": graphs,
         "graph_tree": _build_graph_tree(graphs),
+        "workload_graph": payload.get("workload_graph",
+                                      {"nodes": [], "edges": [], "num_lanes": 0,
+                                       "makespan_s": float(payload.get("makespan_s") or 0.0)}),
     }
 
 
