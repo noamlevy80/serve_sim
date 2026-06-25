@@ -86,7 +86,8 @@ def test_run_from_config_offline(tmp_path, fake_fetcher):
         tokenizer=WhitespaceTokenizer(),
     )
 
-    assert out_dir == tmp_path / "Outputs" / "test-run"
+    assert out_dir.parent == tmp_path / "Outputs"
+    assert out_dir.name.startswith("run-") and out_dir.name.endswith("-test-run")
     assert result.records, "expected at least one completed request"
     assert len(result.records) == 2
 
@@ -95,7 +96,7 @@ def test_run_from_config_offline(tmp_path, fake_fetcher):
         assert (out_dir / name).exists(), name
 
     report = json.loads((out_dir / "run_report.json").read_text())
-    assert report["run_id"] == "test-run"
+    assert report["run_id"] == out_dir.name
     assert report["report"]["num_requests"] == 2
     assert report["report"]["makespan_s"] > 0.0
     assert report["report"]["throughput_requests_per_s"] > 0.0
@@ -120,7 +121,8 @@ def test_run_id_override_and_default_output_root(tmp_path, fake_fetcher):
         tokenizer=WhitespaceTokenizer(),
     )
 
-    assert out_dir == tmp_path / "elsewhere" / "override-id"
+    assert out_dir.parent == tmp_path / "elsewhere"
+    assert out_dir.name.startswith("run-") and out_dir.name.endswith("-override-id")
     assert (out_dir / "run_report.json").exists()
 
 

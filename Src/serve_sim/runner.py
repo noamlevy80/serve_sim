@@ -350,7 +350,9 @@ def run_from_config(
 
     result = Simulator(system, strategy).run(requests, progress=progress)
 
-    run_id = run_id or cfg.get("run_id") or f"run-{datetime.now():%Y%m%d-%H%M%S}"
+    timestamp = f"run-{datetime.now():%Y%m%d-%H%M%S}"
+    label = run_id or cfg.get("run_id")
+    run_id = f"{timestamp}-{label}" if label else timestamp
     root = Path(output_root or cfg.get("output_root", "Outputs"))
     if verbose:
         print(f"[epilogue] writing outputs ({len(result.events)} events, "

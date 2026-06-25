@@ -1,6 +1,6 @@
 {
   "run_id": null,
-  "system": "../Systems/b200-8-nodes.json",
+  "system": "../Systems/b200x128.json",
   "models_dir": "../Models",
   "tokenizer": "tiktoken",
   "output_root": "Outputs",
@@ -17,7 +17,7 @@
     "description": "Draws a handful of random multi-turn workloads from the cached source dataset and assigns each a model at random, for a quick end-to-end run.",
     "type": "randomized",
     "num_workloads": 32,
-    "models": ["nemotron-3-ultra"]
+    "models": ["deepseek-v4-pro"]
   },
 
   "max_batch_size": 8,
@@ -33,10 +33,10 @@
   "hbm_kv_fraction": 0.5,
 
   "auto_parallelism": true,
-  "pipeline_parallel": 2,
-  "expert_parallel": 2,
-  "tensor_parallel": 4,
-  "max_parallelism": 16,
+  "pipeline_parallel": 1,
+  "expert_parallel": 32,
+  "tensor_parallel": 1,
+  "max_parallelism": 32,
 
   "prefill_chunk_size": null,
   "event_random_factor_range": 0.05,

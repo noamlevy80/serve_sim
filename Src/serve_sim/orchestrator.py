@@ -682,6 +682,12 @@ class Simulator:
         # batch index, so the capacity check uses the working-set footprint rather
         # than pinning every expert.
         self._job_reserve: dict[int, float] = {}
+        # Per engine slot (``id(slot)``), the arbiter job index whose in-flight
+        # weight/expert transfers are warming that slot's resident model. A later
+        # batch reusing the slot is gated behind those transfers (it cannot
+        # compute before the weights/experts its ranks need are resident). Reset
+        # per run; entries clear naturally once the warm-up finishes.
+        self._slot_warming_job: dict[int, int] = {}
         # System-wide persistent KV cache (cross-conversation prefix reuse, LRU
         # eviction, migration across floating memories). Inert when disabled or
         # when the system has no floating (node) memory to offload KV into.
@@ -822,6 +828,7 @@ class Simulator:
         window_open: float | None = None
 
         arbiter = IncrementalArbiter()
+        self._slot_warming_job = {}
         in_flight = 0
         batch_index = 0
         total = len(requests)
@@ -1017,6 +1024,7 @@ class Simulator:
         decode_window: float | None = None
 
         arbiter = IncrementalArbiter()
+        self._slot_warming_job = {}
         in_flight = 0  # counted from prefill dispatch to decode completion
         batch_index = 0
         total = len(requests)
@@ -1713,6 +1721,13 @@ class Simulator:
                     result, batch, slot, placement.evicted_model, now, batch_index)
         fetches = self._kv_fetch_events(slot, kv_fetches) if kv_fetches else []
         prelude = loads + fetches
+        # A batch reusing an engine slot whose cold load is still streaming must
+        # wait for that warm-up; a batch that loads its own weights establishes a
+        # fresh one and gates on nothing prior.
+        after_job = (
+            None if placement.needs_weight_load
+            else self._slot_warming_job.get(id(slot))
+        )
         if prelude or expert_trace is not None:
             schedule = generator.run(
                 shards,
@@ -1732,8 +1747,13 @@ class Simulator:
                 self._emit_expert_decisions(
                     result, batch, slot, schedule, now, batch_index, expert_source.name)
             events = self._prepend_transfers(prelude, schedule.events)
-            return arbiter.admit_events(events, list(slot.devices)), slot, pp, ep, tp
-        return arbiter.admit(generator, shards), slot, pp, ep, tp
+            job_index = arbiter.admit_events(
+                events, list(slot.devices), after_job=after_job)
+            # Future reuses of this slot wait for whatever this job is loading.
+            if loads or any(e.phase == "expert_transfer" for e in schedule.events):
+                self._slot_warming_job[id(slot)] = job_index
+            return job_index, slot, pp, ep, tp
+        return arbiter.admit(generator, shards, after_job=after_job), slot, pp, ep, tp
 
     @staticmethod
     def _prepend_transfers(

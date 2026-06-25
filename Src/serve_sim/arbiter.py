@@ -425,6 +425,7 @@ class IncrementalArbiter:
         shards,
         expert_trace=None,
         expert_cache_capacity=None,
+        after_job: int | None = None,
     ) -> int:
         """Run a generator in isolation and admit its events at the current time."""
 
@@ -433,15 +434,29 @@ class IncrementalArbiter:
             expert_trace=expert_trace,
             expert_cache_capacity=expert_cache_capacity,
         )
-        return self.admit_events(schedule.events, generator.devices)
+        return self.admit_events(
+            schedule.events, generator.devices, after_job=after_job
+        )
 
-    def admit_events(self, events: list[ComputeEvent], devices: list) -> int:
+    def admit_events(
+        self,
+        events: list[ComputeEvent],
+        devices: list,
+        after_job: int | None = None,
+    ) -> int:
         """Admit a pre-computed event list (against ``devices``) at the current time.
 
         The events are placed on the shared timeline starting now: their relative
         ordering/dependencies (one job's events lie on a non-decreasing clock) are
         preserved, but the whole job is shifted so its first events become ready
         at :attr:`time`.
+
+        ``after_job`` gates this job behind the *still-in-flight* weight/expert
+        transfers of an earlier job (the one currently warming the engine slot
+        these events reuse). Causally, a batch cannot compute on a rank until the
+        weights and routed experts that rank needs are resident; a slot whose cold
+        load is still streaming forces a reusing batch to wait for it. Already
+        finished transfers impose no wait, so a fully warm slot admits at once.
         """
 
         job_index = len(self._jobs)
@@ -460,6 +475,22 @@ class IncrementalArbiter:
             for pred_order in task.preds:
                 pred = by_order[(task.job, pred_order)]
                 self._successors[id(pred)].append(task)
+
+        # Cross-job warm-up barrier: the still-loading weights/experts of the slot
+        # this batch reuses must finish before any of this job's roots can start.
+        externals: list[_Task] = []
+        if after_job is not None and 0 <= after_job < len(self._jobs):
+            externals = [
+                t for t in self._jobs[after_job]
+                if t.co_end is None
+                and t.event.phase in ("weight_transfer", "expert_transfer")
+            ]
+        if externals:
+            for task in job_tasks:
+                if not task.preds:
+                    for ext in externals:
+                        self._successors[id(ext)].append(task)
+                        task.pending += 1
 
         for task in job_tasks:
             if task.pending == 0:

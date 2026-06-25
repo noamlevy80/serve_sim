@@ -33,7 +33,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--run-id",
         default=None,
-        help="Override the run id (default: config value or a timestamp).",
+        help="Label appended to the timestamped run id (default: config value or none).",
     )
     parser.add_argument(
         "--tokenizer",
