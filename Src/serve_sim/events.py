@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 
 from .blocks import LayeredModel
 from .device_memory import DeviceHbmResidency
-from .hardware import ComputeDevice, MemoryDevice
+from .hardware import ComputeDevice, MemoryDevice, dtype_compute_scale
 from .shards import WorkShard
 from .tiering import ExpertResidencyCache, GroupActivation
 
@@ -83,7 +83,9 @@ class ComputeEvent:
         group_index: Originating forward-pass group.
         phase: ``"prefill"`` or ``"decode"``.
         device_index: Index into the event generator's device list.
-        flops: Total consolidated FLOPs.
+        flops: Total consolidated FP16-equivalent FLOPs. Each shard's raw FLOPs
+            are normalized by its dtype's compute-rate scale at consolidation, so
+            the device always retires this work at ``peak_flops_fp16``.
         bytes_read: Total consolidated bytes read.
         compute_time: Compute-bound duration.
         bandwidth_time: Bandwidth-bound duration.
@@ -546,20 +548,21 @@ class EventGenerator:
         start: float,
         divide: int = 1,
     ) -> ComputeEvent:
-        dtypes = {s.flops_dtype_bytes for s in shards}
-        if len(dtypes) != 1:
-            raise ValueError(
-                "cannot consolidate shards with differing flops dtypes "
-                f"in one event: {sorted(dtypes)}"
-            )
-        dtype_bytes = next(iter(dtypes))
         device = self.devices[device_index]
 
-        total_flops = sum(s.flops for s in shards) / divide
+        # All compute accounting is in FP16-equivalent FLOPs: a shard's raw FLOPs
+        # are normalized by its dtype's compute-rate scale (e.g. FP8 runs at 2x,
+        # so its FP16-equivalent work is half the raw FLOPs). Shards of differing
+        # dtypes can therefore be consolidated -- each is normalized on the spot --
+        # and the device retires the result at ``peak_flops_fp16`` regardless of
+        # dtype, so the unit never has to be tracked downstream.
+        total_flops = sum(
+            s.flops / dtype_compute_scale(s.flops_dtype_bytes) for s in shards
+        ) / divide
         total_bytes = sum(s.bytes_read for s in shards) / divide
 
         scale = self._time_scale()
-        compute_time = total_flops / device.effective_flops(dtype_bytes) * scale
+        compute_time = total_flops / device.peak_flops_fp16 * scale
         bandwidth_time = total_bytes / device.bandwidth_bytes_per_s * scale
         duration = max(compute_time, bandwidth_time)
 
