@@ -797,6 +797,26 @@ def _turn_state_at(
     return "prefill", ""
 
 
+def _turn_batch_at(
+    events: Sequence[EventRecord], t: float
+) -> int | None:
+    """The id of the batch actively computing this turn at instant ``t``.
+
+    Returns the ``batch_index`` of the event covering ``t`` (compute phases take
+    precedence over transfers), or ``None`` when no event covers ``t`` -- i.e.
+    the sequence is not currently being executed by any batch.
+    """
+
+    covering = [e for e in events if e.start <= t < e.end]
+    compute = next((e for e in covering if e.phase in _COMPUTE_PHASES), None)
+    if compute is not None:
+        return compute.batch_index
+    transfer = next((e for e in covering if e.phase in _TRANSFER_PHASES), None)
+    if transfer is not None:
+        return transfer.batch_index
+    return None
+
+
 def _workload_key(record: RequestRecord) -> tuple[int, str]:
     """A stable (sort-key, label) for a record's workload (or itself if standalone)."""
 
@@ -811,8 +831,10 @@ def workload_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str
     One row per workload per time bucket. A workload is a multi-turn conversation
     (or a standalone request); at each instant exactly one turn is current. The
     row reports that turn's index, its serving device, the full engine group it
-    runs on (a stable ``group`` id plus the ``devices`` list) and its lifecycle
-    state (not-arrived / in-queue / KV-fetch / prefill / decode / done).
+    runs on (a stable ``group`` id plus the ``devices`` list), the id of the
+    batch currently executing it (``batch``, ``None`` when not being computed)
+    and its lifecycle state (not-arrived / in-queue / KV-fetch / prefill /
+    decode / done).
     """
 
     makespan = result.makespan or 0.0
@@ -861,8 +883,10 @@ def workload_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str
                 devices = slots.setdefault(
                     current.request_id, _slot(current.request_id)
                 )
+                batch = _turn_batch_at(events, t0)
             else:
                 devices = ()
+                batch = None
             rows.append({
                 "bucket": b,
                 "time_start": t0,
@@ -875,6 +899,7 @@ def workload_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str
                 "device": device,
                 "group": _group_id(devices),
                 "devices": list(devices),
+                "batch": batch,
             })
     return rows
 

@@ -785,6 +785,15 @@ def test_workload_timeline_walks_the_turn_lifecycle():
         if r["devices"]:
             assert groups[tuple(r["devices"])] == r["group"]
 
+    # Each row also reports the batch executing the turn: an integer id while the
+    # turn is actively computed, and ``None`` otherwise (graph 3.4 "In batch").
+    assert "batch" in rows[0]
+    for r in rows:
+        if r["state"] in {"kv_fetch", "prefill", "decode"} and r["device"]:
+            assert isinstance(r["batch"], int)
+        elif r["state"] in {"not_arrived", "in_queue", "done"}:
+            assert r["batch"] is None
+
 
 def test_workload_graph_emits_input_and_output_nodes_per_turn():
     model = toy_model()

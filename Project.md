@@ -430,6 +430,7 @@ The default for all graphs is displayed.
 3.1 Device computing workload
 3.2 Current turn
 3.3 State (of current turn sequence): Not arrived, In queue, KV Fetch, Prefill, Decode, Done
+3.4 In batch - each executed batch will get a unique batch ID, and this displays the ID for this sequence over time; when the sequence is not actively being computed, this graph is empty.
 
 ### Workload Tab
 The workload tab provides a visualization of the workloads that were used in the run.

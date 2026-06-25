@@ -157,7 +157,7 @@ def test_workload_graphs_present():
     wl = [g for g in vm["graphs"] if g["section"] == "workload"]
     assert wl
     suffixes = {g["id"].rsplit(":", 1)[1] for g in wl}
-    assert {"device", "turn", "state"} <= suffixes
+    assert {"device", "turn", "state", "batch"} <= suffixes
 
 
 def test_view_model_carries_workload_graph():

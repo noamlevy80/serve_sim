@@ -401,6 +401,11 @@ def _workload_graphs(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
             _merge_segments(rows, lambda r: (
                 *_WORKLOAD_STATE_ABBREV.get(r["state"], (r["state"], r["state"])),
                 f"wstate:{r['state']}"))))
+        graphs.append(_discrete_graph(
+            f"wl:{w}:batch", f"In batch -- {w}", "workload", w,
+            _merge_segments(rows, lambda r: (
+                (f"B{r['batch']}", f"Batch {r['batch']}", f"batch:{r['batch']}")
+                if r.get("batch") is not None else None))))
     return graphs
 
 
