@@ -229,6 +229,29 @@ class DeviceHbmResidency:
         )
         return evicted
 
+    def preload_experts(
+        self, indices: list[int], index_bytes: float, now: float
+    ) -> bool:
+        """Pin a rank's full expert shard as part of its model's weights.
+
+        Experts are part of the weights, so they are made resident together with
+        the model. Every index in ``indices`` (each costing ``index_bytes``) is
+        admitted, but only when the whole shard fits the expert region; the set is
+        admitted atomically so no preloaded expert evicts another. Returns
+        ``True`` when the shard was pinned, ``False`` when it cannot fit -- the
+        documented exception, leaving the rank to stream its working set on
+        demand. Any KV already retained in a shared region is left untouched.
+        """
+
+        index_bytes = float(index_bytes)
+        if index_bytes <= 0.0 or not indices:
+            return False
+        if len(indices) * index_bytes > self._experts.free + 1e-9:
+            return False
+        for index in indices:
+            self._experts.admit(("expert", index), "expert", index_bytes, now)
+        return True
+
     def access_experts(
         self,
         active: frozenset[int],

@@ -669,6 +669,65 @@ def test_weight_loading_prepends_transfer_and_delays_compute():
     )
 
 
+def test_warm_start_skips_weight_load_and_runs_solo():
+    # warm_start pre-loads the suite's model onto the slot, so even with weight
+    # loading on the first batch finds its weights resident and skips the trivial
+    # cold transfer -- the request runs at solo timing with no warm-up delay.
+    model = toy_model()
+    system = make_system(1)
+    device = system.compute_devices[0]
+    req = Request(0, model, 64, 8, 0.0)
+    strat = StrategyConfig(
+        max_batch_size=1, model_weight_loading=True, warm_start=True
+    )
+
+    result = Simulator(system, strat).run([req])
+
+    assert not [e for e in result.events if e.phase == "weight_transfer"]
+    assert result.record_for(0).completion_time == pytest.approx(
+        solo_makespan(model, device, 64, 8)
+    )
+
+
+def test_warm_start_preloads_multiple_models_across_slots():
+    # Two models, two slots: warm start homes one model per slot, so both first
+    # batches are warm and no cold weight transfer is charged for either.
+    from serve_sim.model import toy_moe_model
+
+    model_a = toy_model()
+    model_b = toy_moe_model()
+    system = make_system(2)
+    strat = StrategyConfig(
+        max_batch_size=1, model_weight_loading=True, warm_start=True
+    )
+    reqs = [Request(0, model_a, 64, 8, 0.0), Request(1, model_b, 64, 8, 0.0)]
+
+    result = Simulator(system, strat).run(reqs)
+
+    assert not [e for e in result.events if e.phase == "weight_transfer"]
+
+
+def test_warm_start_preloads_experts_skipping_expert_stream():
+    # Experts are part of a model's weights: warm start makes a MoE model's
+    # routed experts resident on its slot, so the first batch finds them all
+    # cached and streams none. Without warm start the same batch must stream its
+    # working set from memory first.
+    from serve_sim.model import toy_moe_model
+
+    model = toy_moe_model()
+    system = make_system(1)
+    req = Request(0, model, 64, 8, 0.0)
+    base = dict(
+        max_batch_size=1, model_weight_loading=True, memory_policy="global_lru"
+    )
+
+    cold = Simulator(system, StrategyConfig(warm_start=False, **base)).run([req])
+    warm = Simulator(system, StrategyConfig(warm_start=True, **base)).run([req])
+
+    assert [e for e in cold.events if e.phase == "expert_transfer"]
+    assert not [e for e in warm.events if e.phase == "expert_transfer"]
+
+
 def test_weight_loading_charged_once_for_resident_model():
     # Two same-model requests serialized on one slot: only the first pays the
     # load; the second reuses the resident weights.

@@ -179,6 +179,25 @@ class EnginePool:
             raise ValueError(f"slot {slot.index} is not currently busy")
         self._load[slot.index] -= 1
 
+    def warm_start(self, models: list[object]) -> None:
+        """Pre-mark slot residency so an initial placement needs no weight load.
+
+        Distributes ``models`` (most-wanted first) across the slots round-robin
+        and records each as the resident of its slot, without changing any slot's
+        load. A later :meth:`acquire`/:meth:`place` for one of these models then
+        finds a slot already hosting it (``needs_weight_load=False``), so the
+        run skips the trivial cold weight transfer that would otherwise stream the
+        weights in. With a single model every slot is pre-warmed; with more models
+        than slots only the leading ``num_slots`` are preloaded and the rest cold
+        load on demand. This is best-effort: any model the orchestrator later
+        needs on a slot that does not host it still triggers a normal (re)load.
+        """
+
+        if not models:
+            return
+        for slot in self._slots:
+            self._resident[slot.index] = models[slot.index % len(models)]
+
     # --- internal -----------------------------------------------------------
 
     def _pick(self, candidates: list[EngineSlot], model: object | None) -> EngineSlot:

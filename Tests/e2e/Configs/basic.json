@@ -17,6 +17,7 @@
   "pipeline_parallel": 1,
   "expert_parallel": 1,
   "model_weight_loading": true,
+  "warm_start": false,
   "prefill_chunk_size": null,
   "arrival_interval_sec": 0.0,
   "max_turns_per_workload": 2,

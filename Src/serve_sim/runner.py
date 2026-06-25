@@ -158,6 +158,7 @@ def _strategy_from_config(cfg: Mapping[str, Any]) -> StrategyConfig:
         prefill_engine_fraction=float(cfg.get("prefill_engine_fraction", 0.5)),
         prefill_chunk_size=cfg.get("prefill_chunk_size"),
         model_weight_loading=bool(cfg.get("model_weight_loading", True)),
+        warm_start=bool(cfg.get("warm_start", True)),
         event_random_factor_range=float(cfg.get("event_random_factor_range", 0.05)),
         random_seed=cfg.get("random_seed"),
         global_kv_cache=bool(cfg.get("global_kv_cache", True)),

@@ -304,6 +304,11 @@ The orchestration strategy is configured by a few knobs:
 - Global KV cache: whether the system-wide, cross-conversation KV cache (with LRU eviction and KV migration across floating memories) is active.
 - Model weight loading: whether model weights are streamed from the input NVM onto an engine slot on (re)placement (with per-slot single-model residency and displacement), or assumed pre-resident.
 
+## Warm start
+The simulator shall support optional warm start.
+In this configuration, the simulator shall examine the test suite and the orchestration parameters, and preload compute groups with model weights in accordance with the chosen parallelism scheme and the models existing in the test suite.
+The simulator will make an eager effort to preload the best it can and of course if models need to be offloaded and switched during the simulation it will happen by orchestration decision.
+
 ## List of simulation parameters (to appear in config.JSON)
 - max_batch_size (default 8)
     the fundamental inference knob: the largest batch a single engine slot forms and runs at once (the window fill threshold)
@@ -323,6 +328,8 @@ The orchestration strategy is configured by a few knobs:
     If set, prefill is split into chunks of this many tokens; null means prefill the whole prompt in one shard
 - global_kv_cache (default true)
     If true, the orchestrator keeps a system-wide record of non-evicted KV, reuses the longest message-aligned prefix across conversations, offloads completed KV to floating (node) memories with arbiter-accounted transfers, and evicts by LRU at sequence granularity when the floating pool is full. If false, only the previous-turn-of-the-same-conversation reuse applies.
+- warm_start (default true)
+    Should the simulator start with preloaded weights in the engine groups.
 
 - expert_persistance_mean (default 16)    
 - expert_persistance_var (default 4)
@@ -390,7 +397,7 @@ This will display an AI-Perf style summary of the run with detailed tables showi
 ### Timeline Tab
 The timeline shall show a set of graphs all with the same horizontal axis of time.
 
-The graphs will display in a matrix of 1,2,3, or 4 columns (a selector at the top of the tab chooses the matrix configuration) and as many lines as needed, at the order specified in the list below (filling row and then column), however it shall be possible to rearrange graphs, by dragging and dropping (the graph shall pin to a location in the display matrix and shift elements to other pinned locations)
+The graphs will display in a matrix of 1,2,3,4,5, or 6 columns (a selector at the top of the tab chooses the matrix configuration) and as many lines as needed, at the order specified in the list below (filling row and then column), however it shall be possible to rearrange graphs, by dragging and dropping (the graph shall pin to a location in the display matrix and shift elements to other pinned locations)
 
 Graphs that display discrete object shall display as bars, choose different colors for different states, abbreviations on the graph and detailed text on mouse hover.
 When a state does not exist (example - transfer source when no transfer is happening) - the graph shall be empty in that range.

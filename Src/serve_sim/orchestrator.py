@@ -120,6 +120,15 @@ class StrategyConfig:
             resident weights (no reload). When ``False`` (default) weights are
             assumed pre-resident and no load is charged. Config-driven runs turn
             this on (see :func:`serve_sim.runner.run_from_config`).
+        warm_start: When ``True``, before the run the orchestrator examines the
+            suite's models and eagerly pre-loads them onto the engine slots (in
+            proportion to demand, round-robin across slots), so the first batch of
+            a pre-warmed model finds its weights already resident and skips the
+            trivial cold ``weight_load`` -- valuable simulation time is not spent
+            on start-up weight transfers. Only meaningful together with
+            ``model_weight_loading``; mid-run model offload/switch still loads
+            weights by orchestration decision. When ``False`` (default) every slot
+            starts empty and the first placement of each model cold loads.
         event_random_factor_range: Per-event time is multiplied by
             ``1 + U(-range, range)`` to model system randomness; ``0`` disables it.
         random_seed: Seed for the run's randomness (event-time perturbation);
@@ -158,6 +167,7 @@ class StrategyConfig:
     prefill_engine_fraction: float = 0.5
     prefill_chunk_size: int | None = None
     model_weight_loading: bool = False
+    warm_start: bool = False
     event_random_factor_range: float = 0.0
     random_seed: int | None = None
     global_kv_cache: bool = True
@@ -742,6 +752,80 @@ class Simulator:
 
         return self._planner_for(model).model.num_moe_layers > 0
 
+    def _distinct_models_by_demand(self, requests: list["Request"]) -> list[object]:
+        """The suite's distinct model instances, most-requested first.
+
+        Ties keep first-arrival order, so the ordering is deterministic. Used to
+        decide which models to eagerly pre-load on the engine slots for warm
+        start (the leading models win the slots when models outnumber them).
+        """
+
+        counts: dict[int, int] = {}
+        order: dict[int, int] = {}
+        models: dict[int, object] = {}
+        for pos, req in enumerate(requests):
+            key = id(req.model)
+            counts[key] = counts.get(key, 0) + 1
+            if key not in order:
+                order[key] = pos
+                models[key] = req.model
+        return [models[k] for k in sorted(models, key=lambda k: (-counts[k], order[k]))]
+
+    def _apply_warm_start(self, requests: list["Request"]) -> None:
+        """Pre-load the suite's models onto the engine slots before a run.
+
+        No-op unless ``warm_start`` is set. Marks each pool's slots as already
+        hosting the suite's models (in demand order, round-robin), so the first
+        batch of a pre-warmed model skips the cold ``weight_load``. Inert without
+        ``model_weight_loading`` (no weight loads are charged either way).
+        """
+
+        if not self.strategy.warm_start:
+            return
+        models = self._distinct_models_by_demand(requests)
+        if not models:
+            return
+        for pool in (self._pool, self._prefill_pool, self._decode_pool):
+            if pool is not None:
+                pool.warm_start(models)
+                self._warm_start_experts(pool)
+
+    def _warm_start_experts(self, pool: EnginePool) -> None:
+        """Preload each warm-started MoE model's expert shards onto its slot HBM.
+
+        Routed experts are part of a model's weights, so warm start makes them
+        resident on each expert rank's device (the configured ``expert_parallel x
+        tensor_parallel`` scheme) alongside the model, sparing the first batch the
+        expert stream. The exception is a rank whose full expert shard does not
+        fit its HBM region: it is left to stream its working set on demand. No-op
+        under the legacy ``node_first`` policy, which keeps no device residency.
+        """
+
+        if not self._hbm:
+            return
+        ep = self.strategy.expert_parallel
+        tp = self.strategy.tensor_parallel
+        for slot in pool.slots:
+            model = pool.resident_model(slot)
+            if model is None or not self._is_moe(model):
+                continue
+            if ep * tp > len(slot.devices):
+                continue
+            layered = self._planner_for(model).model
+            ffns = layered.moe_ffns()
+            if not ffns:
+                continue
+            num_experts = ffns[0].num_experts
+            index_bytes = (
+                sum(ffn.routed_expert_params for ffn in ffns)
+                * layered.param_dtype_bytes
+            ) / tp
+            for r in range(ep):
+                residency = self._hbm[id(slot.devices[r * tp])]
+                owned = [e for e in range(num_experts) if e % ep == r]
+                residency.preload_experts(owned, index_bytes, 0.0)
+
+
     def _home_node_for(self, model: object, slot: EngineSlot):
         """A representative node whose RAM streams ``model``'s experts.
 
@@ -829,6 +913,7 @@ class Simulator:
 
         arbiter = IncrementalArbiter()
         self._slot_warming_job = {}
+        self._apply_warm_start(requests)
         in_flight = 0
         batch_index = 0
         total = len(requests)
@@ -1025,6 +1110,7 @@ class Simulator:
 
         arbiter = IncrementalArbiter()
         self._slot_warming_job = {}
+        self._apply_warm_start(requests)
         in_flight = 0  # counted from prefill dispatch to decode completion
         batch_index = 0
         total = len(requests)

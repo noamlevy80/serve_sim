@@ -37,9 +37,16 @@ function colorFor(key) {
 }
 
 // --- view model state -----------------------------------------------------------
-const STATE = { vm: null, cols: 2, t0: 0, t1: 1, order: [], drag: null,
+const STATE = { vm: null, cols: 4, t0: 0, t1: 1, order: [], drag: null,
                 hidden: new Set(), treeRefs: { leaves: [], groups: [] } };
 const PAD = { l: 40, r: 42, t: 8, b: 14 };
+
+// Compute-device graph types shown by default; every other graph starts hidden.
+const DEFAULT_VISIBLE_TYPES = new Set(["compute", "bandwidth", "reason", "out_tps"]);
+function isDefaultVisible(id) {
+  if (!id.startsWith("dev:")) return false;
+  return DEFAULT_VISIBLE_TYPES.has(id.slice(id.lastIndexOf(":") + 1));
+}
 
 async function boot() {
   await loadRun(null);     // fetch + render the default run
@@ -57,7 +64,8 @@ async function loadRun(run) {
   STATE.t0 = 0;
   STATE.t1 = STATE.vm.makespan_s || 1;
   STATE.order = STATE.vm.graphs.map((g) => g.id);
-  STATE.hidden = new Set();
+  STATE.hidden = new Set(
+    STATE.vm.graphs.filter((g) => !isDefaultVisible(g.id)).map((g) => g.id));
   document.getElementById("run-id").textContent = STATE.vm.run_id;
   const start = document.getElementById("slider-start");
   const end = document.getElementById("slider-end");
