@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .blocks import DenseFFN, LayeredModel, MambaBlock, MoEFFN
+from .blocks import DenseFFN, GatedDeltaNet, LayeredModel, MambaBlock, MoEFFN
 from .hardware import MemoryDevice
 
 
@@ -187,7 +187,12 @@ class ModelWeightsTracker:
         for li, layer in enumerate(model.layers):
             mixer = layer.mixer
             if mixer is not None:
-                component = "mamba" if isinstance(mixer, MambaBlock) else "attention"
+                if isinstance(mixer, MambaBlock):
+                    component = "mamba"
+                elif isinstance(mixer, GatedDeltaNet):
+                    component = "linear_attention"
+                else:
+                    component = "attention"
                 add(component, mixer.weight_params * pdb, layer_index=li,
                     name=f"layer{li}.{component}")
             ffn = layer.ffn

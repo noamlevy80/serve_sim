@@ -1,0 +1,167 @@
+{
+  "name": "DeepSeek-V4-Pro",
+  "source": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro",
+  "note": "1.6T-param MoE (49B activated), 1M context. Novel hybrid compressed attention: Heavily Compressed Attention (HCA, kv_compression_ratio 128, local sliding window 128) and Compressed Sparse Attention (CSA, kv_compression_ratio 4 + DSA indexer top-k 1024) interleaved per the config's compress_ratios = [128, 128, 4, 128, 4, ...]. All layers are MLA with a low-rank output projection (o_lora_rank 1024, o_groups 16). First 3 layers dense, remaining 58 MoE (384 routed experts, 6 active, 1 shared). The MLA latent dims (kv_lora_rank, qk_nope_head_dim, v_head_dim) are reconstructed from the DeepSeek-V3.2 lineage as the public config truncates them; mHC hyper-connections (hc_mult 4) are a residual-path feature with negligible roofline impact and are not separately modelled.",
+  "global": {
+    "num_layers": 61,
+    "hidden_size": 7168,
+    "vocab_size": 129280,
+    "tie_word_embeddings": false,
+    "param_dtype_bytes": 1,
+    "kv_dtype_bytes": 2,
+    "layer_pattern": [
+      "dense_hca", "dense_hca", "dense_csa",
+      "moe_hca", "moe_csa", "moe_hca", "moe_csa", "moe_hca", "moe_csa",
+      "moe_hca", "moe_csa", "moe_hca", "moe_csa", "moe_hca", "moe_csa",
+      "moe_hca", "moe_csa", "moe_hca", "moe_csa", "moe_hca", "moe_csa",
+      "moe_hca", "moe_csa", "moe_hca", "moe_csa", "moe_hca", "moe_csa",
+      "moe_hca", "moe_csa", "moe_hca", "moe_csa", "moe_hca", "moe_csa",
+      "moe_hca", "moe_csa", "moe_hca", "moe_csa", "moe_hca", "moe_csa",
+      "moe_hca", "moe_csa", "moe_hca", "moe_csa", "moe_hca", "moe_csa",
+      "moe_hca", "moe_csa", "moe_hca", "moe_csa", "moe_hca", "moe_csa",
+      "moe_hca", "moe_csa", "moe_hca", "moe_csa", "moe_hca", "moe_csa",
+      "moe_hca", "moe_csa", "moe_hca", "moe_full"
+    ]
+  },
+  "blocks": {
+    "dense_hca": {
+      "block_type": "composite",
+      "attention": {
+        "block_type": "attention",
+        "attention_type": "MLA",
+        "num_query_heads": 128,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "v_head_dim": 128,
+        "o_lora_rank": 1024,
+        "o_groups": 16,
+        "sliding_window": 128,
+        "kv_compression_ratio": 128,
+        "sparse_attention": false
+      },
+      "ffn": {
+        "block_type": "ffn",
+        "ffn_type": "dense",
+        "intermediate_size": 18432,
+        "gated": true
+      }
+    },
+    "dense_csa": {
+      "block_type": "composite",
+      "attention": {
+        "block_type": "attention",
+        "attention_type": "MLA",
+        "num_query_heads": 128,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "v_head_dim": 128,
+        "o_lora_rank": 1024,
+        "o_groups": 16,
+        "kv_compression_ratio": 4,
+        "sparse_attention": true,
+        "sparse_topk": 1024,
+        "index_n_heads": 64,
+        "index_head_dim": 128
+      },
+      "ffn": {
+        "block_type": "ffn",
+        "ffn_type": "dense",
+        "intermediate_size": 18432,
+        "gated": true
+      }
+    },
+    "moe_hca": {
+      "block_type": "composite",
+      "attention": {
+        "block_type": "attention",
+        "attention_type": "MLA",
+        "num_query_heads": 128,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "v_head_dim": 128,
+        "o_lora_rank": 1024,
+        "o_groups": 16,
+        "sliding_window": 128,
+        "kv_compression_ratio": 128,
+        "sparse_attention": false
+      },
+      "ffn": {
+        "block_type": "ffn",
+        "ffn_type": "MoE",
+        "intermediate_size": 3072,
+        "gated": true,
+        "num_experts": 384,
+        "num_experts_per_token": 6,
+        "num_shared_experts": 1,
+        "shared_expert_intermediate_size": 3072
+      }
+    },
+    "moe_csa": {
+      "block_type": "composite",
+      "attention": {
+        "block_type": "attention",
+        "attention_type": "MLA",
+        "num_query_heads": 128,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "v_head_dim": 128,
+        "o_lora_rank": 1024,
+        "o_groups": 16,
+        "kv_compression_ratio": 4,
+        "sparse_attention": true,
+        "sparse_topk": 1024,
+        "index_n_heads": 64,
+        "index_head_dim": 128
+      },
+      "ffn": {
+        "block_type": "ffn",
+        "ffn_type": "MoE",
+        "intermediate_size": 3072,
+        "gated": true,
+        "num_experts": 384,
+        "num_experts_per_token": 6,
+        "num_shared_experts": 1,
+        "shared_expert_intermediate_size": 3072
+      }
+    },
+    "moe_full": {
+      "block_type": "composite",
+      "attention": {
+        "block_type": "attention",
+        "attention_type": "MLA",
+        "num_query_heads": 128,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "v_head_dim": 128,
+        "o_lora_rank": 1024,
+        "o_groups": 16,
+        "kv_compression_ratio": 1,
+        "sparse_attention": false
+      },
+      "ffn": {
+        "block_type": "ffn",
+        "ffn_type": "MoE",
+        "intermediate_size": 3072,
+        "gated": true,
+        "num_experts": 384,
+        "num_experts_per_token": 6,
+        "num_shared_experts": 1,
+        "shared_expert_intermediate_size": 3072
+      }
+    }
+  },
+  "mtp": {
+    "num_mtp_layers": 1,
+    "mtp_layer_pattern": ["attention", "moe"]
+  }
+}

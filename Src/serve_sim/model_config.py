@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .blocks import Attention, DenseFFN, Layer, LayeredModel, MoEFFN
+from .blocks import Attention, DenseFFN, GatedDeltaNet, Layer, LayeredModel, MoEFFN
 
 
 def _build_attention(spec: dict[str, Any], hidden_size: int) -> Attention:
@@ -38,6 +38,10 @@ def _build_attention(spec: dict[str, Any], hidden_size: int) -> Attention:
         sparse_topk=spec.get("sparse_topk"),
         index_n_heads=spec.get("index_n_heads"),
         index_head_dim=spec.get("index_head_dim"),
+        indexer_shared=spec.get("indexer_shared", False),
+        kv_compression_ratio=spec.get("kv_compression_ratio", 1),
+        o_lora_rank=spec.get("o_lora_rank"),
+        o_groups=spec.get("o_groups"),
     )
 
 
@@ -66,21 +70,29 @@ def _build_mixer(spec: dict[str, Any], hidden_size: int):
         from .blocks import MambaBlock  # imported lazily until implemented
 
         return MambaBlock.from_spec(spec, hidden_size)
+    if block_type == "gated_deltanet":
+        return GatedDeltaNet.from_spec(spec, hidden_size)
     return _build_attention(spec, hidden_size)
 
 
 def _build_layer(spec: dict[str, Any], hidden_size: int, name: str) -> Layer:
     block_type = spec.get("block_type")
     if block_type == "composite":
-        mixer_spec = spec.get("attention") or spec.get("mamba")
+        mixer_spec = (
+            spec.get("attention")
+            or spec.get("mamba")
+            or spec.get("linear_attention")
+        )
         if mixer_spec is None:
-            raise ValueError(f"composite block {name!r} needs an attention/mamba mixer")
+            raise ValueError(
+                f"composite block {name!r} needs an attention/mamba/linear_attention mixer"
+            )
         mixer = _build_mixer(mixer_spec, hidden_size)
         ffn = _build_ffn(spec["ffn"], hidden_size) if "ffn" in spec else None
         return Layer(mixer=mixer, ffn=ffn, name=name)
     if block_type == "attention":
         return Layer(mixer=_build_attention(spec, hidden_size), ffn=None, name=name)
-    if block_type == "mamba":
+    if block_type in ("mamba", "gated_deltanet"):
         return Layer(mixer=_build_mixer(spec, hidden_size), ffn=None, name=name)
     if block_type == "ffn":
         return Layer(mixer=None, ffn=_build_ffn(spec, hidden_size), name=name)

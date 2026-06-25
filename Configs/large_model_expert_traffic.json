@@ -16,11 +16,11 @@
     "name": "Example short randomized suite",
     "description": "Draws a handful of random multi-turn workloads from the cached source dataset and assigns each a model at random, for a quick end-to-end run.",
     "type": "randomized",
-    "num_workloads": 12,
+    "num_workloads": 32,
     "models": ["nemotron-3-ultra"]
   },
 
-  "max_batch_size": 4,
+  "max_batch_size": 8,
   "max_concurrency": null,
   "concurrency_window_sec": 0.5,
 
@@ -42,7 +42,7 @@
   "event_random_factor_range": 0.05,
   "arrival_interval_sec": 0.1,
   "arrival_variance_sec2": 0.001,
-  "max_turns_per_workload": 4,
+  "max_turns_per_workload": 3,
 
   "report_time_buckets": 256,
   "random_seed": 7

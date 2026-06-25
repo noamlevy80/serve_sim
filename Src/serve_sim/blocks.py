@@ -147,6 +147,16 @@ class Attention:
     Supports MHA/GQA and MLA (DeepSeek-style compressed-latent attention), each
     with an optional sliding window and an optional sparse (DSA) indexer overlay
     that caps the number of attended keys to ``sparse_topk``.
+
+    DeepSeek-V4 adds two further knobs: a per-layer ``kv_compression_ratio`` for
+    the hybrid compressed attention (Compressed Sparse Attention / Heavily
+    Compressed Attention), which stores a single compressed KV entry per
+    ``ratio`` tokens; and a low-rank output projection (``o_lora_rank`` /
+    ``o_groups``).
+
+    GLM-5.2 adds IndexShare: a sparse layer with ``indexer_shared=True`` reuses
+    the top-k selection computed by an earlier layer, so it still runs the
+    capped main attention but pays no indexer projection/scoring cost.
     """
 
     hidden_size: int
@@ -166,6 +176,15 @@ class Attention:
     sparse_topk: int | None = None
     index_n_heads: int | None = None
     index_head_dim: int | None = None
+    # GLM-5.2 IndexShare: reuse a neighbouring layer's index (skip indexer cost).
+    indexer_shared: bool = False
+    # V4 compressed attention (CSA/HCA): cache one compressed KV entry per
+    # ``kv_compression_ratio`` tokens; the sliding window and DSA top-k are then
+    # measured in compressed entries.
+    kv_compression_ratio: int = 1
+    # V4 low-rank output projection (factored over ``o_groups`` groups):
+    o_lora_rank: int | None = None
+    o_groups: int | None = None
 
     has_kv: bool = True
 
@@ -188,6 +207,12 @@ class Attention:
             for field in ("sparse_topk", "index_n_heads", "index_head_dim"):
                 if getattr(self, field) is None:
                     raise ValueError(f"sparse (DSA) attention requires {field}")
+        if self.kv_compression_ratio < 1:
+            raise ValueError("kv_compression_ratio must be >= 1")
+        if self.o_lora_rank is not None and self.o_lora_rank <= 0:
+            raise ValueError("o_lora_rank must be positive")
+        if self.indexer_shared and not self.sparse_attention:
+            raise ValueError("indexer_shared requires sparse (DSA) attention")
 
     # --- dimensions ---
 
@@ -204,6 +229,24 @@ class Attention:
         return (self.num_kv_heads or 0) * (self.head_dim or 0)
 
     @property
+    def _attn_output_dim(self) -> int:
+        """Width of the concatenated head outputs feeding the output projection."""
+
+        if self.is_mla:
+            return self.num_query_heads * (self.v_head_dim or 0)
+        return self.q_dim
+
+    @property
+    def _output_proj_params(self) -> int:
+        """Output projection weights (low-rank when ``o_lora_rank`` is set)."""
+
+        out_dim = self._attn_output_dim
+        if self.o_lora_rank is None:
+            return out_dim * self.hidden_size
+        groups = self.o_groups or 1
+        return out_dim * self.o_lora_rank + groups * self.o_lora_rank * self.hidden_size
+
+    @property
     def weight_params(self) -> int:
         d = self.hidden_size
         if self.is_mla:
@@ -214,20 +257,24 @@ class Attention:
                 + d * (self.kv_lora_rank + self.qk_rope_head_dim)
                 + self.kv_lora_rank * h * self.qk_nope_head_dim
                 + self.kv_lora_rank * h * self.v_head_dim
-                + h * self.v_head_dim * d
+                + self._output_proj_params
             )
-        return d * self.q_dim + 2 * d * self.kv_dim + self.q_dim * d
+        return d * self.q_dim + 2 * d * self.kv_dim + self._output_proj_params
 
-    def kv_bytes_per_token(self, kv_dtype_bytes: int) -> int:
-        """Bytes of KV cache read per attended key.
+    def kv_bytes_per_token(self, kv_dtype_bytes: int) -> float:
+        """Bytes of KV cache stored/read per token.
 
         GQA/MHA cache K and V (``2 * kv_dim``); MLA caches a single compressed
         latent plus the decoupled rope key (``kv_lora_rank + qk_rope_head_dim``).
+        DeepSeek-V4's compressed attention stores one compressed entry per
+        ``kv_compression_ratio`` tokens, scaling the footprint down accordingly.
         """
 
         if self.is_mla:
-            return (self.kv_lora_rank + self.qk_rope_head_dim) * kv_dtype_bytes
-        return 2 * self.kv_dim * kv_dtype_bytes
+            base = (self.kv_lora_rank + self.qk_rope_head_dim) * kv_dtype_bytes
+        else:
+            base = 2 * self.kv_dim * kv_dtype_bytes
+        return base / self.kv_compression_ratio
 
     @property
     def _per_pair_flops(self) -> int:
@@ -257,11 +304,14 @@ class Attention:
     def _main_and_candidate(self, keys: float) -> tuple[float, float]:
         """For ``keys`` causal keys, return (main-attended, indexer-candidate).
 
-        ``candidate`` is the window-limited key set the indexer scores; ``main``
-        is that set further capped to ``sparse_topk`` when DSA is enabled.
+        Keys are first compressed by ``kv_compression_ratio`` (CSA/HCA), so the
+        sliding window and DSA top-k below are measured in compressed KV entries.
+        ``candidate`` is the window-limited set the indexer scores; ``main`` is
+        that set further capped to ``sparse_topk`` when DSA is enabled.
         """
 
-        candidate = min(float(keys), self._window())
+        compressed = float(keys) / self.kv_compression_ratio
+        candidate = min(compressed, self._window())
         if self.sparse_attention:
             return min(candidate, float(self.sparse_topk)), candidate
         return candidate, candidate
@@ -292,7 +342,7 @@ class Attention:
         kv_bpt = self.kv_bytes_per_token(kv_dtype_bytes)
         flops = 2.0 * new_tokens * self.weight_params + self._per_pair_flops * main_pairs
         bytes_read = self.weight_params * param_dtype_bytes + prior_main * kv_bpt
-        if self.sparse_attention:
+        if self.sparse_attention and not self.indexer_shared:
             flops += 2.0 * new_tokens * self._indexer_proj_params + self._indexer_per_pair * cand_pairs
             bytes_read += (
                 self._indexer_proj_params * param_dtype_bytes
@@ -318,7 +368,7 @@ class Attention:
         kv_bpt = self.kv_bytes_per_token(kv_dtype_bytes)
         flops = 2.0 * batch * self.weight_params + self._per_pair_flops * main_sum
         bytes_read = self.weight_params * param_dtype_bytes + main_sum * kv_bpt
-        if self.sparse_attention:
+        if self.sparse_attention and not self.indexer_shared:
             flops += 2.0 * batch * self._indexer_proj_params + self._indexer_per_pair * cand_sum
             bytes_read += (
                 self._indexer_proj_params * param_dtype_bytes
@@ -418,9 +468,124 @@ class MambaBlock:
         )
 
 
+# --- gated delta-net block -----------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GatedDeltaNet:
+    """Gated DeltaNet linear-attention mixer (Qwen3.5/3.6, Qwen3-Next).
+
+    A linear-attention layer with separate query/key heads (``num_key_heads``)
+    and value heads (``num_value_heads``), a short depthwise causal conv1d, a
+    gated delta-rule recurrence, and an output (swish) gate. Like Mamba, the
+    recurrent state has a fixed size, so the layer holds **no KV cache** and its
+    per-step cost is independent of sequence length.
+    """
+
+    hidden_size: int
+    num_key_heads: int
+    num_value_heads: int
+    key_head_dim: int
+    value_head_dim: int
+    conv_kernel_dim: int = 4
+    has_kv: bool = False
+
+    @property
+    def _q_dim(self) -> int:
+        return self.num_key_heads * self.key_head_dim
+
+    @property
+    def _k_dim(self) -> int:
+        return self.num_key_heads * self.key_head_dim
+
+    @property
+    def _v_dim(self) -> int:
+        return self.num_value_heads * self.value_head_dim
+
+    @property
+    def _qkv_proj_params(self) -> int:
+        return self.hidden_size * (self._q_dim + self._k_dim + self._v_dim)
+
+    @property
+    def _conv_channels(self) -> int:
+        return self._q_dim + self._k_dim + self._v_dim
+
+    @property
+    def _conv_params(self) -> int:
+        return self._conv_channels * self.conv_kernel_dim
+
+    @property
+    def _gate_params(self) -> int:
+        # output (swish) gate over the value projection, plus tiny per-value-head
+        # decay (a) and beta gates.
+        return self.hidden_size * (self._v_dim + 2 * self.num_value_heads)
+
+    @property
+    def _out_proj_params(self) -> int:
+        return self._v_dim * self.hidden_size
+
+    @property
+    def weight_params(self) -> int:
+        return (
+            self._qkv_proj_params
+            + self._conv_params
+            + self._gate_params
+            + self._out_proj_params
+        )
+
+    @property
+    def _recurrence_flops_per_token(self) -> int:
+        # delta-rule state update + readout (~state size per value head), plus the
+        # depthwise causal conv.
+        state = 4 * self.num_value_heads * self.key_head_dim * self.value_head_dim
+        conv = 2 * self._conv_channels * self.conv_kernel_dim
+        return state + conv
+
+    def kv_bytes_per_token(self, kv_dtype_bytes: int) -> int:
+        return 0
+
+    def prefill_cost(
+        self,
+        new_tokens: int,
+        cached: int,
+        start: int,
+        param_dtype_bytes: int,
+        kv_dtype_bytes: int,
+    ) -> tuple[float, float]:
+        flops = (
+            2.0 * new_tokens * self.weight_params
+            + new_tokens * self._recurrence_flops_per_token
+        )
+        return flops, float(self.weight_params * param_dtype_bytes)
+
+    def decode_cost(
+        self,
+        contexts: list[int],
+        param_dtype_bytes: int,
+        kv_dtype_bytes: int,
+    ) -> tuple[float, float]:
+        batch = len(contexts)
+        flops = (
+            2.0 * batch * self.weight_params
+            + batch * self._recurrence_flops_per_token
+        )
+        return flops, float(self.weight_params * param_dtype_bytes)
+
+    @classmethod
+    def from_spec(cls, spec: dict, hidden_size: int) -> "GatedDeltaNet":
+        return cls(
+            hidden_size=hidden_size,
+            num_key_heads=spec["num_key_heads"],
+            num_value_heads=spec["num_value_heads"],
+            key_head_dim=spec["key_head_dim"],
+            value_head_dim=spec["value_head_dim"],
+            conv_kernel_dim=spec.get("conv_kernel_dim", 4),
+        )
+
+
 # --- layer + model -------------------------------------------------------------
 
-Mixer = Attention | MambaBlock
+Mixer = Attention | MambaBlock | GatedDeltaNet
 FFN = DenseFFN | MoEFFN
 
 
@@ -432,7 +597,7 @@ class Layer:
     interleaved mamba / attention / moe blocks) have exactly one.
     """
 
-    mixer: Attention | MambaBlock | None = None
+    mixer: Attention | MambaBlock | GatedDeltaNet | None = None
     ffn: DenseFFN | MoEFFN | None = None
     name: str = ""
 

@@ -1,0 +1,72 @@
+{
+  "name": "Qwen3.6-27B",
+  "source": "https://huggingface.co/Qwen/Qwen3.6-27B",
+  "note": "Dense 27B hybrid (qwen3_5). 64 layers in a [linear x3, full] x16 pattern: linear layers use a Gated DeltaNet mixer (no KV cache), full layers use GQA (24 query / 4 kv heads, head_dim 256, partial rotary 0.25). Every layer has its own dense gated (SwiGLU) FFN, intermediate 17408. Text config only; the vision encoder is not modelled.",
+  "global": {
+    "num_layers": 64,
+    "hidden_size": 5120,
+    "vocab_size": 248320,
+    "tie_word_embeddings": false,
+    "param_dtype_bytes": 2,
+    "kv_dtype_bytes": 2,
+    "layer_pattern": [
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full"
+    ]
+  },
+  "blocks": {
+    "linear": {
+      "block_type": "composite",
+      "linear_attention": {
+        "block_type": "gated_deltanet",
+        "num_key_heads": 16,
+        "num_value_heads": 48,
+        "key_head_dim": 128,
+        "value_head_dim": 128,
+        "conv_kernel_dim": 4
+      },
+      "ffn": {
+        "block_type": "ffn",
+        "ffn_type": "dense",
+        "intermediate_size": 17408,
+        "gated": true
+      }
+    },
+    "full": {
+      "block_type": "composite",
+      "attention": {
+        "block_type": "attention",
+        "attention_type": "GQA",
+        "num_query_heads": 24,
+        "num_kv_heads": 4,
+        "head_dim": 256,
+        "sliding_window": null,
+        "sparse_attention": false
+      },
+      "ffn": {
+        "block_type": "ffn",
+        "ffn_type": "dense",
+        "intermediate_size": 17408,
+        "gated": true
+      }
+    }
+  },
+  "mtp": {
+    "num_mtp_layers": 1,
+    "mtp_layer_pattern": ["linear", "ffn"]
+  }
+}

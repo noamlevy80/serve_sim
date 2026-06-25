@@ -1,0 +1,119 @@
+{
+  "name": "GLM-5.2",
+  "source": "https://huggingface.co/zai-org/GLM-5.2",
+  "note": "753B-param MoE (glm_moe_dsa), 1M context. DeepSeek-V3.2-style MLA with DeepSeek Sparse Attention (DSA): every layer keeps a low-rank latent KV and a lightning indexer that selects the top-k=2048 keys for the main attention. GLM-5.2's novelty is IndexShare (arXiv:2603.12201): the indexer is recomputed only once per group of index_topk_freq=4 layers ('full') and reused by the other three ('shared'), cutting per-token attention FLOPs ~2.9x at 1M context. We model this with indexer_shared on the shared layers, which still run the top-k-capped main attention but pay no indexer projection/scoring cost. First 3 layers dense FFN, remaining 75 MoE (256 routed experts, 8 active, 1 shared). The full/shared phase is reconstructed from the config's indexer_types (the public array is truncated): dense layers 0-2 each compute their own index, then each block of 4 MoE layers computes the index on its first layer.",
+  "global": {
+    "num_layers": 78,
+    "hidden_size": 6144,
+    "vocab_size": 154880,
+    "tie_word_embeddings": false,
+    "param_dtype_bytes": 2,
+    "kv_dtype_bytes": 2,
+    "layer_pattern": [
+      "dense_full", "dense_full", "dense_full",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared", "moe_shared",
+      "moe_full", "moe_shared", "moe_shared"
+    ]
+  },
+  "blocks": {
+    "dense_full": {
+      "block_type": "composite",
+      "attention": {
+        "block_type": "attention",
+        "attention_type": "MLA",
+        "num_query_heads": 64,
+        "q_lora_rank": 2048,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 192,
+        "v_head_dim": 256,
+        "sparse_attention": true,
+        "sparse_topk": 2048,
+        "index_n_heads": 32,
+        "index_head_dim": 128
+      },
+      "ffn": {
+        "block_type": "ffn",
+        "ffn_type": "dense",
+        "intermediate_size": 12288,
+        "gated": true
+      }
+    },
+    "moe_full": {
+      "block_type": "composite",
+      "attention": {
+        "block_type": "attention",
+        "attention_type": "MLA",
+        "num_query_heads": 64,
+        "q_lora_rank": 2048,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 192,
+        "v_head_dim": 256,
+        "sparse_attention": true,
+        "sparse_topk": 2048,
+        "index_n_heads": 32,
+        "index_head_dim": 128
+      },
+      "ffn": {
+        "block_type": "ffn",
+        "ffn_type": "MoE",
+        "intermediate_size": 2048,
+        "gated": true,
+        "num_experts": 256,
+        "num_experts_per_token": 8,
+        "num_shared_experts": 1,
+        "shared_expert_intermediate_size": 2048
+      }
+    },
+    "moe_shared": {
+      "block_type": "composite",
+      "attention": {
+        "block_type": "attention",
+        "attention_type": "MLA",
+        "num_query_heads": 64,
+        "q_lora_rank": 2048,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 192,
+        "v_head_dim": 256,
+        "sparse_attention": true,
+        "sparse_topk": 2048,
+        "index_n_heads": 32,
+        "index_head_dim": 128,
+        "indexer_shared": true
+      },
+      "ffn": {
+        "block_type": "ffn",
+        "ffn_type": "MoE",
+        "intermediate_size": 2048,
+        "gated": true,
+        "num_experts": 256,
+        "num_experts_per_token": 8,
+        "num_shared_experts": 1,
+        "shared_expert_intermediate_size": 2048
+      }
+    }
+  },
+  "mtp": {
+    "num_mtp_layers": 1,
+    "mtp_layer_pattern": ["attention", "moe"]
+  }
+}

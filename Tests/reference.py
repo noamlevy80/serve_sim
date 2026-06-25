@@ -169,7 +169,7 @@ def reference_two_tier(
 
 # --- independent reference for heterogeneous (layered) models -------------------
 
-from serve_sim.blocks import Attention, DenseFFN, LayeredModel, MambaBlock, MoEFFN  # noqa: E402
+from serve_sim.blocks import Attention, DenseFFN, GatedDeltaNet, LayeredModel, MambaBlock, MoEFFN  # noqa: E402
 
 _INF = float("inf")
 
@@ -210,6 +210,17 @@ def _ref_attn_dims(attn: Attention) -> tuple[int, int]:
     return q_dim, kv_dim
 
 
+def _ref_attn_output_proj(attn) -> int:
+    if attn.attention_type == "MLA":
+        out_dim = attn.num_query_heads * attn.v_head_dim
+    else:
+        out_dim = attn.num_query_heads * attn.head_dim
+    if attn.o_lora_rank is None:
+        return out_dim * attn.hidden_size
+    groups = attn.o_groups or 1
+    return out_dim * attn.o_lora_rank + groups * attn.o_lora_rank * attn.hidden_size
+
+
 def _ref_attn_weight(attn) -> int:
     d = attn.hidden_size
     if attn.attention_type == "MLA":
@@ -220,10 +231,10 @@ def _ref_attn_weight(attn) -> int:
             + d * (attn.kv_lora_rank + attn.qk_rope_head_dim)
             + attn.kv_lora_rank * h * attn.qk_nope_head_dim
             + attn.kv_lora_rank * h * attn.v_head_dim
-            + h * attn.v_head_dim * d
+            + _ref_attn_output_proj(attn)
         )
     q_dim, kv_dim = _ref_attn_dims(attn)
-    return d * q_dim + 2 * d * kv_dim + q_dim * d
+    return d * q_dim + 2 * d * kv_dim + _ref_attn_output_proj(attn)
 
 
 def _ref_attn_per_pair(attn) -> int:
@@ -234,15 +245,18 @@ def _ref_attn_per_pair(attn) -> int:
     return 4 * q_dim
 
 
-def _ref_attn_kv_bpt(attn, kvdb) -> int:
+def _ref_attn_kv_bpt(attn, kvdb) -> float:
     if attn.attention_type == "MLA":
-        return (attn.kv_lora_rank + attn.qk_rope_head_dim) * kvdb
-    _, kv_dim = _ref_attn_dims(attn)
-    return 2 * kv_dim * kvdb
+        base = (attn.kv_lora_rank + attn.qk_rope_head_dim) * kvdb
+    else:
+        _, kv_dim = _ref_attn_dims(attn)
+        base = 2 * kv_dim * kvdb
+    return base / attn.kv_compression_ratio
 
 
 def _ref_main_cand(attn, keys, window) -> tuple[float, float]:
-    cand = min(float(keys), window)
+    compressed = float(keys) / attn.kv_compression_ratio
+    cand = min(compressed, window)
     if attn.sparse_attention:
         return min(cand, float(attn.sparse_topk)), cand
     return cand, cand
@@ -262,7 +276,7 @@ def _ref_attn_prefill(attn, tokens, cached, start, pdb, kvdb) -> tuple[float, fl
     prior_main, prior_cand = _ref_main_cand(attn, cached + start, window)
     flops = 2.0 * tokens * wp + per_pair * main_pairs
     bytes_read = wp * pdb + prior_main * kv_bpt
-    if attn.sparse_attention:
+    if attn.sparse_attention and not attn.indexer_shared:
         idx_proj = attn.hidden_size * attn.index_n_heads * attn.index_head_dim
         flops += 2.0 * tokens * idx_proj + 2 * attn.index_n_heads * attn.index_head_dim * cand_pairs
         bytes_read += idx_proj * pdb + prior_cand * attn.index_head_dim * kvdb
@@ -283,7 +297,7 @@ def _ref_attn_decode(attn, contexts, pdb, kvdb) -> tuple[float, float]:
     batch = len(contexts)
     flops = 2.0 * batch * wp + per_pair * main_sum
     bytes_read = wp * pdb + main_sum * kv_bpt
-    if attn.sparse_attention:
+    if attn.sparse_attention and not attn.indexer_shared:
         idx_proj = attn.hidden_size * attn.index_n_heads * attn.index_head_dim
         flops += 2.0 * batch * idx_proj + 2 * attn.index_n_heads * attn.index_head_dim * cand_sum
         bytes_read += idx_proj * pdb + cand_sum * attn.index_head_dim * kvdb
@@ -299,6 +313,23 @@ def _ref_mamba_cost(mixer, tokens, pdb) -> tuple[float, float]:
     wp = in_proj + conv + out_proj
     ssm = 4 * d_inner * mixer.d_state
     flops = 2.0 * tokens * wp + tokens * ssm
+    return flops, float(wp * pdb)
+
+
+def _ref_gdn_cost(mixer, tokens, pdb) -> tuple[float, float]:
+    d = mixer.hidden_size
+    q_dim = mixer.num_key_heads * mixer.key_head_dim
+    k_dim = mixer.num_key_heads * mixer.key_head_dim
+    v_dim = mixer.num_value_heads * mixer.value_head_dim
+    qkv = d * (q_dim + k_dim + v_dim)
+    conv_channels = q_dim + k_dim + v_dim
+    conv = conv_channels * mixer.conv_kernel_dim
+    gate = d * (v_dim + 2 * mixer.num_value_heads)
+    out_proj = v_dim * d
+    wp = qkv + conv + gate + out_proj
+    state = 4 * mixer.num_value_heads * mixer.key_head_dim * mixer.value_head_dim
+    rec = state + 2 * conv_channels * mixer.conv_kernel_dim
+    flops = 2.0 * tokens * wp + tokens * rec
     return flops, float(wp * pdb)
 
 
@@ -337,6 +368,8 @@ def reference_layered(
                 if layer.mixer is not None:
                     if isinstance(layer.mixer, MambaBlock):
                         f, b = _ref_mamba_cost(layer.mixer, tokens, pdb)
+                    elif isinstance(layer.mixer, GatedDeltaNet):
+                        f, b = _ref_gdn_cost(layer.mixer, tokens, pdb)
                     else:
                         f, b = _ref_attn_prefill(
                             layer.mixer, tokens, seq.cached_tokens, start, pdb, kvdb
@@ -363,6 +396,8 @@ def reference_layered(
             if layer.mixer is not None:
                 if isinstance(layer.mixer, MambaBlock):
                     f, b = _ref_mamba_cost(layer.mixer, batch_size, pdb)
+                elif isinstance(layer.mixer, GatedDeltaNet):
+                    f, b = _ref_gdn_cost(layer.mixer, batch_size, pdb)
                 else:
                     f, b = _ref_attn_decode(layer.mixer, contexts, pdb, kvdb)
                 flops += f
