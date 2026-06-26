@@ -159,10 +159,13 @@ fit one device is rejected earlier, in `_parallelism_for`.)
 1. Add `Systems/<name>.json`: `name`, `network` (scale-up + CXL bandwidth/latency), `input_memory`
    (the shared NVM stem holding all weights at init), and `nodes`.
 2. Each node: `name`, optional `node_memory` (the "floating" CPU memory — see KV cache below), and
-   `compute_devices` as `{"device": "<stem>", "count": N}`.
+   `compute_devices` as `{"device": "<stem>", "count": N}`. An optional node-level `"count": N`
+   replicates the whole node N times.
 3. **Identity matters:** `count: 4` expands to four *distinct* device instances, each with its own
    first-tier memory and a node-qualified name (`"NVIDIA B200 [node-0 #2]"`). The arbiter and event
-   generator contend on object identity, so never share one instance across logical devices.
+   generator contend on object identity, so never share one instance across logical devices. A
+   node-level `count` likewise yields distinct nodes, each uniquely named (`"pod #2"`) so the node
+   memory and device names stay conflict-free across copies.
 4. Point a config's `system` at the new file.
 5. Tests: [Tests/test_system.py](Tests/test_system.py), [Tests/test_placement.py](Tests/test_placement.py).
 

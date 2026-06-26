@@ -215,6 +215,49 @@ def test_zero_count_is_rejected() -> None:
         build(config)
 
 
+# --- node-level count (replicating whole nodes) --------------------------------
+
+
+def test_node_count_expands_to_distinct_nodes() -> None:
+    config = _base_config()
+    config["nodes"][0]["count"] = 3
+    system = build(config)
+    assert len(system.nodes) == 3
+    # Replicated nodes get unique, index-qualified names.
+    assert [n.name for n in system.nodes] == ["n0 #0", "n0 #1", "n0 #2"]
+    # Every compute device across every copy is a distinct instance...
+    devices = system.compute_devices
+    assert system.num_compute_devices == 6
+    assert len({id(d) for d in devices}) == len(devices)
+    # ...with a unique name and a distinct first-tier memory instance.
+    assert len({d.name for d in devices}) == len(devices)
+    assert len({id(d.first_tier_memory) for d in devices}) == len(devices)
+
+
+def test_node_count_qualifies_node_memory_names() -> None:
+    config = _base_config()
+    config["nodes"][0]["node_memory"] = "nvidia-grace-lpddr5x"
+    config["nodes"][0]["count"] = 2
+    system = build(config)
+    mem_names = [n.node_memory.name for n in system.nodes]
+    assert mem_names[0] != mem_names[1]
+    assert mem_names[0].endswith("[n0 #0]")
+    assert mem_names[1].endswith("[n0 #1]")
+
+
+def test_node_count_defaults_to_one_keeps_plain_name() -> None:
+    system = build(_base_config())
+    assert len(system.nodes) == 1
+    assert system.nodes[0].name == "n0"
+
+
+def test_zero_node_count_is_rejected() -> None:
+    config = _base_config()
+    config["nodes"][0]["count"] = 0
+    with pytest.raises(ValueError):
+        build(config)
+
+
 def test_system_requires_at_least_one_node() -> None:
     config = _base_config(nodes=[])
     with pytest.raises(ValueError):

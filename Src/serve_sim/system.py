@@ -16,6 +16,12 @@ per-device reports. The single input memory is one shared instance; each node's
 node memory is one instance per node, given a node-qualified name (e.g.
 ``"NVIDIA Grace LPDDR5X [node-0]"``) so same-type node memories stay
 distinguishable in per-memory reports.
+
+A whole node can likewise be replicated with a node-level ``"count"``: a node
+entry with ``"count": 8`` is expanded into eight *distinct* :class:`Node` s,
+each given a unique name (the base name qualified with a per-copy index, e.g.
+``"pod #2"``) so the node memory and every compute-device instance -- both of
+which qualify their names on the owning node -- stay conflict-free across copies.
 """
 
 from __future__ import annotations
@@ -267,6 +273,54 @@ def _name_instance(
     )
 
 
+def _build_node(
+    raw_node: Mapping[str, Any],
+    node_name: str,
+    compute_dir: Path,
+    memory_dir: Path,
+) -> Node:
+    """Instantiate one :class:`Node` from its config under a given name.
+
+    ``node_name`` is the (already uniquified) name to give this node; it is used
+    to qualify the node memory and every compute-device instance so all instances
+    stay distinguishable in per-node and per-device reports.
+    """
+
+    node_memory = None
+    node_memory_stem = raw_node.get("node_memory")
+    if node_memory_stem is not None:
+        node_memory = load_memory_device(memory_dir / f"{node_memory_stem}.json")
+        # Each node owns a distinct node-memory instance; qualify its name
+        # with the node so same-type node memories stay distinguishable in
+        # per-memory reports (events key utilization by memory name).
+        node_memory = replace(node_memory, name=f"{node_memory.name} [{node_name}]")
+
+    devices: list[ComputeDevice] = []
+    for entry in raw_node["compute_devices"]:
+        count = entry.get("count", 1)
+        if count < 1:
+            raise ValueError("compute device 'count' must be >= 1")
+        device_path = compute_dir / f"{entry['device']}.json"
+        # A fresh load per instance gives each device its own first-tier
+        # memory instance (identity matters for resource contention). Each
+        # instance is also given a unique, node-qualified name so it is
+        # distinguishable in logs and per-device reports.
+        for _ in range(count):
+            device = load_compute_device(device_path, memory_dir=memory_dir)
+            index = len(devices)
+            device = _name_instance(device, node_name, index)
+            devices.append(device)
+
+    if not devices:
+        raise ValueError(f"node {node_name!r} has no compute devices")
+
+    return Node(
+        name=node_name,
+        compute_devices=tuple(devices),
+        node_memory=node_memory,
+    )
+
+
 def system_from_config(
     config: Mapping[str, Any],
     compute_dir: str | Path,
@@ -288,43 +342,21 @@ def system_from_config(
 
     nodes: list[Node] = []
     for raw_node in config["nodes"]:
-        node_memory = None
-        node_memory_stem = raw_node.get("node_memory")
-        if node_memory_stem is not None:
-            node_memory = load_memory_device(memory_dir / f"{node_memory_stem}.json")
-            # Each node owns a distinct node-memory instance; qualify its name
-            # with the node so same-type node memories stay distinguishable in
-            # per-memory reports (events key utilization by memory name).
-            node_memory = replace(
-                node_memory, name=f"{node_memory.name} [{raw_node['name']}]"
+        node_count = raw_node.get("count", 1)
+        if node_count < 1:
+            raise ValueError("node 'count' must be >= 1")
+        # A node with ``count`` > 1 is expanded into that many *distinct* nodes.
+        # Each copy is given a unique name (the base name qualified with a
+        # per-copy index, e.g. ``"pod #2"``) so the node memory and every
+        # compute-device instance -- which qualify their names on the owning
+        # node's name -- stay distinct across copies. A single node (``count``
+        # == 1) keeps its plain name for backward compatibility.
+        base_name = raw_node["name"]
+        for copy_index in range(node_count):
+            node_name = base_name if node_count == 1 else f"{base_name} #{copy_index}"
+            nodes.append(
+                _build_node(raw_node, node_name, compute_dir, memory_dir)
             )
-
-        devices: list[ComputeDevice] = []
-        for entry in raw_node["compute_devices"]:
-            count = entry.get("count", 1)
-            if count < 1:
-                raise ValueError("compute device 'count' must be >= 1")
-            device_path = compute_dir / f"{entry['device']}.json"
-            # A fresh load per instance gives each device its own first-tier
-            # memory instance (identity matters for resource contention). Each
-            # instance is also given a unique, node-qualified name so it is
-            # distinguishable in logs and per-device reports.
-            for _ in range(count):
-                device = load_compute_device(device_path, memory_dir=memory_dir)
-                index = len(devices)
-                device = _name_instance(device, raw_node["name"], index)
-                devices.append(device)
-
-        if not devices:
-            raise ValueError(f"node {raw_node['name']!r} has no compute devices")
-
-        nodes.append(
-            Node(
-                name=raw_node["name"],
-                compute_devices=tuple(devices),
-                node_memory=node_memory,
-            )
-        )
 
     return System(
         name=config["name"],
