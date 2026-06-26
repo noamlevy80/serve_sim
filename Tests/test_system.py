@@ -2,8 +2,10 @@
 
 A system config names a network, an input memory and a list of nodes; each node
 expands ``{"device": ..., "count": N}`` entries into N distinct compute-device
-instances. The repo ships two sample systems we assert against, plus synthetic
-configs for the edge cases.
+instances. Topology assertions load from a frozen, test-owned fixture tree
+(``Tests/fixtures/``) so edits to the shipped, user-editable ``Systems/``
+examples cannot change what these tests assert; a single smoke test still checks
+that every shipped config parses. Synthetic configs cover the edge cases.
 """
 
 from __future__ import annotations
@@ -22,11 +24,18 @@ from serve_sim.system import (
 from serve_sim.hardware import ComputeDevice, MemoryDevice
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SYSTEMS_DIR = REPO_ROOT / "Systems"
-COMPUTE_DIR = REPO_ROOT / "Compute_devices"
-MEMORY_DIR = REPO_ROOT / "Memory_devices"
+# Tests that assert a *specific* topology load from a frozen, test-owned fixture
+# tree so edits to the shipped, user-editable ``Systems/`` examples can never
+# silently change (or break) what these tests check. The repo-level ``Systems/``
+# directory is only used by the smoke test below, which deliberately verifies
+# that every shipped config still parses.
+SHIPPED_SYSTEMS_DIR = REPO_ROOT / "Systems"
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+SYSTEMS_DIR = FIXTURES_DIR / "Systems"
+COMPUTE_DIR = FIXTURES_DIR / "Compute_devices"
+MEMORY_DIR = FIXTURES_DIR / "Memory_devices"
 
-SYSTEM_FILES = sorted(SYSTEMS_DIR.glob("*.json"))
+SYSTEM_FILES = sorted(SHIPPED_SYSTEMS_DIR.glob("*.json"))
 
 
 def load(name: str) -> System:

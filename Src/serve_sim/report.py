@@ -305,6 +305,19 @@ def _occupancy_at(jobs: Sequence[JobRecord], device: str, t: float) -> float:
                if device in j.devices and j.start <= t < j.end)
 
 
+def _resident_tasks_at(jobs: Sequence[JobRecord], device: str, t: float) -> int:
+    """How many jobs (running batches) are resident on ``device`` at instant ``t``.
+
+    A job pins its footprint on its serving devices for its whole ``[start, end)``
+    span, so this counts every batch concurrently resident -- not just the one
+    dominating compute -- and tracks the memory-occupancy series instant for
+    instant.
+    """
+
+    return sum(1 for j in jobs
+               if device in j.devices and j.start <= t < j.end)
+
+
 _TRANSFER_PHASES = ("transfer", "weight_transfer", "expert_transfer")
 
 
@@ -431,7 +444,8 @@ def device_timeline(
     (FLOP/s) and first-tier bandwidth (bytes/s) in the bucket, the first-tier
     occupancy split into KV vs weights (``content``), a discrete label for any
     incoming transfer (its source memory and what it moves), the current task's
-    batch size, and the effective decode (output) and prefill (input) token
+    batch size, the number of tasks (running batches) concurrently resident on
+    the device, and the effective decode (output) and prefill (input) token
     throughput -- the same for every device in the task's engine group -- so the
     visualization can plot absolute values against the device's static ceilings.
     """
@@ -502,6 +516,7 @@ def device_timeline(
                 "memory_bytes": _occupancy_at(result.jobs, name, t0),
                 "content": content,
                 "batch_size": batch_size,
+                "resident_tasks": _resident_tasks_at(result.jobs, name, t0),
                 "decode_tokens_per_s": decode_tps.get((name, b), 0.0),
                 "prefill_tokens_per_s": prefill_tps.get((name, b), 0.0),
                 "compute_flops_per_s": bucket_flops / width if width else 0.0,
@@ -1469,7 +1484,8 @@ def write_outputs(
     _write_csv(
         out / "device_timeline.csv",
         ["bucket", "time_start", "time_end", "device", "busy_fraction",
-         "memory_bytes", "content_json", "batch_size", "decode_tokens_per_s",
+         "memory_bytes", "content_json", "batch_size", "resident_tasks",
+         "decode_tokens_per_s",
          "prefill_tokens_per_s", "compute_flops_per_s", "compute_seconds",
          "first_tier_bytes_per_s", "bandwidth_seconds", "transfer_source",
          "transfer_object", *(f"{state}_fraction" for state in DEVICE_STATES)],

@@ -428,6 +428,7 @@ The default for all graphs is displayed.
 1.7 Current task batch size (0 if device is idle)
 1.8 Effective device output token throughput (total tokens per second of current task) - if device is a rank in a parallelism group, this is the effective throughput of the part of the token generation the device is responsible for. When not decoding this is 0
 1.9 Effective device input token throughput, similar to 1.8 but for prefill; when not prefilling, this is 0.
+1.10 Number of resident tasks - the total number of current resident tasks (running batches) on the device
 2. For each independent memory device:
 2.1 Bandwidth used (with both absolute and relative to max)
 2.2 Capacity used (with both absolute and relative to max) - broken down by content - KV and weights

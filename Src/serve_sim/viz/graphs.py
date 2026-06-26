@@ -325,6 +325,9 @@ def _device_graphs(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         graphs.append(_value_graph(
             f"dev:{name}:in_tps", f"Input token throughput -- {name}",
             "compute_device", name, "tok/s", None, rows, "prefill_tokens_per_s"))
+        graphs.append(_value_graph(
+            f"dev:{name}:resident", f"Resident tasks -- {name}", "compute_device",
+            name, "tasks", None, rows, "resident_tasks"))
     return graphs
 
 

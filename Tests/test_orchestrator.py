@@ -816,20 +816,37 @@ def test_no_weight_decisions_without_weight_loading():
 # --- memory-capacity enforcement -----------------------------------------------
 
 
-def test_run_raises_when_device_memory_oversubscribed():
-    from serve_sim.orchestrator import MemoryCapacityExceeded
-
-    model = toy_model()
+def test_back_pressure_serializes_when_device_memory_tight():
     # One job's footprint (~7.6 MB for 72 KV tokens) fits, but two concurrent
-    # jobs sharing the single device overflow this capacity.
+    # jobs sharing the single device would overflow it. Rather than crash, the
+    # orchestrator applies back-pressure: the second job waits for the first to
+    # complete and free memory, so both run to completion -- serialized, not
+    # overlapped.
+    model = toy_model()
     system = make_system(1, cap=10e6)
     reqs = [Request(0, model, 64, 8, 0.0), Request(1, model, 64, 8, 0.0)]
 
-    with pytest.raises(MemoryCapacityExceeded) as exc:
-        Simulator(system, StrategyConfig(max_batch_size=1)).run(reqs)
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run(reqs)
 
-    assert exc.value.device == system.compute_devices[0].name
-    assert exc.value.peak_bytes > exc.value.capacity_bytes
+    assert len(result.records) == 2
+    # The two jobs never co-reside: one ends no later than the other starts.
+    assert len(result.jobs) == 2
+    a, b = sorted(result.jobs, key=lambda j: j.start)
+    assert a.end <= b.start + 1e-9
+
+
+def test_run_raises_when_single_job_exceeds_device_memory():
+    from serve_sim.orchestrator import MemoryCapacityExceeded
+
+    model = toy_model()
+    # A single job's footprint exceeds even an empty device's capacity: no amount
+    # of back-pressure can help, so the run still aborts rather than serializing
+    # an impossible batch.
+    system = make_system(1, cap=1e6)
+    req = Request(0, model, 64, 8, 0.0)
+
+    with pytest.raises((ValueError, MemoryCapacityExceeded)):
+        Simulator(system, StrategyConfig(max_batch_size=1)).run([req])
 
 
 def test_run_succeeds_when_footprint_fits():

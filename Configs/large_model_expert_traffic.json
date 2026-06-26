@@ -20,7 +20,7 @@
     "models": ["deepseek-v4-pro"]
   },
 
-  "max_batch_size": 8,
+  "max_batch_size": 1,
   "max_concurrency": null,
   "concurrency_window_sec": 0.5,
 
@@ -34,9 +34,9 @@
 
   "auto_parallelism": true,
   "pipeline_parallel": 1,
-  "expert_parallel": 32,
+  "expert_parallel": 12,
   "tensor_parallel": 1,
-  "max_parallelism": 32,
+  "max_parallelism": 12,
 
   "prefill_chunk_size": null,
   "event_random_factor_range": 0.05,

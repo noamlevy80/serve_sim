@@ -1,0 +1,7 @@
+{
+  "name": "Cerebras WSE-3 On-Chip SRAM",
+  "source": "https://www.cerebras.ai/product-chip (WSE-3: 44 GB on-chip SRAM, 21 PB/s memory bandwidth)",
+  "capacity_bytes": 4.4e10,
+  "bandwidth_bytes_per_s": 2.1e16,
+  "notes": "Single first tier: 44 GB of on-wafer SRAM at 21 PB/s. There is no separate on-package DRAM tier."
+}

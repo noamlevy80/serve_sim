@@ -1,0 +1,7 @@
+{
+  "name": "NVIDIA B200 HBM3e",
+  "source": "https://www.nvidia.com/en-us/data-center/dgx-b200/ (DGX B200: 1,440 GB / 64 TB/s across 8 GPUs => 180 GB / 8 TB/s per GPU)",
+  "capacity_bytes": 1.8e11,
+  "bandwidth_bytes_per_s": 8.0e12,
+  "notes": "Per-GPU first-tier HBM3e. 180 GB at 8 TB/s."
+}

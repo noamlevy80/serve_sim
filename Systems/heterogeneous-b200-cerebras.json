@@ -1,6 +1,6 @@
 {
   "name": "Heterogeneous B200 + Cerebras WSE-3",
-  "description": "Two heterogeneous nodes: node-0 holds 4 NVIDIA B200 GPUs, node-1 holds 4 Cerebras WSE-3 wafer-scale engines. All devices are connected point-to-point over the scale-up network; devices within a node also share an in-node CXL link to the (optional) node memory. A single datacenter NVM pool is the input device that holds all model weights at init.",
+  "description": "A heterogeneous cluster built by node duplication: 24 nodes each holding 4 NVIDIA B200 GPUs and 24 nodes each holding a single Cerebras WSE-3 wafer-scale engine. All devices are connected point-to-point over the scale-up network; devices within a node also share an in-node CXL link to the (optional) node memory. A single datacenter NVM pool is the input device that holds all model weights at init.",
   "network": {
     "scale_up_bandwidth_bytes_per_s": 1.8e12,
     "scale_up_latency_s": 1.0e-6,

@@ -1,0 +1,7 @@
+{
+  "name": "Datacenter NVM Pool",
+  "source": "Representative shared non-volatile memory tier (pooled NVMe / CXL flash)",
+  "capacity_bytes": 1.0e15,
+  "bandwidth_bytes_per_s": 1.0e12,
+  "notes": "ESTIMATE - representative system-level shared NVM second tier: ~1 PB at ~1 TB/s aggregate. Tune to the fabric you want to model."
+}

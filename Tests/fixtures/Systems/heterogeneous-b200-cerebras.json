@@ -1,0 +1,27 @@
+{
+  "name": "Heterogeneous B200 + Cerebras WSE-3",
+  "description": "Frozen test fixture: two heterogeneous nodes -- node-0 holds 4 NVIDIA B200 GPUs, node-1 holds 4 Cerebras WSE-3 wafer-scale engines -- each keeping its own first-tier memory. Owned by the test suite so edits to the shipped Systems/ examples cannot change what these tests assert.",
+  "network": {
+    "scale_up_bandwidth_bytes_per_s": 1.8e12,
+    "scale_up_latency_s": 1.0e-6,
+    "cxl_bandwidth_bytes_per_s": 6.4e10,
+    "cxl_latency_s": 3.0e-7
+  },
+  "input_memory": "datacenter-nvm",
+  "nodes": [
+    {
+      "name": "node-0",
+      "node_memory": "nvidia-grace-lpddr5x",
+      "compute_devices": [
+        { "device": "nvidia-b200", "count": 4 }
+      ]
+    },
+    {
+      "name": "node-1",
+      "node_memory": "nvidia-grace-lpddr5x",
+      "compute_devices": [
+        { "device": "cerebras-wse3", "count": 4 }
+      ]
+    }
+  ]
+}

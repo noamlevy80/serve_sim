@@ -1,0 +1,8 @@
+{
+  "name": "Cerebras WSE-3",
+  "source": "https://www.cerebras.ai/product-chip (WSE-3: 125 PFLOPS AI compute, 900,000 cores, 4T transistors)",
+  "peak_flops_fp16": 1.25e17,
+  "first_tier_memory": "cerebras-wse3-sram",
+  "notes": "125 PFLOPS peak AI (FP16) compute for a single wafer-scale engine.",
+  "kernel_launch_latency": 0
+}

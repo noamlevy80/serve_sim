@@ -316,6 +316,33 @@ class Attention:
             return min(candidate, float(self.sparse_topk)), candidate
         return candidate, candidate
 
+    def _sum_clamped(self, a: int, b: int, cap: float) -> float:
+        """Sum of ``min(k / kv_compression_ratio, cap)`` for integer ``k`` in [a, b].
+
+        Closed form of the per-token accumulation in :meth:`prefill_cost` (which
+        otherwise loops once per prefill position and turns long-prompt batches
+        into an O(prefill_tokens) Python loop per layer). ``a`` and ``b`` are
+        inclusive; callers guarantee ``a <= b``.
+
+        ``min(k / ratio, cap)`` is linear in ``k`` until ``k / ratio`` reaches the
+        cap, then constant. ``kt`` is the last integer key still in the linear
+        region, so the sum splits into an arithmetic-series part and a flat part.
+        """
+
+        ratio = self.kv_compression_ratio
+        if cap == math.inf:
+            return (a + b) * (b - a + 1) / 2.0 / ratio
+        kt = math.floor(cap * ratio)
+        total = 0.0
+        lin_hi = min(b, kt)
+        if lin_hi >= a:
+            n_lin = lin_hi - a + 1
+            total += (a + lin_hi) * n_lin / 2.0 / ratio
+        lo = max(a, kt + 1)
+        if b >= lo:
+            total += cap * (b - lo + 1)
+        return total
+
     # --- costs ---
 
     def prefill_cost(
@@ -334,10 +361,15 @@ class Attention:
 
         main_pairs = 0.0
         cand_pairs = 0.0
-        for j in range(new_tokens):
-            main, cand = self._main_and_candidate(cached + start + j + 1)
-            main_pairs += main
-            cand_pairs += cand
+        if new_tokens > 0:
+            a = cached + start + 1
+            b = cached + start + new_tokens
+            window = self._window()
+            cand_pairs = self._sum_clamped(a, b, window)
+            if self.sparse_attention:
+                main_pairs = self._sum_clamped(a, b, min(window, float(self.sparse_topk)))
+            else:
+                main_pairs = cand_pairs
         prior_main, prior_cand = self._main_and_candidate(cached + start)
         kv_bpt = self.kv_bytes_per_token(kv_dtype_bytes)
         flops = 2.0 * new_tokens * self.weight_params + self._per_pair_flops * main_pairs

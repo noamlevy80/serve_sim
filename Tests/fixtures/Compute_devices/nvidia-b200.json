@@ -1,0 +1,8 @@
+{
+  "name": "NVIDIA B200",
+  "source": "https://www.nvidia.com/en-us/data-center/dgx-b200/ (DGX B200 FP8 72 PFLOPS sparse across 8 GPUs; dense FP16 per GPU = 2.25 PFLOPS)",
+  "peak_flops_fp16": 2.25e15,
+  "first_tier_memory": "nvidia-b200-hbm3e",
+  "notes": "Dense FP16/BF16 tensor-core throughput per single B200 GPU. Sparse is 2x.",
+  "kernel_launch_latency": 5e-6
+}

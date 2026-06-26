@@ -179,6 +179,26 @@ class EnginePool:
             raise ValueError(f"slot {slot.index} is not currently busy")
         self._load[slot.index] -= 1
 
+    def unplace(self, placement: Placement) -> None:
+        """Reverse a :meth:`place`/:meth:`acquire` that is not being committed.
+
+        Drops the load increment and, when the placement had loaded a new model,
+        restores the slot's prior resident model -- so a batch that is refused
+        admission (e.g. by memory back-pressure) leaves the pool exactly as it was
+        before the placement.
+        """
+
+        slot = placement.slot
+        self._check_owned(slot)
+        if self._load[slot.index] == 0:
+            raise ValueError(f"slot {slot.index} is not currently busy")
+        self._load[slot.index] -= 1
+        if placement.needs_weight_load:
+            if placement.evicted_model is not None:
+                self._resident[slot.index] = placement.evicted_model
+            else:
+                self._resident.pop(slot.index, None)
+
     def warm_start(self, models: list[object]) -> None:
         """Pre-mark slot residency so an initial placement needs no weight load.
 

@@ -698,6 +698,19 @@ class Simulator:
         # compute before the weights/experts its ranks need are resident). Reset
         # per run; entries clear naturally once the warm-up finishes.
         self._slot_warming_job: dict[int, int] = {}
+        # Memory-aware admission (back-pressure) bookkeeping. ``_slot_reserved``
+        # maps ``id(slot)`` to the per-device bytes its in-flight jobs currently
+        # pin; ``_job_reserved_bytes`` maps an arbiter job index to the footprint
+        # it reserved, so a retiring job releases exactly what it took. Both are
+        # reset per run.
+        self._slot_reserved: dict[int, float] = {}
+        self._job_reserved_bytes: dict[int, float] = {}
+        # Cached dispatch plans (work shards + MoE activation trace + chosen
+        # parallelism) keyed by ``batch_index``. Generating these is the costly
+        # part of a dispatch and depends only on the batch's work, so a batch
+        # deferred by memory back-pressure reuses its plan on the next attempt
+        # instead of regenerating it. Reset per run; entries clear on commit.
+        self._dispatch_plans: dict[int, tuple] = {}
         # System-wide persistent KV cache (cross-conversation prefix reuse, LRU
         # eviction, migration across floating memories). Inert when disabled or
         # when the system has no floating (node) memory to offload KV into.
@@ -913,6 +926,9 @@ class Simulator:
 
         arbiter = IncrementalArbiter()
         self._slot_warming_job = {}
+        self._slot_reserved = {}
+        self._job_reserved_bytes = {}
+        self._dispatch_plans = {}
         self._apply_warm_start(requests)
         in_flight = 0
         batch_index = 0
@@ -975,6 +991,7 @@ class Simulator:
                 end = arbiter.job_end_time(job_index)
                 in_flight -= len(reqs)
                 self._pool.release(slot)
+                self._free_reservation(slot, job_index)
                 first_token_time = _first_token_end(
                     arbiter.job_rescaled_events(job_index)
                 )
@@ -1031,6 +1048,7 @@ class Simulator:
                 if batch is None:
                     break  # concurrency full; wait for a completion
                 in_flight += len(batch)
+                queued_batch = batch
                 matches: dict[int, Match] = {}
                 kv_fetches: list[tuple[object, float, object]] | None = None
                 if self._kv_active:
@@ -1039,6 +1057,13 @@ class Simulator:
                 job_index, slot, pp, ep, tp = self._dispatch(
                     arbiter, batch, kv_fetches=kv_fetches,
                     result=result, now=now, batch_index=batch_index)
+                if job_index is None:
+                    # Memory back-pressure: the slot cannot hold this batch yet.
+                    # Return it to the front of the queue and wait for an
+                    # in-flight job to complete and free memory.
+                    in_flight -= len(queued_batch)
+                    ready[:0] = queued_batch
+                    break
                 device_names = tuple(d.name for d in slot.devices)
                 members = tuple((r.workload_id, r.turn_index) for r in batch)
                 for req in batch:
@@ -1110,6 +1135,9 @@ class Simulator:
 
         arbiter = IncrementalArbiter()
         self._slot_warming_job = {}
+        self._slot_reserved = {}
+        self._job_reserved_bytes = {}
+        self._dispatch_plans = {}
         self._apply_warm_start(requests)
         in_flight = 0  # counted from prefill dispatch to decode completion
         batch_index = 0
@@ -1185,6 +1213,7 @@ class Simulator:
                 reported.add(job_index)
                 end = arbiter.job_end_time(job_index)
                 pool.release(slot)
+                self._free_reservation(slot, job_index)
                 if kind == "prefill":
                     # KV handoff: schedule each sequence for decode after its
                     # transfer completes (the sequence stays "in flight").
@@ -1260,6 +1289,7 @@ class Simulator:
                 if batch is None:
                     break  # concurrency full; wait for a decode completion
                 in_flight += len(batch)
+                queued_batch = batch
                 matches: dict[int, Match] = {}
                 kv_fetches: list[tuple[object, float, object]] | None = None
                 if self._kv_active:
@@ -1270,6 +1300,11 @@ class Simulator:
                     kv_fetches=kv_fetches,
                     result=result, now=now, batch_index=batch_index,
                 )
+                if job_index is None:
+                    # Memory back-pressure on the prefill pool: requeue and wait.
+                    in_flight -= len(queued_batch)
+                    prefill_ready[:0] = queued_batch
+                    break
                 device_names = tuple(d.name for d in slot.devices)
                 members = tuple((r.workload_id, r.turn_index) for r in batch)
                 for req in batch:
@@ -1310,6 +1345,12 @@ class Simulator:
                     arbiter, batch, pool=self._decode_pool, phase="decode",
                     result=result, now=now, batch_index=batch_index,
                 )
+                if job_index is None:
+                    # Memory back-pressure on the decode pool: requeue and wait
+                    # for an in-flight decode to free memory (the sequences are
+                    # already counted in flight, so the count is unchanged).
+                    decode_ready[:0] = batch
+                    break
                 device_names = tuple(d.name for d in slot.devices)
                 members = tuple((r.workload_id, r.turn_index) for r in batch)
                 for req in batch:
@@ -1660,6 +1701,54 @@ class Simulator:
         except (ValueError, ZeroDivisionError):
             return 0.0
 
+    def _device_capacity(self, device: ComputeDevice) -> float:
+        """Total memory a device can pin: its first tier plus any spill tier."""
+
+        cap = device.first_tier_memory.capacity_bytes
+        if device.second_tier_memory is not None:
+            cap += device.second_tier_memory.capacity_bytes
+        return cap
+
+    def _admit_on_slot(self, slot: EngineSlot, per_device_bytes: float) -> bool:
+        """Whether a job reserving ``per_device_bytes`` may dispatch onto ``slot``.
+
+        Memory-aware back-pressure: the job is admitted when its footprint plus
+        the footprints already in flight on the slot fit every serving device's
+        memory (first tier plus any spill tier). When it does not fit but the slot
+        still holds other in-flight jobs, admission is refused so the caller defers
+        the batch until a completion frees memory -- the run serialises rather than
+        over-subscribing the devices. A job that overflows an *empty* slot cannot
+        be helped by waiting, so it is admitted and left to the post-run capacity
+        check, which reports the genuine infeasibility.
+        """
+
+        reserved = self._slot_reserved.get(id(slot), 0.0)
+        capacity = min(self._device_capacity(d) for d in slot.devices)
+        if reserved + per_device_bytes <= capacity * (1.0 + 1e-9):
+            return True
+        return reserved <= 0.0
+
+    def _record_reservation(
+        self, slot: EngineSlot, job_index: int, per_device_bytes: float
+    ) -> None:
+        """Charge a dispatched job's per-device footprint to its slot."""
+
+        if per_device_bytes <= 0.0:
+            return
+        self._slot_reserved[id(slot)] = (
+            self._slot_reserved.get(id(slot), 0.0) + per_device_bytes
+        )
+        self._job_reserved_bytes[job_index] = per_device_bytes
+
+    def _free_reservation(self, slot: EngineSlot, job_index: int) -> None:
+        """Release a retired job's tracked footprint back to its slot."""
+
+        released = self._job_reserved_bytes.pop(job_index, 0.0)
+        if released:
+            self._slot_reserved[id(slot)] = (
+                self._slot_reserved.get(id(slot), 0.0) - released
+            )
+
     def _take_batch(self, ready: list[Request], in_flight: int) -> list[Request] | None:
         """Pull up to ``max_batch_size`` same-model requests, honoring concurrency.
 
@@ -1722,7 +1811,7 @@ class Simulator:
         result: "RunResult | None" = None,
         now: float = 0.0,
         batch_index: int = -1,
-    ) -> tuple[int, EngineSlot, int, int, int]:
+    ) -> tuple[int | None, EngineSlot, int, int, int]:
         """Place a batch on an engine slot and admit its events to the arbiter.
 
         ``phase`` selects the work generated: ``"full"`` (prefill + decode in one
@@ -1733,17 +1822,51 @@ class Simulator:
         the global KV cache before compute. Returns the arbiter job index, the
         slot the batch occupies (released on completion), and the
         ``(pipeline_parallel, expert_parallel, tensor_parallel)`` arrangement
-        chosen.
+        chosen. A ``None`` job index signals memory back-pressure: the batch did
+        not fit the slot and must be deferred (the placement has been rolled
+        back).
         """
 
         model = batch[0].model
         pool = pool or self._pool
-        placement = pool.place(model)
-        slot = placement.slot
         work = [self._phase_work(req, phase) for req in batch]
-        shards = WorkShardGenerator(model).generate(
-            work, prefill_chunk_size=self.strategy.prefill_chunk_size
+
+        # Plan the batch: work shards, the MoE activation trace, and the chosen
+        # parallelism. This is the expensive part of a dispatch (it materialises
+        # every work shard and simulates the per-token expert trace) and depends
+        # only on the batch's work, not on which slot it lands on. Cache it by
+        # ``batch_index`` so a batch deferred by memory back-pressure re-attempts
+        # placement without regenerating the plan; an unexpected change in the
+        # batch's work (e.g. KV reuse shifting the prefill) invalidates the cache.
+        sig = (
+            phase,
+            tuple(
+                (r.request_id, w.prefill_tokens, w.decode_tokens)
+                for r, w in zip(batch, work)
+            ),
         )
+        plan = self._dispatch_plans.get(batch_index)
+        if plan is None or plan[0] != sig:
+            shards = WorkShardGenerator(model).generate(
+                work, prefill_chunk_size=self.strategy.prefill_chunk_size
+            )
+            expert_trace = (
+                build_activation_trace(
+                    model, work, self.strategy.prefill_chunk_size,
+                    seed=self._rng.randrange(1 << 30),
+                )
+                if self._is_moe(model)
+                else None
+            )
+            pp, ep, tp = self._parallelism_for(model, batch, shards, expert_trace)
+            expert_cap = (
+                max(1, peak_active_per_rank(expert_trace, ep))
+                if expert_trace is not None
+                else None
+            )
+            plan = (sig, shards, expert_trace, pp, ep, tp, expert_cap)
+            self._dispatch_plans[batch_index] = plan
+        _, shards, expert_trace, pp, ep, tp, expert_cap = plan
 
         # A real stack stages weights through host RAM: when a node can hold the
         # whole model it becomes the model's home (NVM -> RAM once, then RAM ->
@@ -1752,21 +1875,12 @@ class Simulator:
         # when one fits, otherwise straight from the shared input NVM (so even a
         # model too large for any single node's RAM still streams its experts
         # instead of pinning every one on the serving devices).
+        placement = pool.place(model)
+        slot = placement.slot
         home = self._home_node_for(model, slot)
-        expert_trace = None
-        expert_cap = None
         expert_source = None
         expert_latency = 0.0
-        if self._is_moe(model):
-            expert_trace = build_activation_trace(
-                model, work, self.strategy.prefill_chunk_size,
-                seed=self._rng.randrange(1 << 30),
-            )
-
-        pp, ep, tp = self._parallelism_for(model, batch, shards, expert_trace)
-
         if expert_trace is not None:
-            expert_cap = max(1, peak_active_per_rank(expert_trace, ep))
             expert_source = (
                 home.node_memory if home is not None else self.system.input_memory
             )
@@ -1775,6 +1889,23 @@ class Simulator:
             self._job_reserve[batch_index] = self._planner_for(model).streaming_footprint(
                 pp, kv_tokens, expert_cap, tp
             )
+
+        # Memory-aware admission: a real engine cannot pin more than its devices
+        # hold, so rather than over-subscribe and crash, refuse a batch whose
+        # footprint would not fit the chosen slot yet -- the caller defers it until
+        # in-flight work frees memory (back-pressure). Undo the speculative
+        # placement and streaming reservation so the pool is untouched.
+        kv_tokens_full = sum(r.prompt_tokens + r.output_tokens for r in batch)
+        per_device_bytes = self._job_footprint(
+            model, pp, ep, tp, kv_tokens_full, batch_index
+        )
+        if not self._admit_on_slot(slot, per_device_bytes):
+            self._job_reserve.pop(batch_index, None)
+            pool.unplace(placement)
+            return None, slot, pp, ep, tp
+
+        # Committed: the batch will run, so its cached plan is no longer needed.
+        self._dispatch_plans.pop(batch_index, None)
 
         generator = EventGenerator(
             model,
@@ -1838,8 +1969,11 @@ class Simulator:
             # Future reuses of this slot wait for whatever this job is loading.
             if loads or any(e.phase == "expert_transfer" for e in schedule.events):
                 self._slot_warming_job[id(slot)] = job_index
+            self._record_reservation(slot, job_index, per_device_bytes)
             return job_index, slot, pp, ep, tp
-        return arbiter.admit(generator, shards, after_job=after_job), slot, pp, ep, tp
+        job_index = arbiter.admit(generator, shards, after_job=after_job)
+        self._record_reservation(slot, job_index, per_device_bytes)
+        return job_index, slot, pp, ep, tp
 
     @staticmethod
     def _prepend_transfers(
