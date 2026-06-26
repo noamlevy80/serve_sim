@@ -1045,6 +1045,73 @@ def workload_graph(result: RunResult) -> dict[str, Any]:
     }
 
 
+def _idle_wait(
+    events: Sequence[EventRecord], dispatch: float, completion: float
+) -> float:
+    """Seconds a dispatched sequence spent with no active event before completing.
+
+    The idle wait is the part of the ``[dispatch, completion]`` window not
+    covered by any of the sequence's events (compute or transfer): time the
+    sequence was admitted but sitting without active work (batching, contention,
+    transfer queueing).
+    """
+
+    window = completion - dispatch
+    if window <= 0:
+        return 0.0
+    spans = sorted(
+        (max(e.start, dispatch), min(e.end, completion))
+        for e in events
+        if min(e.end, completion) > max(e.start, dispatch)
+    )
+    busy = 0.0
+    if spans:
+        cur_lo, cur_hi = spans[0]
+        for lo, hi in spans[1:]:
+            if lo > cur_hi:
+                busy += cur_hi - cur_lo
+                cur_lo, cur_hi = lo, hi
+            else:
+                cur_hi = max(cur_hi, hi)
+        busy += cur_hi - cur_lo
+    return max(0.0, window - busy)
+
+
+def sequence_table(result: RunResult) -> list[dict[str, Any]]:
+    """Per-sequence timings: one row per turn of every workload (or request).
+
+    Each row carries the time in queue (arrival to dispatch), TTFT counted only
+    over prefill (dispatch to first token), TPS counted only over decode, the
+    total idle wait while dispatched, and the end-to-end latency (arrival to
+    answer). Rows are ordered by workload then turn, with standalone requests
+    last.
+    """
+
+    by_request = _events_by_request(_rescaled(result.events))
+
+    def _key(r: RequestRecord) -> tuple[int, int, int]:
+        if r.workload_id >= 0:
+            return (0, r.workload_id, r.turn_index)
+        return (1, r.request_id, 0)
+
+    rows: list[dict[str, Any]] = []
+    for r in sorted(result.records, key=_key):
+        ttft_prefill = (r.first_token_time - r.dispatch_time
+                        if r.first_token_time is not None else None)
+        rows.append({
+            "sequence": _sequence_id(r.workload_id, r.turn_index)
+                        or f"r{r.request_id}",
+            "queue_s": r.queue_delay,
+            "ttft_prefill_s": ttft_prefill,
+            "tps_tokens_per_s": r.tps,
+            "idle_wait_s": _idle_wait(
+                by_request.get(r.request_id, ()), r.dispatch_time,
+                r.completion_time),
+            "latency_s": r.latency,
+        })
+    return rows
+
+
 def summarize(
     result: RunResult, *, progress: Callable[[float, float], None] | None = None
 ) -> dict[str, Any]:
@@ -1083,6 +1150,10 @@ def summarize(
             (total_prompt + total_output) / makespan if makespan else 0.0,
         "latency_s": _distribution(r.latency for r in records),
         "queue_delay_s": _distribution(r.queue_delay for r in records),
+        "avg_latency_s": (sum(r.latency for r in records) / len(records)
+                          if records else 0.0),
+        "avg_queue_delay_s": (sum(r.queue_delay for r in records) / len(records)
+                              if records else 0.0),
         "ttft_s": _distribution(r.ttft for r in records),
         "tpot_s": _distribution(r.tpot for r in records),
         "tps_tokens_per_s": _distribution(r.tps for r in records),
@@ -1473,6 +1544,7 @@ def build_viz_payload(
         "makespan_s": result.makespan or 0.0,
         "num_buckets": num_buckets,
         "summary": summary,
+        "sequences": sequence_table(result),
         "devices": devices,
         "memories": memories,
         "device_timeline": dev_timeline,

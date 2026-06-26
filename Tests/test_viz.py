@@ -219,6 +219,31 @@ def test_summary_tables_format_distributions():
     assert perf["rows"]
 
 
+def test_throughput_table_carries_average_queue_and_latency():
+    payload = _payload()
+    tables = build_summary_tables(payload)
+    throughput = next(t for t in tables if t["title"] == "Throughput")
+    metrics = [row[0] for row in throughput["rows"]]
+    assert "Avg time in queue (s)" in metrics
+    assert "Avg latency (s)" in metrics
+
+
+def test_sequences_table_has_one_row_per_turn():
+    payload = _payload()
+    # Three standalone requests => three sequence rows.
+    assert len(payload["sequences"]) == 3
+    tables = build_summary_tables(payload)
+    seq = next(t for t in tables if t["title"] == "Sequences")
+    assert seq["columns"] == [
+        "Sequence", "Time in queue (s)", "TTFT (prefill, s)",
+        "TPS (decode, tok/s)", "Total idle wait (s)", "Total latency (s)"]
+    assert len(seq["rows"]) == 3
+    for q in payload["sequences"]:
+        assert q["queue_s"] >= 0.0
+        assert q["idle_wait_s"] >= 0.0
+        assert q["latency_s"] >= q["queue_s"]
+
+
 # --- Flask app ------------------------------------------------------------------
 
 def test_app_serves_view_model(tmp_path):

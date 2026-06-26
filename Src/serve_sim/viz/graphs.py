@@ -106,6 +106,8 @@ def build_summary_tables(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         "rows": [
             ["Requests / s", eng_format(s.get("throughput_requests_per_s"))],
             ["Output tokens / s", eng_format(s.get("throughput_output_tokens_per_s"))],
+            ["Avg time in queue (s)", eng_format(s.get("avg_queue_delay_s"))],
+            ["Avg latency (s)", eng_format(s.get("avg_latency_s"))],
         ],
     })
 
@@ -130,6 +132,22 @@ def build_summary_tables(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
             "title": "Orchestration decisions",
             "columns": ["Decision", "Count"],
             "rows": [[k, str(v)] for k, v in counts.items()],
+        })
+
+    sequences = payload.get("sequences", [])
+    if sequences:
+        tables.append({
+            "title": "Sequences",
+            "columns": ["Sequence", "Time in queue (s)", "TTFT (prefill, s)",
+                        "TPS (decode, tok/s)", "Total idle wait (s)",
+                        "Total latency (s)"],
+            "rows": [[q.get("sequence", ""),
+                      eng_format(q.get("queue_s")),
+                      eng_format(q.get("ttft_prefill_s")),
+                      eng_format(q.get("tps_tokens_per_s")),
+                      eng_format(q.get("idle_wait_s")),
+                      eng_format(q.get("latency_s"))]
+                     for q in sequences],
         })
 
     if devices:

@@ -40,9 +40,9 @@
 
   "prefill_chunk_size": null,
   "event_random_factor_range": 0.05,
-  "arrival_interval_sec": 0.1,
+  "arrival_interval_sec": 0.05,
   "arrival_variance_sec2": 0.001,
-  "max_turns_per_workload": 3,
+  "max_turns_per_workload": 4,
 
   "report_time_buckets": 256,
   "random_seed": 7
