@@ -16,7 +16,7 @@
       "compute_devices": [
         { "device": "nvidia-b200", "count": 2 }
       ],
-      "count": 18
+      "count": 64
     }
   ]
 }

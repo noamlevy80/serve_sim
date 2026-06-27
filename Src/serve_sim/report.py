@@ -442,7 +442,9 @@ def device_timeline(
     Each row is one device in one time bucket. Beyond the busy fraction, memory
     occupancy and execution-state breakdown, it carries the achieved compute
     (FLOP/s) and first-tier bandwidth (bytes/s) in the bucket, the first-tier
-    occupancy split into KV vs weights (``content``), a discrete label for any
+    occupancy split into weights and per-task KV (``content``: a ``weights``
+    band plus one ``KV B<n>`` band per co-resident dispatch batch), a discrete
+    label for any
     incoming transfer (its source memory and what it moves), the current task's
     batch size, the number of tasks (running batches) concurrently resident on
     the device, and the effective decode (output) and prefill (input) token
@@ -500,13 +502,14 @@ def device_timeline(
             bucket_bw_s = sum(e.bandwidth_time * _overlap_fraction(e, t0, t1)
                               for e in first_tier_events)
             dom = _dominant_transfer(dev_events, t0, t1)
-            dev_weights, dev_kv = _first_tier_content_at(result, {name}, t0)
+            dev_weights, dev_kv_by_batch = _first_tier_content_at(result, {name}, t0)
             content: dict[str, float] = {}
             weight_bytes = sum(dev_weights.values())
             if weight_bytes > 0:
                 content["weights"] = weight_bytes
-            if dev_kv > 0:
-                content["KV"] = dev_kv
+            for batch in sorted(dev_kv_by_batch):
+                if dev_kv_by_batch[batch] > 0:
+                    content[f"KV B{batch}"] = dev_kv_by_batch[batch]
             row = {
                 "bucket": b,
                 "time_start": t0,
@@ -641,16 +644,18 @@ def _floating_kv_residency(
 
 def _first_tier_content_at(
     result: RunResult, attached: set[str], t: float
-) -> tuple[dict[str, float], float]:
+) -> tuple[dict[str, float], dict[int, float]]:
     """Reserved first-tier content at instant ``t`` across ``attached`` devices.
 
-    Returns ``(weights_by_model, kv_bytes)`` summed over the jobs active at ``t``
-    on the attached devices, splitting each job's per-device reservation into its
-    weight portion (keyed by model) and its KV portion.
+    Returns ``(weights_by_model, kv_by_batch)`` summed over the jobs active at
+    ``t`` on the attached devices, splitting each job's per-device reservation
+    into its weight portion (keyed by model) and its KV portion (keyed by the
+    dispatch ``batch_index`` of the task holding it, so co-resident parallel
+    tasks stay separable).
     """
 
     weights: dict[str, float] = {}
-    kv_bytes = 0.0
+    kv_by_batch: dict[int, float] = {}
     for j in result.jobs:
         if not (j.start <= t < j.end):
             continue
@@ -658,8 +663,10 @@ def _first_tier_content_at(
         if count == 0:
             continue
         weights[j.model] = weights.get(j.model, 0.0) + j.weight_bytes_per_device * count
-        kv_bytes += j.kv_bytes_per_device * count
-    return weights, kv_bytes
+        kv_by_batch[j.batch_index] = (
+            kv_by_batch.get(j.batch_index, 0.0) + j.kv_bytes_per_device * count
+        )
+    return weights, kv_by_batch
 
 
 def memory_timeline(
@@ -669,11 +676,12 @@ def memory_timeline(
     """Per-memory bandwidth, occupancy-by-content and incoming transfer over time.
 
     One row per memory per time bucket. Carries the achieved bandwidth (bytes/s)
-    in the bucket, the occupancy split into KV vs weights (``content``: resident
-    model weights and KV on a first-tier memory; offloaded KV on a floating
-    memory), and a discrete label for the dominant incoming transfer (its source
-    and object), so the visualization can stack occupancy by content and plot
-    bandwidth against the memory's static ceiling.
+    in the bucket, the occupancy split by content (``content``: on a first-tier
+    memory a ``weights`` band plus one ``KV B<n>`` band per co-resident dispatch
+    batch; on a floating memory the offloaded ``KV``), and a discrete label for
+    the dominant incoming transfer (its source and object), so the visualization
+    can stack occupancy by content and plot bandwidth against the memory's
+    static ceiling.
     """
 
     makespan = result.makespan or 0.0
@@ -708,12 +716,13 @@ def memory_timeline(
 
             content: dict[str, float] = {}
             if mem.role == "first_tier":
-                weights, kv_bytes = _first_tier_content_at(result, attached, t0)
+                weights, kv_by_batch = _first_tier_content_at(result, attached, t0)
                 weight_bytes = sum(weights.values())
                 if weight_bytes > 0:
                     content["weights"] = weight_bytes
-                if kv_bytes > 0:
-                    content["KV"] = kv_bytes
+                for batch in sorted(kv_by_batch):
+                    if kv_by_batch[batch] > 0:
+                        content[f"KV B{batch}"] = kv_by_batch[batch]
             elif mem.role in ("node", "second_tier"):
                 kv_bytes = sum(
                     num_bytes

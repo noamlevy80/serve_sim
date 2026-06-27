@@ -712,12 +712,15 @@ def test_memory_timeline_content_decomposes_occupancy():
     for r in rows:
         assert r["occupancy_bytes"] == pytest.approx(sum(r["content"].values()))
     # While weights are resident, the first-tier content carries a "weights" band
-    # (broken down only by KV vs weights, no per-model detail).
+    # (KV is broken out per co-resident dispatch batch as "KV B<n>" bands).
     first_tier = [r for r in rows
                   if r["role"] == "first_tier" and r["occupancy_bytes"] > 0]
     assert first_tier
     assert any("weights" in r["content"] for r in first_tier)
-    assert all(set(r["content"]) <= {"KV", "weights"} for r in rows)
+    assert all(
+        k == "weights" or k == "KV" or k.startswith("KV B")
+        for r in rows for k in r["content"]
+    )
 
 
 def test_memory_timeline_tracks_offloaded_kv_residency():

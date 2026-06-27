@@ -136,20 +136,24 @@ def test_each_memory_device_has_its_four_graphs():
         assert len(seg) == 5
 
 
-def test_capacity_content_is_kv_vs_weights_only():
+def test_capacity_content_is_weights_and_per_batch_kv():
     # Both the compute-device first-tier capacity and the memory-device capacity
-    # break occupancy down by KV vs weights only -- no per-model or per-sequence
-    # detail.
+    # break occupancy down into a "weights" band plus one "KV B<n>" band per
+    # co-resident dispatch batch -- no per-model detail.
     vm = build_view_model(_payload())
     capacity = [g for g in vm["graphs"] if g["id"].endswith(":capacity")]
     assert capacity
     # The compute-device first-tier capacity is now a stacked breakdown too.
     dev_cap = next(g for g in capacity if g["section"] == "compute_device")
     assert dev_cap["kind"] == "stacked"
+
+    def _ok(key):
+        return key == "weights" or key == "KV" or key.startswith("KV B")
+
     for g in capacity:
-        assert set(g["keys"]) <= {"KV", "weights"}
+        assert all(_ok(k) for k in g["keys"])
         for _t0, _t1, content in g["buckets"]:
-            assert set(content) <= {"KV", "weights"}
+            assert all(_ok(k) for k in content)
 
 
 def test_workload_graphs_present():

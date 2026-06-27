@@ -1,6 +1,6 @@
 {
   "run_id": null,
-  "system": "../Systems/b200-8-nodes.json",
+  "system": "../Systems/cerebras-rack.json",
   "models_dir": "../Models",
   "tokenizer": "tiktoken",
   "output_root": "Outputs",
@@ -16,11 +16,11 @@
     "name": "Example short randomized suite",
     "description": "Draws a handful of random multi-turn workloads from the cached source dataset and assigns each a model at random, for a quick end-to-end run.",
     "type": "randomized",
-    "num_workloads": 40 ,
+    "num_workloads": 40,
     "models": ["gemma-4-31b"]
   },
 
-  "max_batch_size": 4,
+  "max_batch_size": 1,
   "max_concurrency": null,
   "concurrency_window_sec": 0.5,
 
