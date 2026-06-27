@@ -204,7 +204,13 @@ def _state_seconds(
     if span <= 0:
         return seconds
 
-    intervals: list[tuple[float, float, int, str]] = []
+    # Sweep line: each clipped interval contributes a +1 at its start and a -1
+    # at its end. Between consecutive boundaries the covering interval with the
+    # lowest priority index wins (matching the previous min() tie-break, since
+    # priorities are unique per state). This is O(I log I) versus the former
+    # O(points * intervals) scan.
+    starts: dict[float, list[int]] = {}
+    ends: dict[float, list[int]] = {}
     for event in events:
         state = _event_state(event)
         if state == "idle":
@@ -212,21 +218,30 @@ def _state_seconds(
         start = max(window_start, event.start)
         end = min(window_end, event.end)
         if end > start:
-            intervals.append((start, end, _STATE_PRIORITY[state], state))
+            pr = _STATE_PRIORITY[state]
+            starts.setdefault(start, []).append(pr)
+            ends.setdefault(end, []).append(pr)
 
-    if not intervals:
+    if not starts:
         seconds["idle"] = span
         return seconds
 
-    points = sorted({window_start, window_end}
-                    | {p for s, e, _, _ in intervals for p in (s, e)})
+    points = sorted(set(starts) | set(ends) | {window_start, window_end})
+    active_counts: dict[int, int] = {}
     covered = 0.0
     for t0, t1 in zip(points, points[1:]):
+        for pr in ends.get(t0, ()):  # intervals ending at t0 stop covering [t0, t1)
+            n = active_counts[pr] - 1
+            if n:
+                active_counts[pr] = n
+            else:
+                del active_counts[pr]
+        for pr in starts.get(t0, ()):  # intervals starting at t0 cover [t0, t1)
+            active_counts[pr] = active_counts.get(pr, 0) + 1
         if t1 <= t0:
             continue
-        active = [(pr, st) for s, e, pr, st in intervals if s <= t0 and e >= t1]
-        if active:
-            _, state = min(active)
+        if active_counts:
+            state = DEVICE_STATES[min(active_counts)]
             seconds[state] += t1 - t0
             covered += t1 - t0
     seconds["idle"] = max(0.0, span - covered)
@@ -466,6 +481,12 @@ def device_timeline(
     for e in rescaled:
         if e.device:
             events_by_device.setdefault(e.device, []).append(e)
+    # Jobs resident on each device, so the per-(device, bucket) occupancy/content
+    # helpers scan only the handful of jobs on that device rather than all jobs.
+    jobs_by_device: dict[str, list[JobRecord]] = {}
+    for j in result.jobs:
+        for d in j.devices:
+            jobs_by_device.setdefault(d, []).append(j)
 
     # Per-(device, bucket) effective token throughput. A task's token rate is a
     # property of the whole batch, so every device in its engine group reports
@@ -502,7 +523,8 @@ def device_timeline(
             bucket_bw_s = sum(e.bandwidth_time * _overlap_fraction(e, t0, t1)
                               for e in first_tier_events)
             dom = _dominant_transfer(dev_events, t0, t1)
-            dev_weights, dev_kv_by_batch = _first_tier_content_at(result, {name}, t0)
+            dev_jobs = jobs_by_device.get(name, [])
+            dev_weights, dev_kv_by_batch = _first_tier_content_at(dev_jobs, {name}, t0)
             content: dict[str, float] = {}
             weight_bytes = sum(dev_weights.values())
             if weight_bytes > 0:
@@ -516,10 +538,10 @@ def device_timeline(
                 "time_end": t1,
                 "device": name,
                 "busy_fraction": overlap / width if width else 0.0,
-                "memory_bytes": _occupancy_at(result.jobs, name, t0),
+                "memory_bytes": _occupancy_at(dev_jobs, name, t0),
                 "content": content,
                 "batch_size": batch_size,
-                "resident_tasks": _resident_tasks_at(result.jobs, name, t0),
+                "resident_tasks": _resident_tasks_at(dev_jobs, name, t0),
                 "decode_tokens_per_s": decode_tps.get((name, b), 0.0),
                 "prefill_tokens_per_s": prefill_tps.get((name, b), 0.0),
                 "compute_flops_per_s": bucket_flops / width if width else 0.0,
@@ -643,7 +665,7 @@ def _floating_kv_residency(
 
 
 def _first_tier_content_at(
-    result: RunResult, attached: set[str], t: float
+    jobs: Sequence[JobRecord], attached: set[str], t: float
 ) -> tuple[dict[str, float], dict[int, float]]:
     """Reserved first-tier content at instant ``t`` across ``attached`` devices.
 
@@ -656,7 +678,7 @@ def _first_tier_content_at(
 
     weights: dict[str, float] = {}
     kv_by_batch: dict[int, float] = {}
-    for j in result.jobs:
+    for j in jobs:
         if not (j.start <= t < j.end):
             continue
         count = sum(1 for d in j.devices if d in attached)
@@ -716,7 +738,7 @@ def memory_timeline(
 
             content: dict[str, float] = {}
             if mem.role == "first_tier":
-                weights, kv_by_batch = _first_tier_content_at(result, attached, t0)
+                weights, kv_by_batch = _first_tier_content_at(result.jobs, attached, t0)
                 weight_bytes = sum(weights.values())
                 if weight_bytes > 0:
                     content["weights"] = weight_bytes

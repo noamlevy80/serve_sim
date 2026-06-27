@@ -43,13 +43,15 @@ class _Demand:
     work: float
     rate: float  # uncontended rate (work / uncontended_time)
     remaining: float = field(init=False)
+    done_threshold: float = field(init=False)
 
     def __post_init__(self) -> None:
         self.remaining = self.work
+        self.done_threshold = self.work * _REL_TOL
 
     @property
     def done(self) -> bool:
-        return self.remaining <= self.work * _REL_TOL
+        return self.remaining <= self.done_threshold
 
 
 @dataclass
@@ -67,17 +69,26 @@ class _Task:
     pending: int = 0
     ready_time: float = 0.0
     latency_left: float = field(init=False)
+    latency_threshold: float = field(init=False)
+    open_demands: int = field(init=False)
+    live_demands: list = field(init=False)
 
     def __post_init__(self) -> None:
         self.latency_left = self.latency
+        self.latency_threshold = max(self.latency, 1.0) * _REL_TOL
+        # Demands not yet drained. Maintained by _advance so the per-step
+        # _count_sharers/_next_delta/_advance passes iterate only live demands
+        # and ``finished`` need not rescan on each of millions of polls.
+        self.live_demands = [d for d in self.demands if not d.done]
+        self.open_demands = len(self.live_demands)
 
     @property
     def latency_done(self) -> bool:
-        return self.latency_left <= max(self.latency, 1.0) * _REL_TOL
+        return self.latency_left <= self.latency_threshold
 
     @property
     def finished(self) -> bool:
-        return self.latency_done and all(d.done for d in self.demands)
+        return self.open_demands == 0 and self.latency_done
 
 
 @dataclass
@@ -271,24 +282,25 @@ class ResourceArbiter:
     @staticmethod
     def _count_sharers(active: list[_Task]) -> dict[tuple, int]:
         sharers: dict[tuple, int] = {}
+        get = sharers.get
         for task in active:
-            for demand in task.demands:
-                if not demand.done:
-                    sharers[demand.resource] = sharers.get(demand.resource, 0) + 1
+            for demand in task.live_demands:
+                resource = demand.resource
+                sharers[resource] = get(resource, 0) + 1
         return sharers
 
     @staticmethod
     def _next_delta(active: list[_Task], sharers: dict[tuple, int]) -> float:
         dt = float("inf")
         for task in active:
-            for demand in task.demands:
-                if demand.done:
-                    continue
+            for demand in task.live_demands:
                 eff = demand.rate / sharers[demand.resource]
                 if eff > 0:
-                    dt = min(dt, demand.remaining / eff)
-            if not task.latency_done:
-                dt = min(dt, task.latency_left)
+                    candidate = demand.remaining / eff
+                    if candidate < dt:
+                        dt = candidate
+            if not task.latency_done and task.latency_left < dt:
+                dt = task.latency_left
         return dt
 
     @staticmethod
@@ -296,30 +308,60 @@ class ResourceArbiter:
         if dt <= 0:
             return
         for task in active:
-            for demand in task.demands:
-                if demand.done:
-                    continue
-                eff = demand.rate / sharers[demand.resource]
-                demand.remaining -= eff * dt
-                if demand.remaining < demand.work * _REL_TOL:
-                    demand.remaining = 0.0
+            live = task.live_demands
+            if live:
+                completed = 0
+                for demand in live:
+                    eff = demand.rate / sharers[demand.resource]
+                    demand.remaining -= eff * dt
+                    if demand.remaining <= demand.done_threshold:
+                        # Newly drained (matches the ``done`` property exactly);
+                        # snap to zero only when strictly below, preserving prior
+                        # rounding.
+                        if demand.remaining < demand.done_threshold:
+                            demand.remaining = 0.0
+                        completed += 1
+                if completed:
+                    task.live_demands = [
+                        d for d in live if d.remaining > d.done_threshold
+                    ]
+                    task.open_demands -= completed
             if not task.latency_done:
                 task.latency_left -= dt
                 if task.latency_left < 0:
                     task.latency_left = 0.0
 
     @staticmethod
-    def _complete(active: list[_Task], time: float, successors: dict[int, list[_Task]]) -> None:
-        finished = [task for task in active if task.finished]
-        for task in finished:
+    def _complete(
+        active: list[_Task],
+        time: float,
+        successors: dict[int, list[_Task]],
+        on_complete=None,
+    ) -> None:
+        # Flush every finished task, transitively: a zero-work successor that
+        # becomes finished the instant its predecessors clear is drained within
+        # this same call (appended to the work queue) rather than waiting for a
+        # follow-up _complete. The drained co_end times are identical either way
+        # -- successors complete at the current ``time`` -- so callers no longer
+        # need a redundant second sweep.
+        queue = [task for task in active if task.finished]
+        qi = 0
+        while qi < len(queue):
+            task = queue[qi]
+            qi += 1
             task.co_end = time
             active.remove(task)
+            if on_complete is not None:
+                on_complete(task)
             for succ in successors[id(task)]:
                 succ.pending -= 1
-                succ.ready_time = max(succ.ready_time, time)
+                if time > succ.ready_time:
+                    succ.ready_time = time
                 if succ.pending == 0:
                     succ.co_start = succ.ready_time
                     active.append(succ)
+                    if succ.finished:
+                        queue.append(succ)
 
     @staticmethod
     def _retime(task: _Task) -> ComputeEvent:
@@ -362,6 +404,12 @@ class IncrementalArbiter:
         self._active: list[_Task] = []
         self._successors: dict[int, list[_Task]] = {}
         self._jobs: list[list[_Task]] = []
+        # Count of not-yet-finished tasks per job, decremented as tasks complete.
+        # Lets job_is_done answer in O(1) instead of rescanning every task.
+        self._job_unfinished: list[int] = []
+
+    def _note_complete(self, task: _Task) -> None:
+        self._job_unfinished[task.job] -= 1
 
     # --- inspection ---------------------------------------------------------
 
@@ -391,7 +439,7 @@ class IncrementalArbiter:
     def job_is_done(self, job_index: int) -> bool:
         """Whether every event of a job has finished."""
 
-        return all(task.co_end is not None for task in self._jobs[job_index])
+        return self._job_unfinished[job_index] == 0
 
     def job_end_time(self, job_index: int) -> float | None:
         """The job's completion time (max event end), or ``None`` if unfinished."""
@@ -498,8 +546,11 @@ class IncrementalArbiter:
                 self._active.append(task)
 
         self._jobs.append(job_tasks)
+        self._job_unfinished.append(len(job_tasks))
         # Flush any zero-work roots that complete immediately at the current time.
-        ResourceArbiter._complete(self._active, self._time, self._successors)
+        ResourceArbiter._complete(
+            self._active, self._time, self._successors, self._note_complete
+        )
         return job_index
 
     def advance_to(self, target: float) -> None:
@@ -511,10 +562,13 @@ class IncrementalArbiter:
         time at their current shared rate.
         """
 
+        # Drain anything already finished, then step the fluid clock. Each step's
+        # trailing _complete fully flushes (it is now a fixpoint), so no separate
+        # top-of-loop sweep is needed before recomputing rates.
+        ResourceArbiter._complete(
+            self._active, self._time, self._successors, self._note_complete
+        )
         while self._active:
-            ResourceArbiter._complete(self._active, self._time, self._successors)
-            if not self._active:
-                break
             sharers = ResourceArbiter._count_sharers(self._active)
             dt = ResourceArbiter._next_delta(self._active, sharers)
             if dt == float("inf"):
@@ -527,7 +581,7 @@ class IncrementalArbiter:
                     ResourceArbiter._advance(self._active, sharers, dt)
                     self._time = target
                 ResourceArbiter._complete(
-                    self._active, self._time, self._successors
+                    self._active, self._time, self._successors, self._note_complete
                 )
                 return
             # ``target`` is at or beyond the next natural completion: take the
@@ -537,7 +591,9 @@ class IncrementalArbiter:
             # undrainable residual and an infinite loop.
             self._time += dt
             ResourceArbiter._advance(self._active, sharers, dt)
-            ResourceArbiter._complete(self._active, self._time, self._successors)
+            ResourceArbiter._complete(
+                self._active, self._time, self._successors, self._note_complete
+            )
         # The machine drained before ``target``; still advance the idle clock so
         # a job admitted at ``target`` starts there (no-op for ``inf``).
         if target != float("inf") and target > self._time:
