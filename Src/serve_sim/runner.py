@@ -34,6 +34,7 @@ from .dataset import (
 )
 from .model_config import load_model_config
 from .orchestrator import (
+    ParallelismSection,
     ProgressCallback,
     Request,
     RunProgress,
@@ -143,6 +144,33 @@ class BuildProgressReporter:
 
 
 
+def _parallelism_from_config(
+    cfg: Mapping[str, Any],
+) -> tuple[ParallelismSection, ...]:
+    """Parse the optional ``parallelism`` list into per-device sections.
+
+    Each entry binds a compute-device type (matched against a system node's
+    ``device`` key) to its own parallelism scheme. When the key is absent the
+    tuple is empty and the flat ``pipeline_parallel``/``expert_parallel``/... 
+    fields drive a single homogeneous engine group (backward compatible).
+    """
+
+    sections = cfg.get("parallelism")
+    if not sections:
+        return ()
+    return tuple(
+        ParallelismSection(
+            compute_device=str(entry["compute_device"]),
+            pipeline_parallel=int(entry.get("pipeline_parallel", 1)),
+            expert_parallel=int(entry.get("expert_parallel", 1)),
+            tensor_parallel=int(entry.get("tensor_parallel", 1)),
+            auto_parallelism=bool(entry.get("auto_parallelism", False)),
+            max_parallelism=entry.get("max_parallelism"),
+        )
+        for entry in sections
+    )
+
+
 def _strategy_from_config(cfg: Mapping[str, Any]) -> StrategyConfig:
     """Map the PRD config parameters onto a :class:`StrategyConfig`."""
 
@@ -154,6 +182,7 @@ def _strategy_from_config(cfg: Mapping[str, Any]) -> StrategyConfig:
         expert_parallel=int(cfg.get("expert_parallel", 1)),
         tensor_parallel=int(cfg.get("tensor_parallel", 1)),
         auto_parallelism=bool(cfg.get("auto_parallelism", False)),
+        parallelism=_parallelism_from_config(cfg),
         allow_pdd=bool(cfg.get("allow_pdd", True)),
         prefill_engine_fraction=float(cfg.get("prefill_engine_fraction", 0.5)),
         prefill_chunk_size=cfg.get("prefill_chunk_size"),

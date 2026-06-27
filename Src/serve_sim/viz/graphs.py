@@ -138,10 +138,13 @@ def build_summary_tables(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     if sequences:
         tables.append({
             "title": "Sequences",
-            "columns": ["Sequence", "Time in queue (s)", "TTFT (prefill, s)",
+            "columns": ["Sequence", "Model", "Engine group(s)",
+                        "Time in queue (s)", "TTFT (prefill, s)",
                         "TPS (decode, tok/s)", "Total idle wait (s)",
                         "Total latency (s)"],
             "rows": [[q.get("sequence", ""),
+                      q.get("model", ""),
+                      ", ".join(q.get("engine_groups", [])),
                       eng_format(q.get("queue_s")),
                       eng_format(q.get("ttft_prefill_s")),
                       eng_format(q.get("tps_tokens_per_s")),

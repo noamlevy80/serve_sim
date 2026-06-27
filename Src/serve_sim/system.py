@@ -307,6 +307,10 @@ def _build_node(
         # distinguishable in logs and per-device reports.
         for _ in range(count):
             device = load_compute_device(device_path, memory_dir=memory_dir)
+            # Tag the instance with its config key (the file stem) so the
+            # orchestrator can group devices by *type* independent of the
+            # node-qualified instance name.
+            device = replace(device, device_key=entry["device"])
             index = len(devices)
             device = _name_instance(device, node_name, index)
             devices.append(device)

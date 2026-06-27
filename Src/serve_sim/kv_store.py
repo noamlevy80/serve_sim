@@ -299,6 +299,11 @@ class KVCacheManager:
         spilled: list[KVEntry] = []
         dropped: list[KVEntry] = []
         for resident in evicted:
+            if resident.kind != "kv":
+                # Under a shared (GLOBAL_LRU) pool a KV admission can evict
+                # resident experts; those carry no stored KV entry and are simply
+                # refetched on demand, so there is nothing to migrate.
+                continue
             _, key = resident.key  # ("kv", (workload_id, turn_index))
             entry = self._entry_for_key(key)
             if entry is None:

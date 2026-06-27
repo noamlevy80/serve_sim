@@ -1025,9 +1025,10 @@ def test_home_node_prefers_slot_owning_node():
     model = toy_moe_model()
     system = make_streaming_system(num_devices=1, num_nodes=2)
     sim = Simulator(system, StrategyConfig(max_batch_size=1))
-    slot = sim._pool.slots[0]
+    group = sim._groups[0]
+    slot = group.pool.slots[0]
 
-    home = sim._home_node_for(model, slot)
+    home = sim._home_node_for(model, slot, group)
 
     assert home is system.node_of(slot.devices[0])
 
@@ -1045,14 +1046,15 @@ def test_large_model_homes_when_sharded_across_nodes():
     node_cap = full * 0.6
     system = make_streaming_system(num_devices=1, node_cap=node_cap, num_nodes=2)
     sim = Simulator(system, StrategyConfig(max_batch_size=1))
+    group = sim._groups[0]
     # One device per node, so a degree-2 slot spans both nodes.
     slot = EngineSlot(0, tuple(system.compute_devices[:2]))
     assert system.node_of(slot.devices[0]) is not system.node_of(slot.devices[1])
 
-    home = sim._home_node_for(model, slot)
+    home = sim._home_node_for(model, slot, group)
 
     assert home is not None  # homed despite the full model exceeding one node
-    shards = sim._home_shards[id(model)]
+    shards = sim._home_shards[(id(model), id(group))]
     assert len(shards) == 2  # sharded across both participating nodes
     assert all(s <= node_cap for s in shards.values())
     assert sum(shards.values()) == pytest.approx(full)

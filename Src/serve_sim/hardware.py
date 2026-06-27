@@ -55,6 +55,11 @@ class ComputeDevice:
         kernel_launch_latency: Fixed wait incurred each time a new kernel is
             launched on this device (seconds). Zero for devices with no launch
             overhead (e.g. statically scheduled dataflow chips).
+        device_key: The compute-device config key this instance was built from
+            (the ``Compute_devices/<key>.json`` stem, e.g. ``"nvidia-b200"``).
+            Shared by every instance of the same device type, so it identifies a
+            device *type* independent of an instance's node-qualified ``name``.
+            Empty for devices constructed directly (e.g. in tests).
     """
 
     name: str
@@ -62,6 +67,7 @@ class ComputeDevice:
     first_tier_memory: MemoryDevice
     second_tier_memory: MemoryDevice | None = None
     kernel_launch_latency: float = 0.0
+    device_key: str = ""
 
     def __post_init__(self) -> None:
         if self.peak_flops_fp16 <= 0:

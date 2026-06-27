@@ -116,6 +116,32 @@ def test_partitioned_kv_region_too_small_falls_back_to_node():
     assert manager.entries[0].device is None
 
 
+def test_storing_kv_evicting_a_shared_pool_expert_does_not_crash():
+    # Under GLOBAL_LRU experts and retained KV share one device pool, so storing
+    # a completed sequence's KV can evict a resident expert. The expert carries no
+    # stored KV entry; it must be skipped by the spill path rather than have its
+    # integer index unpacked as a (workload_id, turn_index) key.
+    model = toy_model()
+    context_tokens = 64
+    entry_bytes = float(context_kv_bytes(model, context_tokens))
+    system = make_kv_system([entry_bytes * 4])
+    device = system.compute_devices[0]
+    hbm = make_hbm(system, capacity=entry_bytes * 1.5)  # holds ~one block
+    manager = KVCacheManager(system, "global_lru", hbm)
+
+    residency = hbm[id(device)]
+    assert residency.admit_expert(0, entry_bytes, now=0.0) == []
+    assert residency.expert_resident(0)
+
+    tracker = tracker_from_messages([dict(SYSTEM), dict(USER)])
+    res = manager.store(model, tracker, 0, 0, context_tokens, now=1.0, device=device)
+
+    assert res.memory is device.first_tier_memory   # KV retained on the device
+    assert res.spilled == ()                         # nothing migrated for the expert
+    assert not residency.expert_resident(0)          # the LRU expert was evicted
+    assert manager.entries[0].device is device
+
+
 # --- orchestrator: fetch routing ------------------------------------------------
 
 

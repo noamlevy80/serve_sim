@@ -239,8 +239,9 @@ def test_sequences_table_has_one_row_per_turn():
     tables = build_summary_tables(payload)
     seq = next(t for t in tables if t["title"] == "Sequences")
     assert seq["columns"] == [
-        "Sequence", "Time in queue (s)", "TTFT (prefill, s)",
-        "TPS (decode, tok/s)", "Total idle wait (s)", "Total latency (s)"]
+        "Sequence", "Model", "Engine group(s)", "Time in queue (s)",
+        "TTFT (prefill, s)", "TPS (decode, tok/s)", "Total idle wait (s)",
+        "Total latency (s)"]
     assert len(seq["rows"]) == 3
     for q in payload["sequences"]:
         assert q["queue_s"] >= 0.0

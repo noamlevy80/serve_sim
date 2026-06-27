@@ -273,6 +273,8 @@ Concretely, an engine slot is a *fixed device budget* (the parallelism degree); 
 
 Tensor parallelism (`tensor_parallel`) is a third, always-fixed degree layered on top: the engine occupies `pipeline_parallel x expert_parallel x tensor_parallel` devices, and tensor parallelism shards every weight tensor and the KV cache across its ranks while splitting their compute, so it both speeds a batch up by `tensor_parallel` and divides the per-device footprint by the same factor (relieving dense-weight, expert and KV pressure alike — unlike expert parallelism, which only shards routed experts). It is applied verbatim whether or not `auto_parallelism` is set; the search re-factors only the `pipeline x expert` budget while `tensor_parallel` rides along through the footprint and time estimate.
 
+**Per-device-type parallelism.** A heterogeneous cluster mixes compute devices with very different memory and throughput, so one global parallelism scheme rarely suits all of them. An optional `parallelism` list lets each device *type* carry its own scheme: every entry names a `compute_device` (matched against the `device` key of the system's nodes) and its own `pipeline_parallel`/`expert_parallel`/`tensor_parallel`/`auto_parallelism`. The orchestrator then partitions the cluster into one *engine group* per entry, each group spanning only the devices of its type and slicing them into slots of its own degree; a batch is routed to a group and served entirely within it (slots never span device types). When the list is omitted the flat `pipeline_parallel`/`expert_parallel`/`tensor_parallel`/`auto_parallelism` fields drive a single group over all devices, exactly as before. Each device type must be given a scheme its own memory can hold — a model that does not fit any arrangement on a given type cannot be served there.
+
 ### Global KV cache
 The orchestrator keeps a single, system-wide record of every sequence's KV cache that has not yet been evicted, so prefixes can be reused across conversations (not merely between consecutive turns of one conversation) and the KV may live anywhere in the memory hierarchy (not only on the device that last served the sequence). This is enabled by `global_kv_cache` (default true); when off, the only reuse is the previous-turn-of-the-same-conversation heuristic.
 
@@ -322,6 +324,8 @@ The simulator will make an eager effort to preload the best it can and of course
     Fraction of engine slots assigned to the prefill pool when PDD is enabled (the rest serve decode); clamped so each pool keeps at least one slot.
 - auto_parallelism (default false)
     If true, the orchestrator treats the configured pipeline x expert degrees as a fixed engine size and, per batch, searches their factorizations for the fastest memory-feasible arrangement; if false the configured degrees are used as-is.
+- parallelism (default null)
+    Optional list of per-device-type parallelism sections. Each entry sets a `compute_device` (matched against the `device` key of the system's nodes) plus its own `pipeline_parallel`/`expert_parallel`/`tensor_parallel`/`auto_parallelism`, giving that device type its own engine group. When null, the flat `pipeline_parallel`/`expert_parallel`/`tensor_parallel`/`auto_parallelism` fields drive a single group over all devices.
 - max_parallelism (default 32)
     The maximum parallelism rank the orchestrator should explore
 - prefill_chunk_size (default null)

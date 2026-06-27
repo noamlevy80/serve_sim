@@ -263,6 +263,7 @@ Keys read by [runner.py](Src/serve_sim/runner.py) (`run_from_config` / `_strateg
 | `pipeline_parallel` / `expert_parallel` | `1` | Fixed parallel degrees (re-factored by `auto_parallelism`). |
 | `tensor_parallel` | `1` | Fixed tensor-parallel degree; shards every tensor + KV and splits compute. Always applied verbatim. Engine = `pp x ep x tp` devices. |
 | `auto_parallelism` | `False` | Let the orchestrator pick parallelism. |
+| `parallelism` | `None` | Optional list of per-device-type sections; each entry binds a `compute_device` (matched against a system node's `device` key) to its own `pipeline_parallel`/`expert_parallel`/`tensor_parallel`/`auto_parallelism`. Partitions the cluster into one engine group per device type. When absent, the flat `pipeline_parallel`/... fields drive a single homogeneous group (backward compatible). |
 | `model_weight_loading` | `True` | Model first-placement weight-load cost. |
 | `event_random_factor_range` | `0.05` | Per-event time perturbation magnitude. |
 | `global_kv_cache` | `True` | Enable the global persistent KV cache. |

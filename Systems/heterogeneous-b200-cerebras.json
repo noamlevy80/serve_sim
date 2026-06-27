@@ -15,7 +15,7 @@
       "node_memory": "lpddr5x-100T",
       "count" : 24,
       "compute_devices": [
-        { "device": "nvidia-b200", "count": 4 }
+        { "device": "nvidia-b200", "count": 2 }
       ]
     },
     {

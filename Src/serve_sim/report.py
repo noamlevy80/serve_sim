@@ -1104,11 +1104,13 @@ def _idle_wait(
 def sequence_table(result: RunResult) -> list[dict[str, Any]]:
     """Per-sequence timings: one row per turn of every workload (or request).
 
-    Each row carries the time in queue (arrival to dispatch), TTFT counted only
-    over prefill (dispatch to first token), TPS counted only over decode, the
-    total idle wait while dispatched, and the end-to-end latency (arrival to
-    answer). Rows are ordered by workload then turn, with standalone requests
-    last.
+    Each row carries the model that served the turn, the engine group(s) it
+    executed on (a list when prefill and decode run on different groups, e.g.
+    under prefill/decode disaggregation), the time in queue (arrival to
+    dispatch), TTFT counted only over prefill (dispatch to first token), TPS
+    counted only over decode, the total idle wait while dispatched, and the
+    end-to-end latency (arrival to answer). Rows are ordered by workload then
+    turn, with standalone requests last.
     """
 
     by_request = _events_by_request(_rescaled(result.events))
@@ -1122,18 +1124,48 @@ def sequence_table(result: RunResult) -> list[dict[str, Any]]:
     for r in sorted(result.records, key=_key):
         ttft_prefill = (r.first_token_time - r.dispatch_time
                         if r.first_token_time is not None else None)
+        events = by_request.get(r.request_id, ())
         rows.append({
             "sequence": _sequence_id(r.workload_id, r.turn_index)
                         or f"r{r.request_id}",
+            "model": _request_model(events),
+            "engine_groups": _engine_groups(events),
             "queue_s": r.queue_delay,
             "ttft_prefill_s": ttft_prefill,
             "tps_tokens_per_s": r.tps,
             "idle_wait_s": _idle_wait(
-                by_request.get(r.request_id, ()), r.dispatch_time,
-                r.completion_time),
+                events, r.dispatch_time, r.completion_time),
             "latency_s": r.latency,
         })
     return rows
+
+
+def _request_model(events: Sequence[EventRecord]) -> str:
+    """Name of the model serving a request (space-joined if it spans several)."""
+
+    seen: list[str] = []
+    for e in events:
+        if e.model and e.model not in seen:
+            seen.append(e.model)
+    return " ".join(seen)
+
+
+def _engine_groups(events: Sequence[EventRecord]) -> list[str]:
+    """Engine group(s) a request executed on, in prefill-then-decode order.
+
+    Each group is the space-joined set of devices that ran one compute phase.
+    Prefill and decode collapse to a single entry when they share devices, and
+    yield two entries when they run on disjoint groups (prefill/decode
+    disaggregation).
+    """
+
+    groups: list[tuple[str, ...]] = []
+    for phase in _COMPUTE_PHASES:
+        devices = tuple(sorted(
+            {e.device for e in events if e.phase == phase and e.device}))
+        if devices and devices not in groups:
+            groups.append(devices)
+    return [" ".join(g) for g in groups]
 
 
 def summarize(

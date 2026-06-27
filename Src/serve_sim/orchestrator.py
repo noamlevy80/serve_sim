@@ -35,6 +35,7 @@ from typing import Callable, Sequence
 from .arbiter import IncrementalArbiter
 from .device_memory import DeviceHbmResidency, MemoryPolicy
 from .events import ComputeEvent, EventGenerator
+from .hardware import ComputeDevice
 from .parallelism import ParallelismPlanner
 from .pdd import context_kv_bytes, kv_transfer_duration, split_work
 from .placement import EnginePool, EngineSlot
@@ -76,6 +77,54 @@ class MemoryCapacityExceeded(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ParallelismSection:
+    """A parallelism scheme scoped to one compute-device *type*.
+
+    A heterogeneous system mixes very different accelerators, and the best way to
+    wire an engine group out of one device type rarely suits another. A strategy
+    may therefore carry a list of these sections (see
+    ``StrategyConfig.parallelism``); the orchestrator partitions the system's
+    compute devices by type and builds each type's engine groups with its own
+    section. When no sections are given the flat ``StrategyConfig`` fields act as
+    a single section spanning every device.
+
+    Attributes:
+        compute_device: The compute-device config key this section configures
+            (the ``Compute_devices/<key>.json`` stem, e.g. ``"nvidia-b200"``),
+            matched against each device's :attr:`~serve_sim.hardware.ComputeDevice.device_key`.
+        pipeline_parallel: Fixed pipeline-parallel degree for this device type.
+        expert_parallel: Fixed expert-parallel degree for this device type.
+        tensor_parallel: Fixed tensor-parallel degree for this device type.
+        auto_parallelism: When ``True``, the ``pipeline_parallel x expert_parallel``
+            product is treated as a fixed engine size and re-factored per batch
+            (``tensor_parallel`` held fixed); see ``StrategyConfig.auto_parallelism``.
+        max_parallelism: Optional cap on the parallelism rank to explore (accepted
+            for config parity; not yet enforced by the search).
+    """
+
+    compute_device: str
+    pipeline_parallel: int = 1
+    expert_parallel: int = 1
+    tensor_parallel: int = 1
+    auto_parallelism: bool = False
+    max_parallelism: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.compute_device:
+            raise ValueError("a parallelism section needs a compute_device key")
+        if self.pipeline_parallel < 1 or self.expert_parallel < 1:
+            raise ValueError("parallelism degrees must be >= 1")
+        if self.tensor_parallel < 1:
+            raise ValueError("parallelism degrees must be >= 1")
+
+    @property
+    def degree(self) -> int:
+        """Devices per engine slot for this section (``pp x ep x tp``)."""
+
+        return self.pipeline_parallel * self.expert_parallel * self.tensor_parallel
+
+
+@dataclass(frozen=True)
 class StrategyConfig:
     """The orchestration knobs (v0 subset).
 
@@ -105,6 +154,15 @@ class StrategyConfig:
             and, per batch, searches the ``(pp, ep)`` factorizations of that size
             for the fastest one that fits device memory. When ``False`` (default)
             the fixed ``pp``/``ep`` are used verbatim.
+        parallelism: Optional per-compute-device parallelism schemes (one
+            :class:`ParallelismSection` per device *type*). When non-empty the
+            orchestrator partitions the system's compute devices by type and
+            builds each type's engine groups from its matching section instead of
+            the flat ``pipeline_parallel``/``expert_parallel``/``tensor_parallel``/
+            ``auto_parallelism`` fields above -- so a heterogeneous system can wire
+            each accelerator the way that suits it. When empty (default) the flat
+            fields act as a single section spanning every device (the legacy
+            homogeneous behaviour).
         allow_pdd: When ``True``, prefill and decode run on separate engine pools
             (split by ``prefill_engine_fraction``) with a modeled KV-cache
             transfer between them. When ``False`` (default) each request's prefill
@@ -163,6 +221,7 @@ class StrategyConfig:
     expert_parallel: int = 1
     tensor_parallel: int = 1
     auto_parallelism: bool = False
+    parallelism: tuple[ParallelismSection, ...] = ()
     allow_pdd: bool = False
     prefill_engine_fraction: float = 0.5
     prefill_chunk_size: int | None = None
@@ -185,6 +244,13 @@ class StrategyConfig:
             raise ValueError("parallelism degrees must be >= 1")
         if self.tensor_parallel < 1:
             raise ValueError("parallelism degrees must be >= 1")
+        if not isinstance(self.parallelism, tuple):
+            object.__setattr__(self, "parallelism", tuple(self.parallelism))
+        keys = [s.compute_device for s in self.parallelism]
+        if len(keys) != len(set(keys)):
+            raise ValueError(
+                "each compute_device may appear at most once in parallelism sections"
+            )
         if self.prefill_chunk_size is not None and self.prefill_chunk_size < 1:
             raise ValueError("prefill_chunk_size must be >= 1")
         if not 0.0 < self.prefill_engine_fraction < 1.0:
@@ -628,62 +694,106 @@ class RunResult:
         raise KeyError(f"no record for request {request_id}")
 
 
+@dataclass
+class EngineGroup:
+    """One device type's engine slots and the parallelism scheme wiring them.
+
+    A heterogeneous system is partitioned into one group per compute-device type
+    (or a single group spanning every device in the legacy homogeneous case). The
+    group owns an :class:`~serve_sim.placement.EnginePool` carved from *just* that
+    type's devices and the ``(pp, ep, tp)`` arrangement used to run batches on it,
+    so batches on a B200 group and a Cerebras group are each wired the way their
+    silicon prefers. ``prefill_pool``/``decode_pool`` are populated only when PDD
+    splits the group's devices into disjoint phase pools.
+
+    Attributes:
+        device_key: The compute-device config key the group serves (``""`` for the
+            legacy single group spanning every device type).
+        pool: Engine pool over this group's devices (used by the non-PDD loop).
+        pipeline_parallel: Fixed pipeline-parallel degree for the group.
+        expert_parallel: Fixed expert-parallel degree for the group.
+        tensor_parallel: Fixed tensor-parallel degree for the group.
+        auto_parallelism: Whether the per-batch factorization search is enabled.
+        prefill_pool: PDD prefill sub-pool, or ``None`` when PDD is off.
+        decode_pool: PDD decode sub-pool, or ``None`` when PDD is off.
+    """
+
+    device_key: str
+    pool: EnginePool
+    pipeline_parallel: int
+    expert_parallel: int
+    tensor_parallel: int
+    auto_parallelism: bool
+    prefill_pool: EnginePool | None = None
+    decode_pool: EnginePool | None = None
+
+    @property
+    def degree(self) -> int:
+        """Devices per engine slot for this group (``pp x ep x tp``)."""
+
+        return self.pipeline_parallel * self.expert_parallel * self.tensor_parallel
+
+    @property
+    def device(self) -> ComputeDevice:
+        """A representative device of this group's type (for the planner)."""
+
+        return self.pool.slots[0].devices[0]
+
+
 class Simulator:
     """Runs a set of requests through a system under a fixed strategy."""
 
     def __init__(self, system: System, strategy: StrategyConfig | None = None) -> None:
         self.system = system
         self.strategy = strategy or StrategyConfig()
-        degree = (
-            self.strategy.pipeline_parallel
-            * self.strategy.expert_parallel
-            * self.strategy.tensor_parallel
-        )
-        devices = system.compute_devices
-        if len(devices) < degree:
-            raise ValueError(
-                f"system has {len(devices)} compute devices but the engine needs "
-                f"{degree} (pipeline_parallel x expert_parallel x tensor_parallel)"
-            )
-        # Carve the system into fixed-size engine slots. Concurrent batches land
-        # on disjoint slots when free (running independently); when every slot is
-        # busy they time-share the least-loaded one (the arbiter then shares that
-        # device set between them).
-        self._pool = EnginePool(devices, degree)
-        self._degree = degree
-        # Prefill/decode disaggregation: split the slots into a prefill pool and
-        # a decode pool over disjoint device sets. The partition point is a
-        # single knob (prefill_engine_fraction); dynamic repartitioning is future
-        # work.
+        # Carve the system into engine groups -- one per compute-device type when
+        # the strategy carries per-device parallelism sections, otherwise a single
+        # group spanning every device wired by the flat parallelism fields (the
+        # legacy homogeneous behaviour). Each group owns an engine pool over just
+        # its devices and the (pp, ep, tp) scheme that suits that silicon.
+        self._groups: list[EngineGroup] = self._build_groups()
+        # Prefill/decode disaggregation operates within a single engine group for
+        # now (a heterogeneous PDD split is future work); ``_prefill_pool`` /
+        # ``_decode_pool`` mirror that group's phase sub-pools when PDD is on.
         self._prefill_pool: EnginePool | None = None
         self._decode_pool: EnginePool | None = None
         if self.strategy.allow_pdd:
-            num_slots = self._pool.num_slots
+            if len(self._groups) != 1:
+                raise NotImplementedError(
+                    "PDD is not yet supported with per-compute-device parallelism "
+                    "sections; configure a single device type or disable allow_pdd"
+                )
+            group = self._groups[0]
+            num_slots = group.pool.num_slots
             if num_slots < 2:
                 raise ValueError(
-                    f"PDD needs at least 2 engine slots but the system has "
-                    f"{num_slots} (degree {degree} over {len(devices)} devices)"
+                    f"PDD needs at least 2 engine slots but the group has "
+                    f"{num_slots} (degree {group.degree})"
                 )
+            group_devices = [d for s in group.pool.slots for d in s.devices]
             prefill_slots = round(self.strategy.prefill_engine_fraction * num_slots)
             prefill_slots = max(1, min(num_slots - 1, prefill_slots))
-            cut = prefill_slots * degree
-            self._prefill_pool = EnginePool(devices[:cut], degree)
-            self._decode_pool = EnginePool(devices[cut:], degree)
-        # When auto-parallelism is on, a planner re-factors the fixed engine size
-        # (degree) into the fastest memory-feasible (pp, ep) per batch; cached per
-        # model instance since the layout depends only on the model and device.
-        self._planners: dict[int, ParallelismPlanner] = {}
+            cut = prefill_slots * group.degree
+            self._prefill_pool = EnginePool(group_devices[:cut], group.degree)
+            self._decode_pool = EnginePool(group_devices[cut:], group.degree)
+            group.prefill_pool = self._prefill_pool
+            group.decode_pool = self._decode_pool
+        # A planner re-factors a group's fixed engine size into the fastest
+        # memory-feasible (pp, ep) per batch (when auto-parallelism is on); cached
+        # by (model instance, representative device) since the layout depends only
+        # on the model and the device type it runs on.
+        self._planners: dict[tuple[int, int], ParallelismPlanner] = {}
         self._rng = random.Random(self.strategy.random_seed)
-        # Representative home node per MoE model: a node owning one of the serving
-        # devices whose RAM streams routed experts on demand. The model itself is
-        # sharded across all the slot's nodes (see ``_home_shards``); this node is
-        # only the homogeneous fetch source. Chosen the first time the model is
-        # placed and then fixed for the run.
-        self._home_nodes: dict[int, object] = {}
-        # Per-model RAM reservation: ``id(model) -> {id(node): shard_bytes}``. Each
+        # Representative home node per (MoE model, engine group): a node owning one
+        # of the serving devices whose RAM streams routed experts on demand. The
+        # model itself is sharded across all the slot's nodes (see ``_home_shards``);
+        # this node is only the homogeneous fetch source. Chosen the first time the
+        # model is placed on the group and then fixed for the run.
+        self._home_nodes: dict[tuple[int, int], object] = {}
+        # Per-(model, group) RAM reservation: ``-> {id(node): shard_bytes}``. Each
         # participating node holds the fraction of the model its own devices serve
         # for the life of the run, so co-located models must all fit at once.
-        self._home_shards: dict[int, dict[int, float]] = {}
+        self._home_shards: dict[tuple[int, int], dict[int, float]] = {}
         # (model, node) pairs whose weight shard has already been staged into that
         # node's RAM (NVM -> RAM happens once per node; later placements only stage
         # RAM -> device).
@@ -724,6 +834,68 @@ class Simulator:
             else None
         )
 
+    def _build_groups(self) -> list[EngineGroup]:
+        """Partition the system's compute devices into engine groups.
+
+        With per-device parallelism sections, one group is built per section over
+        exactly the devices whose ``device_key`` matches it (preserving system
+        order); a device type with no section is left unused, and a section that
+        matches no device is rejected. Without sections a single group spans every
+        device, wired by the flat ``StrategyConfig`` parallelism fields -- the
+        legacy homogeneous layout.
+        """
+
+        strategy = self.strategy
+        all_devices = self.system.compute_devices
+        if not strategy.parallelism:
+            degree = (
+                strategy.pipeline_parallel
+                * strategy.expert_parallel
+                * strategy.tensor_parallel
+            )
+            if len(all_devices) < degree:
+                raise ValueError(
+                    f"system has {len(all_devices)} compute devices but the engine "
+                    f"needs {degree} (pipeline_parallel x expert_parallel x "
+                    f"tensor_parallel)"
+                )
+            return [
+                EngineGroup(
+                    device_key="",
+                    pool=EnginePool(all_devices, degree),
+                    pipeline_parallel=strategy.pipeline_parallel,
+                    expert_parallel=strategy.expert_parallel,
+                    tensor_parallel=strategy.tensor_parallel,
+                    auto_parallelism=strategy.auto_parallelism,
+                )
+            ]
+
+        groups: list[EngineGroup] = []
+        for section in strategy.parallelism:
+            devices = [d for d in all_devices if d.device_key == section.compute_device]
+            if not devices:
+                raise ValueError(
+                    f"parallelism section for compute_device "
+                    f"{section.compute_device!r} matches no device in the system"
+                )
+            if len(devices) < section.degree:
+                raise ValueError(
+                    f"compute_device {section.compute_device!r} has {len(devices)} "
+                    f"devices but its engine needs {section.degree} (pipeline_parallel "
+                    f"x expert_parallel x tensor_parallel)"
+                )
+            groups.append(
+                EngineGroup(
+                    device_key=section.compute_device,
+                    pool=EnginePool(devices, section.degree),
+                    pipeline_parallel=section.pipeline_parallel,
+                    expert_parallel=section.expert_parallel,
+                    tensor_parallel=section.tensor_parallel,
+                    auto_parallelism=section.auto_parallelism,
+                )
+            )
+        return groups
+
     def _build_hbm(self) -> dict[int, "DeviceHbmResidency"]:
         """Per compute device, the HBM residency for retained KV and experts.
 
@@ -750,11 +922,25 @@ class Simulator:
             )
         return hbm
 
-    def _planner_for(self, model: object) -> ParallelismPlanner:
-        key = id(model)
+    def _planner_for(
+        self, model: object, device: ComputeDevice | None = None
+    ) -> ParallelismPlanner:
+        """The planner for ``model`` on ``device`` (defaults to the first group).
+
+        Keyed by ``(model, device)`` so each device *type* gets its own planner:
+        the per-device byte footprints are device-independent, but the memory
+        ``capacity`` and roofline time estimates that drive the auto-parallelism
+        search are not, so a B200 group and a Cerebras group must plan against
+        their own silicon. Footprint-only callers may omit ``device`` (any
+        group's planner yields the same bytes).
+        """
+
+        if device is None:
+            device = self._groups[0].device
+        key = (id(model), id(device))
         planner = self._planners.get(key)
         if planner is None:
-            planner = ParallelismPlanner(model, self._pool.slots[0].devices[0])
+            planner = ParallelismPlanner(model, device)
             self._planners[key] = planner
         return planner
 
@@ -798,16 +984,17 @@ class Simulator:
         models = self._distinct_models_by_demand(requests)
         if not models:
             return
-        for pool in (self._pool, self._prefill_pool, self._decode_pool):
-            if pool is not None:
-                pool.warm_start(models)
-                self._warm_start_experts(pool)
+        for group in self._groups:
+            for pool in (group.pool, group.prefill_pool, group.decode_pool):
+                if pool is not None:
+                    pool.warm_start(models)
+                    self._warm_start_experts(group, pool)
 
-    def _warm_start_experts(self, pool: EnginePool) -> None:
+    def _warm_start_experts(self, group: EngineGroup, pool: EnginePool) -> None:
         """Preload each warm-started MoE model's expert shards onto its slot HBM.
 
         Routed experts are part of a model's weights, so warm start makes them
-        resident on each expert rank's device (the configured ``expert_parallel x
+        resident on each expert rank's device (the group's ``expert_parallel x
         tensor_parallel`` scheme) alongside the model, sparing the first batch the
         expert stream. The exception is a rank whose full expert shard does not
         fit its HBM region: it is left to stream its working set on demand. No-op
@@ -816,8 +1003,8 @@ class Simulator:
 
         if not self._hbm:
             return
-        ep = self.strategy.expert_parallel
-        tp = self.strategy.tensor_parallel
+        ep = group.expert_parallel
+        tp = group.tensor_parallel
         for slot in pool.slots:
             model = pool.resident_model(slot)
             if model is None or not self._is_moe(model):
@@ -839,7 +1026,7 @@ class Simulator:
                 residency.preload_experts(owned, index_bytes, 0.0)
 
 
-    def _home_node_for(self, model: object, slot: EngineSlot):
+    def _home_node_for(self, model: object, slot: EngineSlot, group: EngineGroup):
         """A representative node whose RAM streams ``model``'s experts.
 
         The model is *sharded across the nodes that own the serving slot's
@@ -852,10 +1039,11 @@ class Simulator:
         devices' own (in-node) RAM. The returned node is a representative (it owns
         a slot device; node RAM is homogeneous) used as the expert-fetch source;
         ``None`` means some node cannot hold its shard, so the model keeps
-        streaming experts straight from the shared input NVM.
+        streaming experts straight from the shared input NVM. Cached per ``(model,
+        group)`` because different device-type groups sit on different nodes.
         """
 
-        key = id(model)
+        key = (id(model), id(group))
         if key in self._home_nodes:
             return self._home_nodes[key]
         full = self._planner_for(model).full_model_bytes
@@ -941,8 +1129,10 @@ class Simulator:
                                      time.perf_counter() - start_wall,
                                      avg_tps, avg_ttft))
 
-        # job_index -> (requests, dispatch_time, batch_index, slot)
-        jobs: dict[int, tuple[list[Request], float, int, EngineSlot]] = {}
+        # job_index -> (requests, dispatch_time, batch_index, slot, pool)
+        jobs: dict[
+            int, tuple[list[Request], float, int, EngineSlot, EnginePool]
+        ] = {}
         # job_index -> (job_phase, requests, slot, batch_index, pp, ep, tp)
         job_meta: dict[
             int, tuple[str, list[Request], EngineSlot, int, int, int, int]
@@ -984,13 +1174,13 @@ class Simulator:
 
             # 1) Retire any jobs that have finished by ``now``.
             completed_before = len(result.records)
-            for job_index, (reqs, dispatch_time, b_index, slot) in jobs.items():
+            for job_index, (reqs, dispatch_time, b_index, slot, pool) in jobs.items():
                 if job_index in reported or not arbiter.job_is_done(job_index):
                     continue
                 reported.add(job_index)
                 end = arbiter.job_end_time(job_index)
                 in_flight -= len(reqs)
-                self._pool.release(slot)
+                pool.release(slot)
                 self._free_reservation(slot, job_index)
                 first_token_time = _first_token_end(
                     arbiter.job_rescaled_events(job_index)
@@ -1054,8 +1244,9 @@ class Simulator:
                 if self._kv_active:
                     batch, matches = self._resolve_kv(batch, now)
                     kv_fetches = self._kv_fetches(batch, matches)
+                group = self._select_group(batch[0].model)
                 job_index, slot, pp, ep, tp = self._dispatch(
-                    arbiter, batch, kv_fetches=kv_fetches,
+                    arbiter, batch, group=group, kv_fetches=kv_fetches,
                     result=result, now=now, batch_index=batch_index)
                 if job_index is None:
                     # Memory back-pressure: the slot cannot hold this batch yet.
@@ -1086,7 +1277,7 @@ class Simulator:
                         now, "decode", req, device_names, batch_index,
                         tokens=req.output_tokens,
                         batch_members=members))
-                jobs[job_index] = (batch, now, batch_index, slot)
+                jobs[job_index] = (batch, now, batch_index, slot, group.pool)
                 job_meta[job_index] = ("full", batch, slot, batch_index, pp, ep, tp)
                 batch_index += 1
                 progressed = True
@@ -1296,7 +1487,8 @@ class Simulator:
                     batch, matches = self._resolve_kv(batch, now)
                     kv_fetches = self._kv_fetches(batch, matches)
                 job_index, slot, pp, ep, tp = self._dispatch(
-                    arbiter, batch, pool=self._prefill_pool, phase="prefill",
+                    arbiter, batch, group=self._groups[0],
+                    pool=self._prefill_pool, phase="prefill",
                     kv_fetches=kv_fetches,
                     result=result, now=now, batch_index=batch_index,
                 )
@@ -1342,7 +1534,8 @@ class Simulator:
                     break
                 batch = self._take_decode_batch(decode_ready)
                 job_index, slot, pp, ep, tp = self._dispatch(
-                    arbiter, batch, pool=self._decode_pool, phase="decode",
+                    arbiter, batch, group=self._groups[0],
+                    pool=self._decode_pool, phase="decode",
                     result=result, now=now, batch_index=batch_index,
                 )
                 if job_index is None:
@@ -1800,11 +1993,38 @@ class Simulator:
         return batch
 
 
+    def _select_group(self, model: object) -> EngineGroup:
+        """Choose the engine group (device type) to host a batch of ``model``.
+
+        Spreads batches across the system's device-type groups: prefers a group
+        with a free slot already holding the model (no weight reload), then any
+        group with a free slot (most-free first), and finally the group whose
+        least-loaded slot is emptiest so a saturated system time-shares its
+        roomiest engine. With a single group (the homogeneous default) this always
+        returns that group, so existing behaviour is unchanged.
+        """
+
+        best: tuple[tuple[int, int, int, int], EngineGroup] | None = None
+        for index, group in enumerate(self._groups):
+            pool = group.pool
+            slots = pool.slots
+            free = pool.free_count
+            affinity = any(
+                pool.is_free(s) and pool.resident_model(s) is model for s in slots
+            )
+            min_load = min(pool.slot_load(s) for s in slots)
+            key = (0 if (affinity and free > 0) else 1, -free, min_load, index)
+            if best is None or key < best[0]:
+                best = (key, group)
+        assert best is not None
+        return best[1]
+
     def _dispatch(
         self,
         arbiter: IncrementalArbiter,
         batch: list[Request],
         *,
+        group: EngineGroup,
         pool: EnginePool | None = None,
         phase: str = "full",
         kv_fetches: list[tuple[object, float, object]] | None = None,
@@ -1814,10 +2034,12 @@ class Simulator:
     ) -> tuple[int | None, EngineSlot, int, int, int]:
         """Place a batch on an engine slot and admit its events to the arbiter.
 
-        ``phase`` selects the work generated: ``"full"`` (prefill + decode in one
-        job, the default), ``"prefill"`` (prompt forward pass only) or
+        ``group`` is the engine group (device type + parallelism scheme) the batch
+        runs on; its ``(pp, ep, tp)`` and planner are used to wire and size the
+        job. ``phase`` selects the work generated: ``"full"`` (prefill + decode in
+        one job, the default), ``"prefill"`` (prompt forward pass only) or
         ``"decode"`` (generation from a fully-cached prompt). ``pool`` defaults to
-        the single engine pool; PDD passes the prefill or decode pool.
+        the group's pool; PDD passes the group's prefill or decode pool.
         ``kv_fetches`` lists ``(floating_memory, bytes)`` prefixes to fetch from
         the global KV cache before compute. Returns the arbiter job index, the
         slot the batch occupies (released on completion), and the
@@ -1828,7 +2050,7 @@ class Simulator:
         """
 
         model = batch[0].model
-        pool = pool or self._pool
+        pool = pool or group.pool
         work = [self._phase_work(req, phase) for req in batch]
 
         # Plan the batch: work shards, the MoE activation trace, and the chosen
@@ -1858,7 +2080,9 @@ class Simulator:
                 if self._is_moe(model)
                 else None
             )
-            pp, ep, tp = self._parallelism_for(model, batch, shards, expert_trace)
+            pp, ep, tp = self._parallelism_for(
+                model, batch, shards, expert_trace, group=group
+            )
             expert_cap = (
                 max(1, peak_active_per_rank(expert_trace, ep))
                 if expert_trace is not None
@@ -1877,7 +2101,7 @@ class Simulator:
         # instead of pinning every one on the serving devices).
         placement = pool.place(model)
         slot = placement.slot
-        home = self._home_node_for(model, slot)
+        home = self._home_node_for(model, slot, group)
         expert_source = None
         expert_latency = 0.0
         if expert_trace is not None:
@@ -1886,9 +2110,9 @@ class Simulator:
             )
             expert_latency = self._expert_fetch_latency(expert_source, slot, home)
             kv_tokens = sum(r.prompt_tokens + r.output_tokens for r in batch)
-            self._job_reserve[batch_index] = self._planner_for(model).streaming_footprint(
-                pp, kv_tokens, expert_cap, tp
-            )
+            self._job_reserve[batch_index] = self._planner_for(
+                model, group.device
+            ).streaming_footprint(pp, kv_tokens, expert_cap, tp)
 
         # Memory-aware admission: a real engine cannot pin more than its devices
         # hold, so rather than over-subscribe and crash, refuse a batch whose
@@ -1932,7 +2156,7 @@ class Simulator:
             ]
         loads: list[ComputeEvent] = []
         if self.strategy.model_weight_loading and placement.needs_weight_load:
-            loads = self._weight_load_events(model, slot, pp, ep, tp, home)
+            loads = self._weight_load_events(model, slot, pp, ep, tp, home, group)
             if result is not None:
                 self._emit_weight_decisions(
                     result, batch, slot, placement.evicted_model, now, batch_index)
@@ -1996,7 +2220,8 @@ class Simulator:
         return prelude + shifted
 
     def _weight_load_events(
-        self, model: object, slot: EngineSlot, pp: int, ep: int, tp: int, home
+        self, model: object, slot: EngineSlot, pp: int, ep: int, tp: int, home,
+        group: EngineGroup,
     ) -> list[ComputeEvent]:
         """Weight-load (``weight_transfer``) events for a slot (re)load.
 
@@ -2022,7 +2247,7 @@ class Simulator:
         events: list[ComputeEvent] = []
         if home is not None:
             nvm = self.system.input_memory
-            shards = self._home_shards.get(id(model), {})
+            shards = self._home_shards.get((id(model), id(group)), {})
             # Stage 1: NVM -> each participating node's RAM, once per (model, node),
             # of that node's shard of the model (its devices' share of the slot).
             staged_nodes: set[int] = set()
@@ -2490,32 +2715,33 @@ class Simulator:
 
     def _parallelism_for(
         self, model: object, batch: list[Request], shards: list,
-        expert_trace: list | None = None,
+        expert_trace: list | None = None, *, group: EngineGroup,
     ) -> tuple[int, int, int]:
         """Pick (pipeline_parallel, expert_parallel, tensor_parallel) for a batch.
 
-        Fixed from the strategy unless ``auto_parallelism`` is set, in which case
-        the planner searches the factorizations of the ``pp x ep`` budget for the
-        fastest memory-feasible arrangement of this batch; ``tensor_parallel`` is
-        always taken verbatim and applied to the footprint. Either way the chosen
-        arrangement must fit in device memory; a batch that cannot be placed
-        raises rather than producing a physically impossible (over-capacity)
-        schedule. When ``expert_trace`` is given the model streams its experts, so
-        the fit only reserves the per-rank working set instead of every expert.
+        Fixed from the group's scheme unless its ``auto_parallelism`` is set, in
+        which case the planner searches the factorizations of the ``pp x ep``
+        budget for the fastest memory-feasible arrangement of this batch;
+        ``tensor_parallel`` is always taken verbatim and applied to the footprint.
+        Either way the chosen arrangement must fit in the group's device memory; a
+        batch that cannot be placed raises rather than producing a physically
+        impossible (over-capacity) schedule. When ``expert_trace`` is given the
+        model streams its experts, so the fit only reserves the per-rank working
+        set instead of every expert.
         """
 
-        planner = self._planner_for(model)
+        planner = self._planner_for(model, group.device)
         kv_tokens = sum(req.prompt_tokens + req.output_tokens for req in batch)
-        tp = self.strategy.tensor_parallel
+        tp = group.tensor_parallel
         cap_for = (
             (lambda ep: peak_active_per_rank(expert_trace, ep))
             if expert_trace is not None
             else None
         )
 
-        if not self.strategy.auto_parallelism:
-            pp = self.strategy.pipeline_parallel
-            ep = self.strategy.expert_parallel
+        if not group.auto_parallelism:
+            pp = group.pipeline_parallel
+            ep = group.expert_parallel
             if cap_for is not None:
                 per_device = planner.streaming_footprint(
                     pp, kv_tokens, cap_for(ep), tp
@@ -2541,7 +2767,7 @@ class Simulator:
             )
             total_bytes += shard.bytes_read
         choice = planner.plan(
-            self._degree // tp,
+            group.degree // tp,
             kv_tokens=kv_tokens,
             flops_by_dtype=flops_by_dtype,
             total_bytes=total_bytes,
