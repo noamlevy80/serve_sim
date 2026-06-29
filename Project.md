@@ -452,6 +452,7 @@ The default for all graphs is displayed.
 2.2 Capacity used (with both absolute and relative to max) - broken down by content - KV and weights
 2.3 Transfer source (the device from which an incoming transfer is happening)
 2.4 Transfer object (KV of which sequence, weights)
+2.5 Eviction object (shows the last object removed from this memory)
 3. For each workload:
 3.1 Device computing workload
 3.2 Current turn

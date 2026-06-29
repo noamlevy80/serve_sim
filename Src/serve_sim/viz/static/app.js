@@ -204,14 +204,26 @@ function syncColSelector() {
   });
 }
 
+// Number of distinct graph types currently shown -- a type counts once if any of
+// its leaves (devices/workloads) is visible. This drives the auto column count.
+function visibleTypeCount() {
+  let count = 0;
+  for (const cat of STATE.vm.graph_tree || []) {
+    for (const grp of cat.children) {
+      if (grp.graphs.some((g) => !STATE.hidden.has(g.id))) count++;
+    }
+  }
+  return count;
+}
+
 function renderGrid() {
   const grid = document.getElementById("graph-grid");
   if (!document.getElementById("timeline").classList.contains("active")) return;
   const byId = new Map(STATE.vm.graphs.map((g) => [g.id, g]));
   const visible = STATE.order.filter((id) => byId.has(id) && !STATE.hidden.has(id));
   if (STATE.autoCols) {
-    // Match columns to the number of visible graphs, capped at the maximum.
-    STATE.cols = Math.min(maxCols(), Math.max(1, visible.length));
+    // Match columns to the number of visible graph types, capped at the maximum.
+    STATE.cols = Math.min(maxCols(), Math.max(1, visibleTypeCount()));
     syncColSelector();
   }
   grid.className = `grid cols-${STATE.cols}`;

@@ -247,3 +247,39 @@ def test_eviction_is_recorded_when_floating_pool_fills():
     evictions = [d for d in result.decisions if d.kind == "kv_eviction"]
     assert evictions, "expected at least one LRU eviction decision"
     assert evictions[0].devices == ("node-0",)
+
+
+def test_memory_timeline_records_the_last_evicted_object():
+    from serve_sim.report import memory_timeline
+
+    model = toy_model()
+    sample = tracker_from_messages(
+        [{"role": "system", "content": "distinct session number 0 here"}],
+        output_length=8,
+    )
+    entry_bytes = float(
+        context_kv_bytes(model, sample.prompt_tokens + sample.output_tokens)
+    )
+    system = make_kv_system([entry_bytes * 1.5])
+    requests = [
+        request_from_messages(
+            i, model,
+            [{"role": "system", "content": f"distinct session number {i} here"}],
+            workload_id=i, arrival_time=float(i) * 1000.0, output_length=8,
+        )
+        for i in range(3)
+    ]
+
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run(requests)
+    evictions = [d for d in result.decisions if d.kind == "kv_eviction"]
+    assert evictions, "expected at least one LRU eviction decision"
+
+    rows = memory_timeline(result, 32)
+    floating = [r for r in rows if r["memory"] == "node-0"]
+    # After the first eviction, the floating memory's eviction-object label holds
+    # the evicted sequence's KV id and persists until the next eviction.
+    labelled = [r for r in floating if r["eviction_object"]]
+    assert labelled, "expected the eviction object to be recorded for node-0"
+    assert all(r["eviction_object"].startswith("kv:") for r in labelled)
+    first_evict_time = min(d.time for d in evictions)
+    assert all(r["time_end"] > first_evict_time for r in labelled)

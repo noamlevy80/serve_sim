@@ -707,7 +707,7 @@ def test_memory_timeline_content_decomposes_occupancy():
     rows = memory_timeline(result, 8)
     assert rows
     assert {"bandwidth_bytes_per_s", "occupancy_bytes", "content",
-            "transfer_source", "transfer_object"} <= set(rows[0])
+            "transfer_source", "transfer_object", "eviction_object"} <= set(rows[0])
     # The content breakdown always sums to the reported occupancy.
     for r in rows:
         assert r["occupancy_bytes"] == pytest.approx(sum(r["content"].values()))

@@ -146,9 +146,9 @@ def test_memory_capacity_graph_is_stacked_with_keys():
         assert len(b) == 3 and isinstance(b[2], dict)
 
 
-def test_each_memory_device_has_its_four_graphs():
-    # Independent memory devices carry bandwidth, capacity, transfer source and
-    # transfer object graphs (PRD section 2).
+def test_each_memory_device_has_its_five_graphs():
+    # Independent memory devices carry bandwidth, capacity, transfer source,
+    # transfer object and eviction object graphs (PRD section 2).
     vm = build_view_model(_payload())
     by_group: dict[str, list[str]] = {}
     for g in vm["graphs"]:
@@ -157,11 +157,17 @@ def test_each_memory_device_has_its_four_graphs():
     assert by_group
     for ids in by_group.values():
         suffixes = {gid.rsplit(":", 1)[1] for gid in ids}
-        assert {"bandwidth", "capacity", "xfer_src", "xfer_obj"} <= suffixes
+        assert {"bandwidth", "capacity", "xfer_src", "xfer_obj",
+                "evict_obj"} <= suffixes
     obj = next(g for g in vm["graphs"]
                if g["section"] == "memory_device" and g["id"].endswith("xfer_obj"))
     assert obj["kind"] == "discrete"
     for seg in obj["segments"]:
+        assert len(seg) == 5
+    evict = next(g for g in vm["graphs"]
+                 if g["section"] == "memory_device" and g["id"].endswith("evict_obj"))
+    assert evict["kind"] == "discrete"
+    for seg in evict["segments"]:
         assert len(seg) == 5
 
 

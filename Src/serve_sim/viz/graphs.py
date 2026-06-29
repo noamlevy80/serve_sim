@@ -428,6 +428,11 @@ def _memory_graphs(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
             name, _merge_segments(rows, lambda r: (
                 _object_label(r["transfer_object"]) if r.get("transfer_object")
                 else None))))
+        graphs.append(_discrete_graph(
+            f"mem:{name}:evict_obj", f"Eviction object -- {name}", "memory_device",
+            name, _merge_segments(rows, lambda r: (
+                _object_label(r["eviction_object"]) if r.get("eviction_object")
+                else None))))
     return graphs
 
 

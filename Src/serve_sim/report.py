@@ -48,6 +48,7 @@ first-cut reservation model, not a byte-accurate residency trace.
 
 from __future__ import annotations
 
+import bisect
 import csv
 import json
 import sys
@@ -671,6 +672,43 @@ def _floating_kv_residency(
     return intervals
 
 
+def _memory_evictions(
+    result: RunResult,
+) -> dict[str, list[tuple[float, str]]]:
+    """Per-memory ordered ``(time, object_label)`` of objects removed from it.
+
+    Reconstructs, for each memory device, the sequence of objects evicted from
+    it. A ``kv_eviction`` names the floating memory it left and the sequence
+    whose KV was reclaimed; a ``weight_eviction`` / ``expert_eviction`` names the
+    compute slot whose first-tier memory gave up a model's weights / routed
+    experts. Object labels share the ``weights:`` / ``experts:`` / ``kv:`` form
+    used for transfer objects so the visualization colours them consistently.
+    Sorted by time within each memory.
+    """
+
+    first_tier_of = {d.name: d.first_tier_memory for d in result.device_specs}
+    evictions: dict[str, list[tuple[float, str]]] = {}
+    for d in result.decisions:
+        if d.kind == "kv_eviction":
+            seq = _sequence_id(d.workload_id, d.turn_index)
+            label = f"kv:{seq}" if seq else "kv"
+            memories = list(d.devices)
+        elif d.kind == "weight_eviction":
+            label = f"weights:{d.model}" if d.model else "weights"
+            memories = [first_tier_of.get(dev) for dev in d.devices]
+        elif d.kind == "expert_eviction":
+            label = f"experts:{d.model}" if d.model else "experts"
+            memories = [first_tier_of.get(dev) for dev in d.devices]
+        else:
+            continue
+        for mem in memories:
+            if mem:
+                evictions.setdefault(mem, []).append((d.time, label))
+    for lst in evictions.values():
+        lst.sort(key=lambda x: x[0])
+    return evictions
+
+
 def _first_tier_content_at(
     jobs: Sequence[JobRecord], attached: set[str], t: float
 ) -> tuple[dict[str, float], dict[int, float]]:
@@ -707,8 +745,9 @@ def memory_timeline(
     One row per memory per time bucket. Carries the achieved bandwidth (bytes/s)
     in the bucket, the occupancy split by content (``content``: on a first-tier
     memory a ``weights`` band plus one ``KV B<n>`` band per co-resident dispatch
-    batch; on a floating memory the offloaded ``KV``), and a discrete label for
-    the dominant incoming transfer (its source and object), so the visualization
+    batch; on a floating memory the offloaded ``KV``), a discrete label for
+    the dominant incoming transfer (its source and object), and the most recent
+    object evicted from the memory (``eviction_object``), so the visualization
     can stack occupancy by content and plot bandwidth against the memory's
     static ceiling.
     """
@@ -721,6 +760,10 @@ def memory_timeline(
     seq_by_request = _sequence_by_request(result.records)
     first_tier_of = {d.name: d.first_tier_memory for d in result.device_specs}
     residency = _floating_kv_residency(result)
+    evictions = _memory_evictions(result)
+    evict_times = {mem: [t for t, _ in lst] for mem, lst in evictions.items()}
+    evict_labels = {mem: [lbl for _, lbl in lst] for mem, lst in evictions.items()}
+
     events_by_memory: dict[str, list[EventRecord]] = {}
     for e in rescaled:
         if e.memory:
@@ -805,6 +848,15 @@ def memory_timeline(
                     source = dom.device
                     obj = _transfer_object_label(dom, seq_by_request)
 
+            # Last object removed from this memory at or before the bucket end:
+            # a step function that holds the most recent eviction's label.
+            evicted = ""
+            etimes = evict_times.get(mem.name)
+            if etimes:
+                idx = bisect.bisect_left(etimes, t1) - 1
+                if idx >= 0:
+                    evicted = evict_labels[mem.name][idx]
+
             rows.append({
                 "bucket": b,
                 "time_start": t0,
@@ -819,6 +871,7 @@ def memory_timeline(
                 "content": content,
                 "transfer_source": source,
                 "transfer_object": obj,
+                "eviction_object": evicted,
             })
         if progress is not None:
             progress(b + 1, num_buckets)
@@ -1626,7 +1679,8 @@ def write_outputs(
         out / "memory_timeline.csv",
         ["bucket", "time_start", "time_end", "memory", "role", "node",
          "bandwidth_bytes_per_s", "bandwidth_seconds", "bandwidth_util",
-         "occupancy_bytes", "content_json", "transfer_source", "transfer_object"],
+         "occupancy_bytes", "content_json", "transfer_source", "transfer_object",
+         "eviction_object"],
         [{**row, "content_json": json.dumps(row["content"], sort_keys=True)}
          for row in mem_timeline],
     )
