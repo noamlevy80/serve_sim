@@ -124,10 +124,23 @@ class System:
     def node_of(self, device: ComputeDevice) -> Node:
         """The node that owns ``device`` (by identity)."""
 
-        for node in self.nodes:
-            if any(d is device for d in node.compute_devices):
-                return node
+        node = self._node_by_device.get(id(device))
+        if node is not None:
+            return node
         raise ValueError(f"device {device.name!r} is not part of this system")
+
+    @property
+    def _node_by_device(self) -> dict[int, Node]:
+        """``id(compute device) -> owning Node``, built once (first owner wins)."""
+
+        cache = self.__dict__.get("_node_by_device_cache")
+        if cache is None:
+            cache = {}
+            for node in self.nodes:
+                for device in node.compute_devices:
+                    cache.setdefault(id(device), node)
+            object.__setattr__(self, "_node_by_device_cache", cache)
+        return cache
 
     def memory_inventory(self) -> list[dict[str, Any]]:
         """Every distinct memory device with its role, node and attached devices.
@@ -212,17 +225,25 @@ class System:
         not node-local and yields ``None``.
         """
 
-        target = id(memory)
-        for index, node in enumerate(self.nodes):
-            if node.node_memory is not None and id(node.node_memory) == target:
-                return index
-            for device in node.compute_devices:
-                if id(device.first_tier_memory) == target:
-                    return index
-                second = device.second_tier_memory
-                if second is not None and id(second) == target:
-                    return index
-        return None
+        return self._node_index_by_memory.get(id(memory))
+
+    @property
+    def _node_index_by_memory(self) -> dict[int, int]:
+        """``id(node-local memory) -> node index``, built once (first owner wins)."""
+
+        cache = self.__dict__.get("_node_index_by_memory_cache")
+        if cache is None:
+            cache = {}
+            for index, node in enumerate(self.nodes):
+                if node.node_memory is not None:
+                    cache.setdefault(id(node.node_memory), index)
+                for device in node.compute_devices:
+                    cache.setdefault(id(device.first_tier_memory), index)
+                    second = device.second_tier_memory
+                    if second is not None:
+                        cache.setdefault(id(second), index)
+            object.__setattr__(self, "_node_index_by_memory_cache", cache)
+        return cache
 
     def link_between(self, src: MemoryDevice, dst: MemoryDevice) -> TransferLink:
         """Classify the link a transfer between ``src`` and ``dst`` traverses.

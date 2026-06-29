@@ -798,6 +798,12 @@ class Simulator:
         # node's RAM (NVM -> RAM happens once per node; later placements only stage
         # RAM -> device).
         self._home_loaded: set[tuple[int, int]] = set()
+        # Memoized expert-fetch link latencies over the fixed topology. The in-node
+        # hop is a pure function of the destination device; the streamed hop is a
+        # pure function of (source memory, destination device). Both are cached by
+        # identity and reused across the millions of per-dispatch evaluations.
+        self._in_node_fetch_latency: dict[int, float] = {}
+        self._streamed_fetch_latency: dict[tuple[int, int], float] = {}
         # Per-dispatch streaming reservation (per-device resident bytes) keyed by
         # batch index, so the capacity check uses the working-set footprint rather
         # than pinning every expert.
@@ -1126,16 +1132,33 @@ class Simulator:
         """
 
         if home is not None:
-            return max(
-                self.system.link_between(
-                    self.system.node_of(d).node_memory, d.first_tier_memory
+            in_node = self._in_node_fetch_latency
+            worst = 0.0
+            for d in slot.devices:
+                key = id(d)
+                latency = in_node.get(key)
+                if latency is None:
+                    latency = self.system.link_between(
+                        self.system.node_of(d).node_memory, d.first_tier_memory
+                    ).latency_s
+                    in_node[key] = latency
+                if latency > worst:
+                    worst = latency
+            return worst
+        streamed = self._streamed_fetch_latency
+        source_id = id(source)
+        worst = 0.0
+        for d in slot.devices:
+            key = (source_id, id(d))
+            latency = streamed.get(key)
+            if latency is None:
+                latency = self.system.link_between(
+                    source, d.first_tier_memory
                 ).latency_s
-                for d in slot.devices
-            )
-        return max(
-            self.system.link_between(source, d.first_tier_memory).latency_s
-            for d in slot.devices
-        )
+                streamed[key] = latency
+            if latency > worst:
+                worst = latency
+        return worst
 
     def run(
         self, requests: list[Request], *, progress: ProgressCallback | None = None

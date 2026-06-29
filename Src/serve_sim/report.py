@@ -729,13 +729,34 @@ def memory_timeline(
     for e in rescaled:
         if e.device:
             events_by_device.setdefault(e.device, []).append(e)
+    # Jobs resident on each device, so the per-(memory, bucket) first-tier content
+    # helper scans only the handful of jobs on the memory's attached devices
+    # rather than every job in the run.
+    jobs_by_device: dict[str, list[JobRecord]] = {}
+    for j in result.jobs:
+        for d in j.devices:
+            jobs_by_device.setdefault(d, []).append(j)
+    # Per-memory attached-device set and the jobs scoped to those devices,
+    # deduplicated by identity (a job spanning several attached devices appears
+    # once; ``_first_tier_content_at`` still counts its per-device shares).
+    attached_by_memory: dict[str, set[str]] = {}
+    jobs_by_memory: dict[str, list[JobRecord]] = {}
+    for mem in result.memories:
+        attached = set(mem.attached_devices)
+        attached_by_memory[mem.name] = attached
+        if mem.role == "first_tier":
+            seen: dict[int, JobRecord] = {}
+            for d in attached:
+                for j in jobs_by_device.get(d, []):
+                    seen.setdefault(id(j), j)
+            jobs_by_memory[mem.name] = list(seen.values())
 
     rows: list[dict[str, Any]] = []
     for b in range(num_buckets):
         t0 = b * width
         t1 = (b + 1) * width
         for mem in result.memories:
-            attached = set(mem.attached_devices)
+            attached = attached_by_memory[mem.name]
             mem_events = [e for e in events_by_memory.get(mem.name, [])
                           if e.end > t0 and e.start < t1]
             bucket_bytes = sum(e.bytes_read * _overlap_fraction(e, t0, t1)
@@ -745,7 +766,9 @@ def memory_timeline(
 
             content: dict[str, float] = {}
             if mem.role == "first_tier":
-                weights, kv_by_batch = _first_tier_content_at(result.jobs, attached, t0)
+                weights, kv_by_batch = _first_tier_content_at(
+                    jobs_by_memory[mem.name], attached, t0
+                )
                 weight_bytes = sum(weights.values())
                 if weight_bytes > 0:
                     content["weights"] = weight_bytes
