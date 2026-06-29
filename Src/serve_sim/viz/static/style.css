@@ -131,19 +131,58 @@ table.summary tr:last-child td { border-bottom: none; }
 .timeline-body { display: flex; gap: 12px; align-items: flex-start; }
 .timeline-body .grid { flex: 1; min-width: 0; }
 
-.tree-panel {
-  width: 20%;
+/* Left column: the graph-type selector with the reason legend pinned beneath. */
+.timeline-left {
   flex: 0 0 20%;
-  overflow: auto;
-  max-height: calc(100vh - 130px);
+  width: 20%;
   position: sticky;
   top: 116px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: calc(100vh - 130px);
+}
+
+.tree-panel {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow: auto;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 8px 6px;
   font-size: 12px;
   white-space: nowrap;
+}
+
+/* Reason-graph colour legend: only shown while a reason graph is visible. */
+.reason-legend {
+  flex: 0 0 auto;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.reason-legend .legend-title {
+  color: var(--muted);
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+.reason-legend .legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  color: var(--text);
+}
+.reason-legend .legend-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  flex: 0 0 auto;
 }
 .tw-children { padding-left: 14px; }
 .tw-children.collapsed { display: none; }

@@ -4,8 +4,8 @@
   "network": {
     "scale_up_bandwidth_bytes_per_s": 1.8e12,
     "scale_up_latency_s": 1.0e-6,
-    "cxl_bandwidth_bytes_per_s": 6.4e10,
-    "cxl_latency_s": 3.0e-7,
+    "cxl_bandwidth_bytes_per_s": 1.8e12,
+    "cxl_latency_s": 1.0e-6,
     "notes": "ESTIMATE - scale-up modeled point-to-point (no congestion/topology): ~1.8 TB/s NVLink-class link at ~1 us; in-node CXL ~64 GB/s (PCIe5 x16-class) at ~300 ns. Tune to the fabric you want to model."
   },
   "input_memory": "datacenter-nvm",

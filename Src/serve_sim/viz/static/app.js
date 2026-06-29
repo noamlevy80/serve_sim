@@ -43,8 +43,11 @@ function colorFor(key) {
 }
 
 // --- view model state -----------------------------------------------------------
-const STATE = { vm: null, cols: 4, t0: 0, t1: 1, order: [], drag: null,
-                hidden: new Set(), treeRefs: { leaves: [], groups: [] } };
+// ``autoCols`` keeps the column count matched to the number of visible graphs
+// (capped at the largest selectable count) until the user picks a count by hand.
+const STATE = { vm: null, cols: 4, autoCols: true, t0: 0, t1: 1, order: [],
+                drag: null, hidden: new Set(),
+                treeRefs: { leaves: [], groups: [] } };
 const PAD = { l: 40, r: 42, t: 8, b: 14 };
 
 // Compute-device graph types shown by default; every other graph starts hidden.
@@ -70,6 +73,7 @@ async function loadRun(run) {
   STATE.t0 = 0;
   STATE.t1 = STATE.vm.makespan_s || 1;
   STATE.order = STATE.vm.graphs.map((g) => g.id);
+  STATE.autoCols = true;     // a fresh run re-fits columns to its visible graphs
   STATE.hidden = new Set(
     STATE.vm.graphs.filter((g) => !isDefaultVisible(g.id)).map((g) => g.id));
   document.getElementById("run-id").textContent = STATE.vm.run_id;
@@ -155,11 +159,10 @@ function renderSummary() {
 function setupControls() {
   document.querySelectorAll("#col-selector button").forEach((btn) => {
     btn.addEventListener("click", () => {
-      document.querySelectorAll("#col-selector button").forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
+      // A manual pick stops auto-fitting until the next run loads.
+      STATE.autoCols = false;
       STATE.cols = parseInt(btn.dataset.cols, 10);
-      const grid = document.getElementById("graph-grid");
-      grid.className = `grid cols-${STATE.cols}`;
+      syncColSelector();
       renderGrid();
     });
   });
@@ -185,16 +188,73 @@ function setupControls() {
 }
 
 // --- grid + drag/drop -----------------------------------------------------------
+// Largest selectable column count, read from the control so the two stay in sync.
+function maxCols() {
+  let m = 0;
+  document.querySelectorAll("#col-selector button").forEach((b) => {
+    m = Math.max(m, parseInt(b.dataset.cols, 10) || 0);
+  });
+  return m || 6;
+}
+
+// Highlight the column button matching the current count (none when off-scale).
+function syncColSelector() {
+  document.querySelectorAll("#col-selector button").forEach((b) => {
+    b.classList.toggle("active", parseInt(b.dataset.cols, 10) === STATE.cols);
+  });
+}
+
 function renderGrid() {
   const grid = document.getElementById("graph-grid");
   if (!document.getElementById("timeline").classList.contains("active")) return;
+  const byId = new Map(STATE.vm.graphs.map((g) => [g.id, g]));
+  const visible = STATE.order.filter((id) => byId.has(id) && !STATE.hidden.has(id));
+  if (STATE.autoCols) {
+    // Match columns to the number of visible graphs, capped at the maximum.
+    STATE.cols = Math.min(maxCols(), Math.max(1, visible.length));
+    syncColSelector();
+  }
   grid.className = `grid cols-${STATE.cols}`;
   grid.innerHTML = "";
-  const byId = new Map(STATE.vm.graphs.map((g) => [g.id, g]));
-  for (const id of STATE.order) {
-    const g = byId.get(id);
-    if (!g || STATE.hidden.has(id)) continue;
-    grid.appendChild(buildCell(g));
+  for (const id of visible) grid.appendChild(buildCell(byId.get(id)));
+  updateLegend();
+}
+
+// Reason-graph colour legend, pinned in the bottom-left below the type selector.
+// Shown only while at least one reason graph is visible; lists the device states
+// that the visible reason graphs actually draw, each with its renderer colour.
+function updateLegend() {
+  const box = document.getElementById("reason-legend");
+  if (!box || !STATE.vm) return;
+  const present = new Set();
+  let anyVisible = false;
+  for (const g of STATE.vm.graphs) {
+    if (!g.id.endsWith(":reason") || STATE.hidden.has(g.id)) continue;
+    anyVisible = true;
+    for (const k of g.keys || []) present.add(k);
+  }
+  const items = (STATE.vm.state_legend || []).filter((s) => present.has(s.key));
+  if (!anyVisible || items.length === 0) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = "";
+  const title = document.createElement("div");
+  title.className = "legend-title";
+  title.textContent = "Reason states";
+  box.appendChild(title);
+  for (const { key, label } of items) {
+    const row = document.createElement("div");
+    row.className = "legend-item";
+    const swatch = document.createElement("span");
+    swatch.className = "legend-swatch";
+    swatch.style.background = colorFor(key);
+    const text = document.createElement("span");
+    text.textContent = label;
+    row.append(swatch, text);
+    box.appendChild(row);
   }
 }
 

@@ -186,15 +186,16 @@ def build_summary_tables(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 # --- timeline tab ---------------------------------------------------------------
 
-_STATE_ABBREV = {
-    "compute_bound": ("CMP", "Compute bound"),
-    "bandwidth_bound": ("BW", "Bandwidth bound"),
-    "communicating": ("COM", "Communicating (collectives)"),
-    "waiting_kv": ("KV", "Waiting on KV"),
-    "waiting_weights": ("WTS", "Waiting on weights"),
-    "waiting_experts": ("EXP", "Waiting on experts"),
-    "kernel_launch": ("KL", "Kernel launch"),
-    "idle": ("IDLE", "Idle"),
+# Human-readable label per device state, for the reason-graph colour legend.
+_STATE_LABELS = {
+    "compute_bound": "Compute bound",
+    "bandwidth_bound": "Bandwidth bound",
+    "communicating": "Communicating (collectives)",
+    "waiting_kv": "Waiting on KV",
+    "waiting_weights": "Waiting on weights",
+    "waiting_experts": "Waiting on experts",
+    "kernel_launch": "Kernel launch",
+    "idle": "Idle",
 }
 
 _WORKLOAD_STATE_ABBREV = {
@@ -256,15 +257,53 @@ def _discrete_graph(gid: str, title: str, section: str, group: str,
     }
 
 
-def _dominant_state(row: Mapping[str, Any]) -> str:
-    best_state = "idle"
-    best = -1.0
-    for state in DEVICE_STATES:
-        frac = float(row.get(f"{state}_fraction") or 0.0)
-        if frac > best:
-            best = frac
-            best_state = state
-    return best_state
+def _top_states(row: Mapping[str, Any], n: int) -> list[tuple[str, float]]:
+    """The ``n`` highest-fraction device states in ``row`` (descending, >0).
+
+    Ties break by :data:`DEVICE_STATES` priority order, so the same state always
+    sorts ahead of an equal-fraction lower-priority one.
+    """
+
+    fracs = [(state, float(row.get(f"{state}_fraction") or 0.0))
+             for state in DEVICE_STATES]
+    ordered = sorted(((s, f) for s, f in fracs if f > 0.0),
+                     key=lambda sf: -sf[1])
+    return ordered[:n]
+
+
+def _reason_fraction_graph(gid: str, title: str, section: str, group: str,
+                           rows: Sequence[Mapping[str, Any]],
+                           top_n: int = 2) -> dict[str, Any]:
+    """Stacked fraction bar of the ``top_n`` device states per bucket.
+
+    Each bucket keeps only its ``top_n`` highest-fraction states (the rest fold
+    into the implicit empty headroom), so the bar reads as "what was this device
+    mostly doing here" without the clutter of all eight states. ``max_value`` is
+    ``1.0`` (the full-occupancy ceiling) and band keys are the state names, so a
+    state keeps one colour across every device's graph.
+    """
+
+    present: list[str] = []
+    buckets: list[list[Any]] = []
+    for r in rows:
+        content: dict[str, float] = {}
+        for state, frac in _top_states(r, top_n):
+            content[state] = frac
+            if state not in present:
+                present.append(state)
+        buckets.append([r["time_start"], r["time_end"], content])
+    keys = [s for s in DEVICE_STATES if s in present]
+    return {
+        "id": gid,
+        "title": title,
+        "section": section,
+        "group": group,
+        "kind": "stacked",
+        "unit": "frac",
+        "max_value": 1.0,
+        "keys": keys,
+        "buckets": buckets,
+    }
 
 
 def _object_label(label: str) -> tuple[str, str, str]:
@@ -308,11 +347,9 @@ def _device_graphs(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
             f"dev:{name}:capacity", f"1st-tier capacity -- {name}",
             "compute_device", name, "B",
             spec.get("first_tier_capacity_bytes"), rows))
-        graphs.append(_discrete_graph(
-            f"dev:{name}:reason", f"Reason idle -- {name}", "compute_device", name,
-            _merge_segments(rows, lambda r: (
-                *_STATE_ABBREV.get(_dominant_state(r), ("?", "?")),
-                f"state:{_dominant_state(r)}"))))
+        graphs.append(_reason_fraction_graph(
+            f"dev:{name}:reason", f"Reason idle -- {name}", "compute_device",
+            name, rows))
         graphs.append(_discrete_graph(
             f"dev:{name}:xfer_src", f"Transfer source -- {name}", "compute_device",
             name, _merge_segments(rows, lambda r: (
@@ -448,6 +485,8 @@ def build_view_model(payload: Mapping[str, Any]) -> dict[str, Any]:
         "summary_tables": build_summary_tables(payload),
         "graphs": graphs,
         "graph_tree": _build_graph_tree(graphs),
+        "state_legend": [{"key": state, "label": _STATE_LABELS[state]}
+                         for state in DEVICE_STATES],
         "workload_graph": payload.get("workload_graph",
                                       {"nodes": [], "edges": [], "num_lanes": 0,
                                        "makespan_s": float(payload.get("makespan_s") or 0.0)}),

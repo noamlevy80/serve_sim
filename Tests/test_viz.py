@@ -90,18 +90,47 @@ def test_value_graphs_carry_buckets_and_static_max():
         assert len(b) == 3 and b[0] <= b[1]
 
 
+def test_reason_graph_is_top2_stacked_fractions():
+    vm = build_view_model(_payload())
+    reason = next(g for g in vm["graphs"] if g["id"].endswith(":reason"))
+    assert reason["kind"] == "stacked"
+    assert reason["unit"] == "frac"
+    assert reason["max_value"] == 1.0
+    # Bands are device-state names drawn in a stable, deduplicated order.
+    assert reason["keys"] and len(reason["keys"]) == len(set(reason["keys"]))
+    for b in reason["buckets"]:
+        assert len(b) == 3 and isinstance(b[2], dict)
+        # At most the top-2 states are kept per bucket, and each is a fraction.
+        assert len(b[2]) <= 2
+        for frac in b[2].values():
+            assert 0.0 < frac <= 1.0 + 1e-9
+
+
+def test_state_legend_covers_every_device_state():
+    from serve_sim.report import DEVICE_STATES
+
+    vm = build_view_model(_payload())
+    legend = vm["state_legend"]
+    assert [item["key"] for item in legend] == list(DEVICE_STATES)
+    assert all(item["label"] for item in legend)
+    # Every band a reason graph can draw has a legend entry to name its colour.
+    keys = {item["key"] for item in legend}
+    for g in vm["graphs"]:
+        if g["id"].endswith(":reason"):
+            assert set(g["keys"]) <= keys
+
+
 def test_discrete_segments_are_merged_and_within_span():
     vm = build_view_model(_payload())
     makespan = vm["makespan_s"]
-    reason = next(g for g in vm["graphs"] if g["id"].endswith(":reason"))
-    assert reason["kind"] == "discrete"
-    assert reason["segments"]
-    for seg in reason["segments"]:
+    disc = next(g for g in vm["graphs"]
+                if g["kind"] == "discrete" and g["segments"])
+    for seg in disc["segments"]:
         assert len(seg) == 5
         t0, t1 = seg[0], seg[1]
         assert 0 <= t0 < t1 <= makespan + 1e-9
     # Merging means no two adjacent segments share a colour key at a shared edge.
-    for a, b in zip(reason["segments"], reason["segments"][1:]):
+    for a, b in zip(disc["segments"], disc["segments"][1:]):
         assert not (a[1] == b[0] and a[4] == b[4])
 
 
