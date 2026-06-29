@@ -1130,9 +1130,10 @@ def sequence_table(result: RunResult) -> list[dict[str, Any]]:
     executed on (a list when prefill and decode run on different groups, e.g.
     under prefill/decode disaggregation), the time in queue (arrival to
     dispatch), TTFT counted only over prefill (dispatch to first token), TPS
-    counted only over decode, the total idle wait while dispatched, and the
-    end-to-end latency (arrival to answer). Rows are ordered by workload then
-    turn, with standalone requests last.
+    counted only over decode, the total idle wait while dispatched, the
+    end-to-end latency (arrival to answer), and the effective TPS (output tokens
+    over that end-to-end latency). Rows are ordered by workload then turn, with
+    standalone requests last.
     """
 
     by_request = _events_by_request(_rescaled(result.events))
@@ -1158,6 +1159,8 @@ def sequence_table(result: RunResult) -> list[dict[str, Any]]:
             "idle_wait_s": _idle_wait(
                 events, r.dispatch_time, r.completion_time),
             "latency_s": r.latency,
+            "effective_tps_tokens_per_s": (
+                r.output_tokens / r.latency if r.latency > 0 else None),
         })
     return rows
 
@@ -1175,10 +1178,10 @@ def _request_model(events: Sequence[EventRecord]) -> str:
 def _engine_groups(events: Sequence[EventRecord]) -> list[str]:
     """Engine group(s) a request executed on, in prefill-then-decode order.
 
-    Each group is the space-joined set of devices that ran one compute phase.
-    Prefill and decode collapse to a single entry when they share devices, and
-    yield two entries when they run on disjoint groups (prefill/decode
-    disaggregation).
+    Each group is abbreviated as ``{first device} + {count of others}`` over the
+    set of devices that ran one compute phase. Prefill and decode collapse to a
+    single entry when they share devices, and yield two entries when they run on
+    disjoint groups (prefill/decode disaggregation).
     """
 
     groups: list[tuple[str, ...]] = []
@@ -1187,7 +1190,17 @@ def _engine_groups(events: Sequence[EventRecord]) -> list[str]:
             {e.device for e in events if e.phase == phase and e.device}))
         if devices and devices not in groups:
             groups.append(devices)
-    return [" ".join(g) for g in groups]
+    return [_abbreviate_devices(g) for g in groups]
+
+
+def _abbreviate_devices(devices: Sequence[str]) -> str:
+    """``{first device} + {count of others}`` (just the device when alone)."""
+
+    if not devices:
+        return ""
+    if len(devices) == 1:
+        return devices[0]
+    return f"{devices[0]} + {len(devices) - 1}"
 
 
 def summarize(

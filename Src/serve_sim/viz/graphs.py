@@ -141,7 +141,7 @@ def build_summary_tables(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
             "columns": ["Sequence", "Model", "Engine group(s)",
                         "Time in queue (s)", "TTFT (prefill, s)",
                         "TPS (decode, tok/s)", "Total idle wait (s)",
-                        "Total latency (s)"],
+                        "Total latency (s)", "Effective TPS (tok/s)"],
             "rows": [[q.get("sequence", ""),
                       q.get("model", ""),
                       ", ".join(q.get("engine_groups", [])),
@@ -149,7 +149,8 @@ def build_summary_tables(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
                       eng_format(q.get("ttft_prefill_s")),
                       eng_format(q.get("tps_tokens_per_s")),
                       eng_format(q.get("idle_wait_s")),
-                      eng_format(q.get("latency_s"))]
+                      eng_format(q.get("latency_s")),
+                      eng_format(q.get("effective_tps_tokens_per_s"))]
                      for q in sequences],
         })
 

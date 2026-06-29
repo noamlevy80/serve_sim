@@ -246,6 +246,45 @@ def test_deepseek_event_generation_matches_reference_chunked(deepseek):
     )
 
 
+# --- Kimi K2.6 (MLA + dense/MoE, no sparse attention) ---------------------------
+
+
+@pytest.fixture(scope="module")
+def kimi_k26() -> LayeredModel:
+    return load_model_config(MODELS_DIR / "kimi-k2.6.json")
+
+
+def test_kimi_k26_loads(kimi_k26):
+    assert kimi_k26.num_layers == 61
+    assert kimi_k26.num_moe_layers == 60
+    dense_layers = [l for l in kimi_k26.layers if isinstance(l.ffn, DenseFFN)]
+    moe_layers = [l for l in kimi_k26.layers if isinstance(l.ffn, MoEFFN)]
+    assert len(dense_layers) == 1 and len(moe_layers) == 60
+    for layer in kimi_k26.layers:
+        assert layer.mixer.is_mla
+        assert layer.mixer.sparse_attention is False
+        assert layer.mixer.num_query_heads == 64
+    moe = moe_layers[0].ffn
+    assert moe.num_experts == 384 and moe.num_experts_per_token == 8
+    assert moe.num_shared_experts == 1
+
+
+def test_kimi_k26_event_generation_matches_reference(kimi_k26):
+    dev = make_device()
+    work = [SequenceWork(0, 64, 4), SequenceWork(0, 32, 2)]
+    sched = simulate(kimi_k26, dev, work)
+    assert sched.makespan == pytest.approx(reference_layered(kimi_k26, dev, work), rel=1e-9)
+
+
+def test_kimi_k26_event_generation_matches_reference_chunked(kimi_k26):
+    dev = make_device()
+    work = [SequenceWork(0, 160, 3)]
+    sched = simulate(kimi_k26, dev, work, prefill_chunk_size=48)
+    assert sched.makespan == pytest.approx(
+        reference_layered(kimi_k26, dev, work, prefill_chunk_size=48), rel=1e-9
+    )
+
+
 # --- Mamba building block --------------------------------------------------------
 
 
