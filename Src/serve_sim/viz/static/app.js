@@ -26,6 +26,12 @@ function formatEng(v) {
   return `${sign}${t}n`;
 }
 
+// Plain decimal formatter for the right-side ratio axis (e.g. 0.00, 1.00, 0.52).
+function formatRatio(v) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "";
+  return v.toFixed(2);
+}
+
 // --- deterministic colour per object id (same id => same colour everywhere) -----
 function colorFor(key) {
   let h = 0;
@@ -420,7 +426,7 @@ function drawValue(ctx, rect, g) {
   // Left: absolute peak; right: relative to the static max.
   labelText(ctx, formatEng(dataMax), rect.x - 2, rect.y + 8, "#9aa3b2", "right");
   if (g.max_value) {
-    labelText(ctx, formatEng(dataMax / g.max_value), rect.x + rect.w + 2,
+    labelText(ctx, formatRatio(dataMax / g.max_value), rect.x + rect.w + 2,
               rect.y + 8, "#9aa3b2", "left");
   }
 }
@@ -463,7 +469,7 @@ function drawStacked(ctx, rect, g) {
   }
   labelText(ctx, formatEng(dataMax), rect.x - 2, rect.y + 8, "#9aa3b2", "right");
   if (g.max_value) {
-    labelText(ctx, formatEng(dataMax / g.max_value), rect.x + rect.w + 2,
+    labelText(ctx, formatRatio(dataMax / g.max_value), rect.x + rect.w + 2,
               rect.y + 8, "#9aa3b2", "left");
   }
 }

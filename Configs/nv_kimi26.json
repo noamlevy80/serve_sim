@@ -33,9 +33,9 @@
   "hbm_kv_fraction": 0.5,
 
   "auto_parallelism": true,
-  "pipeline_parallel": 1,
+  "pipeline_parallel": 32,
   "expert_parallel": 1,
-  "tensor_parallel": 32,
+  "tensor_parallel": 1,
   "max_parallelism": 32,
 
   "prefill_chunk_size": null,
