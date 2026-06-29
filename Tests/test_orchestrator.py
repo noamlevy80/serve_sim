@@ -733,6 +733,35 @@ def test_warm_start_preloads_experts_skipping_expert_stream():
     assert not [e for e in warm.events if e.phase == "expert_transfer"]
 
 
+def test_warm_start_preloads_experts_under_auto_parallelism_scheme():
+    # Warm start must preload experts under the scheme the run actually uses, not
+    # the raw configured degrees. Here pipeline_parallel=2 is configured, but the
+    # 3-layer model is not divisible by 2, so auto_parallelism is forced to
+    # pp=1, ep=2 -- the experts shard across BOTH devices. Preloading under the
+    # configured ep=1 would pin every expert on device 0 only, leaving the run's
+    # ep-rank-1 device cold so the first batch still streams. The fix derives
+    # ep=2 and preloads both ranks, so no expert is streamed.
+    from serve_sim.model import toy_moe_model
+
+    model = toy_moe_model(num_layers=3)
+    system = make_system(2)
+    req = Request(0, model, 64, 8, 0.0)
+    base = dict(
+        max_batch_size=1,
+        model_weight_loading=True,
+        memory_policy="global_lru",
+        auto_parallelism=True,
+        pipeline_parallel=2,
+        expert_parallel=1,
+    )
+
+    cold = Simulator(system, StrategyConfig(warm_start=False, **base)).run([req])
+    warm = Simulator(system, StrategyConfig(warm_start=True, **base)).run([req])
+
+    assert [e for e in cold.events if e.phase == "expert_transfer"]
+    assert not [e for e in warm.events if e.phase == "expert_transfer"]
+
+
 def test_weight_loading_charged_once_for_resident_model():
     # Two same-model requests serialized on one slot: only the first pays the
     # load; the second reuses the resident weights.

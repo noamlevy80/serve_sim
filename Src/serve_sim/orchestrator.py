@@ -988,26 +988,70 @@ class Simulator:
             for pool in (group.pool, group.prefill_pool, group.decode_pool):
                 if pool is not None:
                     pool.warm_start(models)
-                    self._warm_start_experts(group, pool)
+                    self._warm_start_experts(group, pool, requests)
 
-    def _warm_start_experts(self, group: EngineGroup, pool: EnginePool) -> None:
+    def _warm_start_scheme(
+        self, model: object, reqs: list["Request"], group: EngineGroup
+    ) -> tuple[int, int, int]:
+        """The ``(pp, ep, tp)`` a warm-started MoE model's batches will run under.
+
+        Mirrors the per-batch dispatch: the group's fixed scheme, or -- under
+        ``auto_parallelism`` -- the factorization the planner picks for a
+        representative batch of this model's requests. Warm start must preload
+        experts under this layout because the run keys expert residency by the
+        *auto-derived* ``ep`` (on each rank's stage-0 device), not the raw
+        configured degrees: using the configured scheme would shard the experts
+        the wrong way (e.g. asking one rank to hold every expert) and preload
+        nothing. A representative trace is seeded deterministically so warm start
+        never perturbs the run's RNG. ``None`` when the scheme cannot be derived.
+        """
+
+        if not group.auto_parallelism:
+            return group.pipeline_parallel, group.expert_parallel, group.tensor_parallel
+        cap = self.strategy.max_batch_size if self.strategy.max_batch_size > 0 else len(reqs)
+        batch = reqs[: max(1, cap)]
+        work = [req.work for req in batch]
+        shards = WorkShardGenerator(model).generate(
+            work, prefill_chunk_size=self.strategy.prefill_chunk_size
+        )
+        expert_trace = build_activation_trace(
+            model, work, self.strategy.prefill_chunk_size, seed=0
+        )
+        return self._parallelism_for(model, batch, shards, expert_trace, group=group)
+
+    def _warm_start_experts(
+        self, group: EngineGroup, pool: EnginePool, requests: list["Request"]
+    ) -> None:
         """Preload each warm-started MoE model's expert shards onto its slot HBM.
 
         Routed experts are part of a model's weights, so warm start makes them
-        resident on each expert rank's device (the group's ``expert_parallel x
-        tensor_parallel`` scheme) alongside the model, sparing the first batch the
-        expert stream. The exception is a rank whose full expert shard does not
-        fit its HBM region: it is left to stream its working set on demand. No-op
-        under the legacy ``node_first`` policy, which keeps no device residency.
+        resident on each expert rank's device alongside the model, sparing the
+        first batch the expert stream. The shard layout follows the scheme the
+        run will actually use (auto-derived per :meth:`_warm_start_scheme`, not
+        the raw configured degrees), so the preloaded residency lands on the same
+        ranks the run later reads from. The exception is a rank whose full expert
+        shard does not fit its HBM region: it is left to stream its working set on
+        demand. No-op under the legacy ``node_first`` policy, which keeps no
+        device residency.
         """
 
         if not self._hbm:
             return
-        ep = group.expert_parallel
-        tp = group.tensor_parallel
+        by_model: dict[int, list["Request"]] = {}
+        for req in requests:
+            by_model.setdefault(id(req.model), []).append(req)
         for slot in pool.slots:
             model = pool.resident_model(slot)
             if model is None or not self._is_moe(model):
+                continue
+            reqs = by_model.get(id(model))
+            if not reqs:
+                continue
+            try:
+                pp, ep, tp = self._warm_start_scheme(model, reqs, group)
+            except ValueError:
+                # The run will raise its own clear infeasibility error at dispatch;
+                # leave this model to stream rather than aborting warm start early.
                 continue
             if ep * tp > len(slot.devices):
                 continue
