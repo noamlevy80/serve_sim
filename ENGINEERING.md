@@ -213,7 +213,11 @@ fit one device is rejected earlier, in `_parallelism_for`.)
 - **Node-RAM capacity:** `_check_memory_capacity` additionally sums `full_model_bytes` of every model
   homed on a node and aborts with `MemoryCapacityExceeded(node.node_memory.name, …)` if they overflow.
 - **Event phases:** `transfer` = KV fetches, `weight_transfer` = weight staging (both stages),
-  `expert_transfer` = routed-expert fetches. Reports/arbiter key off these and `source_memory`.
+  `expert_transfer` = routed-expert fetches, `kernel_launch` = launch wait, and the parallelism
+  comm collectives `tp_comm` (tensor-parallel all-reduce), `ep_comm` (expert-parallel all-to-all)
+  and `pp_comm` (pipeline-parallel hand-off) — fixed-duration scale-up-network barriers emitted by
+  `EventGenerator` per sharded stage; like `kernel_launch` they carry no FLOPs/bytes and are not
+  rescaled (`ResourceArbiter._demands_for`). Reports/arbiter key off these and `source_memory`.
 - **Toggle:** `StrategyConfig.model_weight_loading` (config key `model_weight_loading`). Expert
   streaming itself is automatic for any MoE model.
 - Tests: [Tests/test_orchestrator.py](Tests/test_orchestrator.py) (`test_moe_experts_stream_*`,
@@ -284,7 +288,7 @@ Written by `write_outputs` in [report.py](Src/serve_sim/report.py):
 | `requests.csv` | Per-request arrival/dispatch/first-token/completion + tokens, batch. |
 | `orchestration_decisions.csv` | Ordered log of every decision (`weight_load`/`weight_eviction`/`prefill`/`kv_reuse`/`kv_transfer`/`decode`/`kv_eviction`), with the decision `time` plus the execution window `time_started`/`time_completed` taken from the rescaled events that realise it (`_attach_decision_times`); acts with no compute/transfer fall back to the decision time. |
 | `events_before_rescaling.csv` / `events_after_rescaling.csv` | Raw compute/transfer events, pre/post arbiter contention rescaling. |
-| `device_summary.csv` | Per-device compute & bandwidth utilization, busy time, and the execution-state breakdown (`compute_bound`/`bandwidth_bound`/`waiting_kv`/`waiting_weights`/`waiting_experts`/`kernel_launch`/`idle` fractions). |
+| `device_summary.csv` | Per-device compute & bandwidth utilization, busy time, and the execution-state breakdown (`compute_bound`/`bandwidth_bound`/`communicating`/`waiting_kv`/`waiting_weights`/`waiting_experts`/`kernel_launch`/`idle` fractions). |
 | `memory_summary.csv` | Per-memory-device bandwidth utilization, busy time. |
 | `device_timeline.csv` | Per-device busy fraction, memory occupancy & per-state fractions over time buckets. |
 | `config.json` | The exact config used (copied for provenance). |

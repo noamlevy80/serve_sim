@@ -143,7 +143,12 @@ class ResourceArbiter:
     def _demands_for(event: ComputeEvent, devices: list) -> tuple[list[_Demand], float]:
         """Resource demands and fixed latency for one isolated event."""
 
-        if event.phase == "kernel_launch":
+        # Fixed-duration events occupy a device for a set wall-clock time without
+        # contending compute or memory bandwidth: a kernel launch, and the
+        # scale-up-network comm barriers (tensor-parallel all-reduce, expert-
+        # parallel all-to-all, pipeline-parallel hand-off). Network congestion is
+        # not modeled, so these are not rescaled under contention.
+        if event.phase in ("kernel_launch", "tp_comm", "ep_comm", "pp_comm"):
             return [], event.duration
 
         device = devices[event.device_index]

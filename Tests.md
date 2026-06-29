@@ -465,6 +465,27 @@ filters used elsewhere are unaffected). The event generator charges a device its
   expert parallelism the ranks of a stage launch concurrently, so one launch per
   group. Both are checked by differencing against the zero-latency run.
 
+### Communication collectives — [Tests/test_communication.py](Tests/test_communication.py)
+
+The scale-up-network cost of sharding a forward pass. 10 offline tests confirm
+the event generator charges the right collective per parallelism axis (against a
+differenced no-comm run):
+
+- An unsharded engine, or one with no scale-up bandwidth configured, emits no
+  collectives and is byte-identical to the roofline path.
+- Tensor parallelism adds two `tp_comm` all-reduces per layer (`lat + 2(tp-1)/tp
+  x A / bw`); the barrier occupies every `tp` rank for one identical window.
+- Expert parallelism adds two `ep_comm` all-to-alls per **MoE** layer (`lat +
+  (ep-1)/ep x A / bw`); a dense model emits none.
+- Pipeline parallelism adds one `pp_comm` point-to-point hand-off per stage
+  boundary, landing on the receiving stage.
+- Comm events carry no FLOPs/bytes and are not rescaled under contention
+  (co-running two jobs leaves their barrier durations unchanged).
+- End to end, a tensor-parallel `Simulator` run surfaces `tp_comm` events and a
+  non-zero `communicating` device-state fraction in the report, and the
+  per-sequence breakdown (`sequence_table`) reports a positive `comm_wait_s`
+  for the sharded sequence (zero when unsharded).
+
 ## Stage 7: Event rescaling
 
 A single event generator assumes it owns its devices. Stage 7 adds a

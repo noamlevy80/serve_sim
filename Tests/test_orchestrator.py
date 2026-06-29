@@ -307,7 +307,8 @@ def _engine_makespan(model, devices, prompt, output, pp, ep):
     work = [Request(0, model, prompt, output).work]
     shards = WorkShardGenerator(model).generate(work)
     return EventGenerator(
-        model, list(devices), pipeline_parallel=pp, expert_parallel=ep
+        model, list(devices), pipeline_parallel=pp, expert_parallel=ep,
+        scale_up_bandwidth_bytes_per_s=1e12, scale_up_latency_s=1e-6,
     ).run(shards).makespan
 
 
@@ -318,6 +319,7 @@ def _engine_makespan_tp(model, devices, prompt, output, pp, ep, tp):
     return EventGenerator(
         model, list(devices),
         pipeline_parallel=pp, expert_parallel=ep, tensor_parallel=tp,
+        scale_up_bandwidth_bytes_per_s=1e12, scale_up_latency_s=1e-6,
     ).run(shards).makespan
 
 
@@ -433,7 +435,10 @@ def test_fixed_tensor_parallel_speeds_up_and_conserves():
     expected = _engine_makespan_tp(model, devices, 64, 8, pp=1, ep=1, tp=2)
     assert result.record_for(0).completion_time == pytest.approx(expected)
     solo = solo_makespan(model, make_device(), 64, 8)
-    assert result.record_for(0).completion_time == pytest.approx(solo / 2, rel=1e-9)
+    # tp=2 shards the compute in half but adds the per-layer all-reduce
+    # collectives, so the batch takes more than the ideal half-time.
+    ct = result.record_for(0).completion_time
+    assert ct > solo / 2
 
 
 def test_tensor_parallel_uses_pp_ep_tp_devices():

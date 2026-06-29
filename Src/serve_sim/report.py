@@ -123,6 +123,10 @@ def _union_length(intervals: Sequence[tuple[float, float]]) -> float:
 
 _COMPUTE_PHASES = ("prefill", "decode")
 
+# Scale-up-network parallelism collectives (tensor-parallel all-reduce,
+# expert-parallel all-to-all, pipeline-parallel activation hand-off).
+_COMM_PHASES = ("tp_comm", "ep_comm", "pp_comm")
+
 # Orchestration-decision kinds, in report order.
 _DECISION_KINDS = (
     "weight_load", "weight_eviction", "prefill", "kv_reuse", "kv_transfer",
@@ -152,12 +156,13 @@ def _isolated(events: Sequence[EventRecord]) -> list[EventRecord]:
 # their fractions sum to 1. Listed in *priority* order: when events overlap on a
 # device (e.g. a transfer prefetching while a forward pass runs), the
 # higher-priority (earlier-listed) state wins that wall-clock interval. ``idle``
-# is the time no event covers. Note: a "waiting for tensors" state (inter-stage
-# activations / tensor-parallel collectives) is not yet modelled as events, so
-# it is not emitted.
+# is the time no event covers. The ``communicating`` state covers the scale-up
+# network collectives a sharded forward pass incurs (tensor-parallel all-reduce,
+# expert-parallel all-to-all and pipeline-parallel activation hand-off).
 DEVICE_STATES = (
     "compute_bound",     # running a forward pass, compute-bound
     "bandwidth_bound",   # running a forward pass, memory-bandwidth-bound
+    "communicating",     # stalled in a parallelism comm collective
     "waiting_kv",        # stalled fetching KV cache
     "waiting_weights",   # stalled staging (non-expert) model weights
     "waiting_experts",   # stalled streaming routed MoE experts
@@ -176,6 +181,8 @@ def _event_state(event: EventRecord) -> str:
     if event.phase in _COMPUTE_PHASES:
         return ("compute_bound" if event.compute_time >= event.bandwidth_time
                 else "bandwidth_bound")
+    if event.phase in _COMM_PHASES:
+        return "communicating"
     if event.phase == "transfer":
         return "waiting_kv"
     if event.phase == "weight_transfer":
@@ -1123,6 +1130,27 @@ def _idle_wait(
     return max(0.0, window - busy)
 
 
+def _comm_wait(
+    events: Sequence[EventRecord], dispatch: float, completion: float
+) -> float:
+    """Seconds a dispatched sequence spent in parallelism comm collectives.
+
+    The wall-clock time inside ``[dispatch, completion]`` covered by the
+    sequence's communication events (tensor-parallel all-reduce, expert-parallel
+    all-to-all, pipeline-parallel hand-off). Collectives are barriers replicated
+    across every rank with identical spans, so the spans are merged to avoid
+    double-counting the parallel ranks; sequential collectives add up.
+    """
+
+    spans = [
+        (max(e.start, dispatch), min(e.end, completion))
+        for e in events
+        if e.phase in _COMM_PHASES
+        and min(e.end, completion) > max(e.start, dispatch)
+    ]
+    return _union_length(spans)
+
+
 def sequence_table(result: RunResult) -> list[dict[str, Any]]:
     """Per-sequence timings: one row per turn of every workload (or request).
 
@@ -1130,10 +1158,11 @@ def sequence_table(result: RunResult) -> list[dict[str, Any]]:
     executed on (a list when prefill and decode run on different groups, e.g.
     under prefill/decode disaggregation), the time in queue (arrival to
     dispatch), TTFT counted only over prefill (dispatch to first token), TPS
-    counted only over decode, the total idle wait while dispatched, the
-    end-to-end latency (arrival to answer), and the effective TPS (output tokens
-    over that end-to-end latency). Rows are ordered by workload then turn, with
-    standalone requests last.
+    counted only over decode, the total idle wait while dispatched, the time
+    spent in parallelism communication collectives, the end-to-end latency
+    (arrival to answer), and the effective TPS (output tokens over that
+    end-to-end latency). Rows are ordered by workload then turn, with standalone
+    requests last.
     """
 
     by_request = _events_by_request(_rescaled(result.events))
@@ -1157,6 +1186,8 @@ def sequence_table(result: RunResult) -> list[dict[str, Any]]:
             "ttft_prefill_s": ttft_prefill,
             "tps_tokens_per_s": r.tps,
             "idle_wait_s": _idle_wait(
+                events, r.dispatch_time, r.completion_time),
+            "comm_wait_s": _comm_wait(
                 events, r.dispatch_time, r.completion_time),
             "latency_s": r.latency,
             "effective_tps_tokens_per_s": (

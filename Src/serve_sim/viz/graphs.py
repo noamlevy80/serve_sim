@@ -141,6 +141,7 @@ def build_summary_tables(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
             "columns": ["Sequence", "Model", "Engine group(s)",
                         "Time in queue (s)", "TTFT (prefill, s)",
                         "TPS (decode, tok/s)", "Total idle wait (s)",
+                        "Comm wait (s)",
                         "Total latency (s)", "Effective TPS (tok/s)"],
             "rows": [[q.get("sequence", ""),
                       q.get("model", ""),
@@ -149,6 +150,7 @@ def build_summary_tables(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
                       eng_format(q.get("ttft_prefill_s")),
                       eng_format(q.get("tps_tokens_per_s")),
                       eng_format(q.get("idle_wait_s")),
+                      eng_format(q.get("comm_wait_s")),
                       eng_format(q.get("latency_s")),
                       eng_format(q.get("effective_tps_tokens_per_s"))]
                      for q in sequences],
@@ -187,6 +189,7 @@ def build_summary_tables(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
 _STATE_ABBREV = {
     "compute_bound": ("CMP", "Compute bound"),
     "bandwidth_bound": ("BW", "Bandwidth bound"),
+    "communicating": ("COM", "Communicating (collectives)"),
     "waiting_kv": ("KV", "Waiting on KV"),
     "waiting_weights": ("WTS", "Waiting on weights"),
     "waiting_experts": ("EXP", "Waiting on experts"),

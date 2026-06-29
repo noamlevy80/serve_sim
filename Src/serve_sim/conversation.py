@@ -63,6 +63,8 @@ def run_conversation(
     expert_parallel: int = 1,
     prefill_chunk_size: int | None = None,
     tool_calling_speedup: float = 1.0,
+    scale_up_bandwidth_bytes_per_s: float | None = None,
+    scale_up_latency_s: float = 0.0,
 ) -> EventSchedule:
     """Simulate a whole multi-turn conversation on a single timeline.
 
@@ -81,6 +83,9 @@ def run_conversation(
         expert_parallel: Expert-parallel degree for each turn.
         prefill_chunk_size: Optional prefill chunking for each turn.
         tool_calling_speedup: Global divisor applied to every ``pre_gap``.
+        scale_up_bandwidth_bytes_per_s: Scale-up network bandwidth used to time
+            parallelism communication collectives; ``None`` disables comm.
+        scale_up_latency_s: Per-collective scale-up network latency.
 
     Returns:
         One :class:`EventSchedule` whose events span the whole conversation,
@@ -109,6 +114,8 @@ def run_conversation(
             compute_devices,
             pipeline_parallel=pipeline_parallel,
             expert_parallel=expert_parallel,
+            scale_up_bandwidth_bytes_per_s=scale_up_bandwidth_bytes_per_s,
+            scale_up_latency_s=scale_up_latency_s,
         )
         turn_schedule = generator.run(shards)
         for event in turn_schedule.events:

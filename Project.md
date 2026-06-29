@@ -206,6 +206,15 @@ The devices form a `pipeline_parallel x expert_parallel x tensor_parallel` grid.
 
 The number of devices must be devisable by the product of the parallelism options (for simplicity). An engine therefore occupies `pipeline_parallel x expert_parallel x tensor_parallel` devices.
 
+#### Communication collectives
+Sharding a forward pass forces the ranks to exchange activations, and that exchange runs on the **scale-up network** (we pay its bandwidth and latency; network congestion is still not modeled, so each collective is an independent fixed-duration barrier). Every collective occupies *all* its participating ranks for `latency + volume / bandwidth` and the group cannot proceed until it completes. For a forward-pass group of `T` tokens the per-layer activation tensor is `A = T x hidden_size x param_dtype_bytes`, and per pipeline stage the generator charges:
+
+- **Tensor parallelism** — two `all-reduce` collectives per layer (after the attention and after the FFN sub-layer), each moving `2(tp-1)/tp x A` across the `tp` ranks (`tp_comm`).
+- **Expert parallelism** — two `all-to-all` collectives per MoE layer (the dispatch of tokens to their experts and the combine of the results), each moving `(ep-1)/ep x A` across the `ep` ranks (`ep_comm`).
+- **Pipeline parallelism** — one point-to-point send of `A` from each stage to the next (`pp_comm`).
+
+The barriers serialize after each stage's compute, so a sharded forward pass costs its compute plus its collective time. When the engine is unsharded (every degree is 1) no collectives are emitted and the schedule is identical to the pure-roofline path. In the per-device state breakdown these waits surface as the `communicating` state.
+
 The event generator can and should consolidate adjacent work shards if they run on the same device, so as to minimize thrashing of the simulation with events.
 
 ### Events generated:
@@ -224,6 +233,9 @@ Compute is defined by the nominal capabilities of the device. If using a differe
 #### Kernel launch
 When a new kernel must be launched (as depicted by the approriate work shard), the device must wait the kernel_launch_latency.
 This event models the wait.
+
+#### Communication
+A collective (`tp_comm` / `ep_comm` / `pp_comm`) accompanying a sharded forward pass: a fixed-duration barrier of `latency + volume / bandwidth` on the scale-up network that occupies every participating rank (see *Communication collectives* above for the volume per parallelism axis). Like a kernel launch it carries no FLOPs or bytes and is never rescaled under contention.
 
 #### Tool call
 We do not model the event of computing a tool call, but we do model waiting for the tool call to complete.
@@ -397,6 +409,8 @@ The following tabs shall exist:
 
 ### Summary Tab
 This will display an AI-Perf style summary of the run with detailed tables showing aggregate values for the run, workload, system, and simulated performance.
+
+The per-sequence breakdown lists one row per turn with its model, engine group(s), time in queue, TTFT, decode TPS, total idle wait, communication wait (the wall-clock time the sequence spent in parallelism collectives — tensor-parallel all-reduce, expert-parallel all-to-all and pipeline-parallel hand-off), end-to-end latency and effective TPS.
 
 ### Timeline Tab
 The timeline shall show a set of graphs all with the same horizontal axis of time.

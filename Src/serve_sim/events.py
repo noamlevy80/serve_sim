@@ -18,14 +18,35 @@ ranks run concurrently and an evenly balanced stage is ``expert_parallel`` times
 faster. Each rank keeps its own LRU residency of the experts it owns; in a
 two-tier system those experts are streamed up from the second tier on demand,
 and when the second tier is a single shared device (a system NVM) its bandwidth
-bounds the aggregate movement. Inter-stage activation transfers are not modeled
-here.
+bounds the aggregate movement.
 
 Tensor parallelism shards every tensor (and the per-rank compute) across the
 ``tensor_parallel`` devices that sit under each ``(stage, expert_rank)`` cell, so
 a stage's work is divided evenly across all ``expert_parallel x tensor_parallel``
 devices of the stage and runs that many times faster. Tensor parallelism is not
 supported alongside two-tier expert movement.
+
+**Communication collectives.** Sharding a forward pass forces the ranks to
+exchange activations, and that exchange runs on the scale-up network (the
+``scale_up_bandwidth_bytes_per_s`` / ``scale_up_latency_s`` the generator is
+given; when no bandwidth is supplied, communication is not modeled and the
+output is byte-identical to the pure-roofline path). Each collective is a
+*barrier*: every participating rank is occupied for ``latency + volume /
+bandwidth`` and the group cannot proceed until it completes. For a group of
+``T`` tokens the per-layer activation tensor is ``A = T * hidden_size *
+param_dtype_bytes``, and per pipeline stage:
+
+* **Tensor parallelism** adds two ``all-reduce`` collectives per layer (after the
+  attention and after the FFN sub-layer), each moving ``2*(tp-1)/tp * A`` across
+  the ``tp`` ranks (``phase == "tp_comm"``).
+* **Expert parallelism** adds two ``all-to-all`` collectives per MoE layer (the
+  dispatch of tokens to their experts and the combine of the results), each
+  moving ``(ep-1)/ep * A`` across the ``ep`` ranks (``phase == "ep_comm"``).
+* **Pipeline parallelism** adds one point-to-point activation send of ``A`` from
+  each stage to the next (``phase == "pp_comm"``).
+
+These barriers are inserted after each stage's compute and serialize with it, so
+a sharded forward pass costs its compute plus its collective time.
 
 A group's compute may be preceded by a kernel-launch event: when a work shard
 marks a kernel launch, each participating device waits its
@@ -161,6 +182,8 @@ class EventGenerator:
         tensor_parallel: int = 1,
         event_random_factor_range: float = 0.0,
         rng: random.Random | None = None,
+        scale_up_bandwidth_bytes_per_s: float | None = None,
+        scale_up_latency_s: float = 0.0,
     ) -> None:
         model = LayeredModel.from_model(model)
         if not compute_devices:
@@ -169,6 +192,10 @@ class EventGenerator:
             raise ValueError("parallelism degrees must be >= 1")
         if not 0.0 <= event_random_factor_range < 1.0:
             raise ValueError("event_random_factor_range must be in [0, 1)")
+        if scale_up_bandwidth_bytes_per_s is not None and scale_up_bandwidth_bytes_per_s <= 0:
+            raise ValueError("scale_up_bandwidth_bytes_per_s must be positive")
+        if scale_up_latency_s < 0:
+            raise ValueError("scale_up_latency_s must be non-negative")
         product = pipeline_parallel * expert_parallel * tensor_parallel
         if len(compute_devices) % product != 0:
             raise ValueError(
@@ -187,6 +214,8 @@ class EventGenerator:
         self.tensor_parallel = tensor_parallel
         self.event_random_factor_range = event_random_factor_range
         self._rng = rng if rng is not None else random.Random()
+        self._comm_bandwidth = scale_up_bandwidth_bytes_per_s
+        self._comm_latency = scale_up_latency_s
         self._layers_per_stage = model.num_layers // pipeline_parallel
         # Bytes moved per expert miss: that expert's routed weights across all
         # MoE layers (selection is shared, so they move together).
@@ -386,7 +415,8 @@ class EventGenerator:
                 stage_shards.setdefault(stage, []).append(shard)
 
             # Stages run sequentially; the ep*tp ranks of a stage run concurrently.
-            for stage in sorted(stage_shards):
+            ordered_stages = sorted(stage_shards)
+            for stage_pos, stage in enumerate(ordered_stages):
                 bucket = stage_shards[stage]
                 # A new kernel is launched on each rank of this stage; they
                 # launch concurrently, so the slowest rank gates the group.
@@ -418,6 +448,16 @@ class EventGenerator:
                         stage_end = max(stage_end, event.end)
                         schedule.events.append(event)
                 clock = stage_end
+                # Sharding the stage forces the ranks to exchange activations
+                # over the scale-up network: a tensor-parallel all-reduce after
+                # every sub-layer, an expert-parallel all-to-all around every MoE
+                # layer, and a point-to-point hand-off of the activations to the
+                # next pipeline stage. Each is a barrier that serializes after the
+                # stage's compute.
+                clock = self._emit_stage_collectives(
+                    schedule, group_index, stage, bucket, clock,
+                    last_stage=(stage_pos == len(ordered_stages) - 1),
+                )
 
         if expert_residency is not None:
             for cache in caches:
@@ -447,6 +487,127 @@ class EventGenerator:
             start=start,
             end=start + latency,
         )
+
+
+    def _emit_stage_collectives(
+        self,
+        schedule: EventSchedule,
+        group_index: int,
+        stage: int,
+        bucket: list[WorkShard],
+        start: float,
+        last_stage: bool,
+    ) -> float:
+        """Append the comm-collective barriers a sharded stage incurs.
+
+        Returns the clock after the barriers. When no scale-up bandwidth was
+        configured -- or the stage is unsharded -- nothing is emitted and the
+        clock is returned unchanged (byte-identical to the pure-roofline path).
+
+        The activation tensor exchanged by a layer is ``A = tokens * hidden_size
+        * param_dtype_bytes``. Tensor parallelism adds two all-reduces per layer,
+        expert parallelism two all-to-alls per MoE layer, and pipeline
+        parallelism one point-to-point send of ``A`` to the next stage. Each
+        barrier occupies every participating rank for its duration; one random
+        ``_time_scale`` draw is shared across a barrier's per-rank events so they
+        stay aligned.
+        """
+
+        if self._comm_bandwidth is None:
+            return start
+        ep = self.expert_parallel
+        tp = self.tensor_parallel
+        layer_shards = [s for s in bucket if s.kind == "layer"]
+        tokens = max((s.tokens for s in bucket), default=0)
+        activation_bytes = tokens * self.model.hidden_size * self.model.param_dtype_bytes
+        if activation_bytes <= 0:
+            return start
+        clock = start
+        if tp > 1 and layer_shards:
+            # Two all-reduces per layer (post-attention, post-FFN).
+            per = self._allreduce_time(activation_bytes, tp)
+            total = 2 * len(layer_shards) * per * self._time_scale()
+            clock = self._emit_barrier(
+                schedule, group_index, "tp_comm", stage, total, clock
+            )
+        if ep > 1:
+            n_moe = sum(
+                1 for s in layer_shards if self.model.is_moe_layer(s.layer_index)
+            )
+            if n_moe:
+                # Two all-to-alls per MoE layer (token dispatch, result combine).
+                per = self._alltoall_time(activation_bytes, ep)
+                total = 2 * n_moe * per * self._time_scale()
+                clock = self._emit_barrier(
+                    schedule, group_index, "ep_comm", stage, total, clock
+                )
+        if not last_stage:
+            # Hand the stage's activations to the next pipeline stage.
+            total = self._p2p_time(activation_bytes) * self._time_scale()
+            clock = self._emit_barrier(
+                schedule, group_index, "pp_comm", stage + 1, total, clock
+            )
+        return clock
+
+    def _emit_barrier(
+        self,
+        schedule: EventSchedule,
+        group_index: int,
+        phase: str,
+        stage: int,
+        duration: float,
+        start: float,
+    ) -> float:
+        """Emit a comm barrier of ``duration`` on every rank of ``stage``.
+
+        All ``ep*tp`` ranks of the stage are occupied for the same window (a
+        collective completes only when every participant has), so the per-rank
+        events share one start and end; the clock advances by ``duration`` once.
+        """
+
+        if duration <= 0:
+            return start
+        end = start + duration
+        for ep_rank in range(self.expert_parallel):
+            for tp_rank in range(self.tensor_parallel):
+                schedule.events.append(
+                    ComputeEvent(
+                        group_index=group_index,
+                        phase=phase,
+                        device_index=self._device_index(stage, ep_rank, tp_rank),
+                        flops=0.0,
+                        bytes_read=0.0,
+                        compute_time=0.0,
+                        bandwidth_time=0.0,
+                        duration=duration,
+                        start=start,
+                        end=end,
+                    )
+                )
+        return end
+
+    def _allreduce_time(self, num_bytes: float, degree: int) -> float:
+        """Ring all-reduce wall time over ``degree`` ranks: ``lat + 2(d-1)/d * B / bw``."""
+
+        if degree <= 1 or self._comm_bandwidth is None:
+            return 0.0
+        volume = 2.0 * (degree - 1) / degree * num_bytes
+        return self._comm_latency + volume / self._comm_bandwidth
+
+    def _alltoall_time(self, num_bytes: float, degree: int) -> float:
+        """All-to-all wall time over ``degree`` ranks: ``lat + (d-1)/d * B / bw``."""
+
+        if degree <= 1 or self._comm_bandwidth is None:
+            return 0.0
+        volume = (degree - 1) / degree * num_bytes
+        return self._comm_latency + volume / self._comm_bandwidth
+
+    def _p2p_time(self, num_bytes: float) -> float:
+        """Point-to-point send wall time: ``lat + B / bw``."""
+
+        if self._comm_bandwidth is None:
+            return 0.0
+        return self._comm_latency + num_bytes / self._comm_bandwidth
 
 
     def _build_transfer_event(

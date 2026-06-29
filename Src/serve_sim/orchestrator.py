@@ -2139,6 +2139,8 @@ class Simulator:
             tensor_parallel=tp,
             event_random_factor_range=self.strategy.event_random_factor_range,
             rng=self._rng,
+            scale_up_bandwidth_bytes_per_s=self.system.network.scale_up_bandwidth_bytes_per_s,
+            scale_up_latency_s=self.system.network.scale_up_latency_s,
         )
         # Device-first policies keep routed experts resident on each rank's HBM
         # across batches (sharing the pool with retained KV). The residency for
