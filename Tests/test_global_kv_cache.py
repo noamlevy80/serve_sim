@@ -166,6 +166,42 @@ def test_migration_to_other_floating_avoids_eviction():
     assert len(manager.entries) == 2
 
 
+def test_offload_spreads_evenly_across_node_memories():
+    model = toy_model()
+    context_tokens = 64
+    # Four roomy node memories: nothing forces eviction, so placement is driven
+    # purely by the hash-based home-node choice.
+    manager = KVCacheManager(make_kv_system([80e9, 80e9, 80e9, 80e9]))
+
+    for wid in range(40):
+        tracker = tracker_from_messages(
+            [{"role": "system", "content": f"session number {wid} prompt"}]
+        )
+        manager.store(model, tracker, wid, 0, context_tokens, now=float(wid))
+
+    # Every node memory receives a meaningful share of the offloaded KV instead
+    # of it all piling onto node-0 (the old first-fit behaviour).
+    per_memory = [manager.used_bytes(m.node_memory)
+                  for m in manager.system.nodes]
+    assert all(used > 0 for used in per_memory), per_memory
+    # Spread is balanced: the busiest node holds no more than ~2x the lightest.
+    assert max(per_memory) <= 2 * min(per_memory)
+
+
+def test_home_node_choice_is_deterministic():
+    model = toy_model()
+    context_tokens = 64
+    caps = [80e9, 80e9, 80e9]
+    landings = []
+    for _ in range(3):
+        manager = KVCacheManager(make_kv_system(list(caps)))
+        tracker = tracker_from_messages([{"role": "system", "content": "stable prompt"}])
+        result = manager.store(model, tracker, 7, 2, context_tokens, now=0.0)
+        landings.append(result.memory.name)
+    # The same sequence id always lands on the same home node across runs.
+    assert len(set(landings)) == 1, landings
+
+
 def test_manager_inert_without_floating_memory():
     model = toy_model()
     manager = KVCacheManager(make_kv_system([None]))  # node with no node memory

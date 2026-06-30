@@ -12,9 +12,13 @@ sequence's KV cache that has not yet been evicted. It exists so that:
   *floating* memory (any node's CPU-managed node memory). The system NVM (the
   weight input device) never holds KV.
 
-Storage competes for floating-memory capacity: as long as some floating memory
-has room the entry is kept (migrating across nodes if needed to avoid eviction);
-only when the whole floating pool is full are entries evicted, least-recently-used
+Storage competes for floating-memory capacity. Each sequence has a *home*
+floating memory chosen by hashing its ``(workload_id, turn_index)`` key, so
+offloaded KV spreads evenly across the node memories instead of piling onto one
+node (which would make that node's bandwidth an unrealistic bottleneck). The
+whole sequence always lands on a single memory -- it is never split across
+nodes. If its home node is full the next nodes are probed (wrapping around); only
+when the *whole* floating pool is full are entries evicted, least-recently-used
 first, at the granularity of a whole stored sequence.
 
 This module only does the bookkeeping (which prefix to reuse, where KV resides,
@@ -259,7 +263,8 @@ class KVCacheManager:
         if not self._floating:
             return StoreResult(memory=None, num_bytes=num_bytes, evicted=())
         evicted: list[KVEntry] = []
-        memory = self._node_with_room(num_bytes)
+        key = (workload_id, turn_index)
+        memory = self._node_with_room(num_bytes, key)
         while memory is None:
             victim = self._lru_node_entry()
             if victim is None:
@@ -268,7 +273,7 @@ class KVCacheManager:
                 )
             self._remove(victim)
             evicted.append(victim)
-            memory = self._node_with_room(num_bytes)
+            memory = self._node_with_room(num_bytes, key)
 
         entry = KVEntry(
             workload_id=workload_id,
@@ -308,14 +313,14 @@ class KVCacheManager:
             entry = self._entry_for_key(key)
             if entry is None:
                 continue
-            memory = self._node_with_room(entry.num_bytes)
+            memory = self._node_with_room(entry.num_bytes, key)
             while memory is None:
                 victim = self._lru_node_entry()
                 if victim is None or victim is entry:
                     break
                 self._remove(victim)
                 dropped.append(victim)
-                memory = self._node_with_room(entry.num_bytes)
+                memory = self._node_with_room(entry.num_bytes, key)
             if memory is None:
                 self._entries.remove(entry)
                 dropped.append(entry)
@@ -338,14 +343,42 @@ class KVCacheManager:
         if entry is not None:
             self._remove(entry)
 
-    def _node_with_room(self, num_bytes: float) -> MemoryDevice | None:
-        """First floating memory whose free capacity holds ``num_bytes``."""
+    def _node_with_room(
+        self, num_bytes: float, key: tuple[int, int] | None = None
+    ) -> MemoryDevice | None:
+        """A floating memory whose free capacity holds ``num_bytes``.
 
-        for memory in self._floating:
+        To keep offloaded KV from piling onto a single node memory (which would
+        make that node's bandwidth an unrealistic bottleneck), each sequence has a
+        *home* floating memory chosen by hashing its ``(workload_id, turn_index)``
+        key. The whole sequence lands on that home node, spreading the offload load
+        evenly across nodes while never splitting one sequence across memories.
+        Probing starts at the home node and wraps around, so capacity constraints
+        are still honoured: if the home node is full the next ones are tried, and
+        only when *every* node is full does the caller fall back to LRU eviction.
+        """
+
+        order = self._floating
+        if key is not None and len(self._floating) > 1:
+            start = self._home_index(key)
+            count = len(self._floating)
+            order = [self._floating[(start + i) % count] for i in range(count)]
+        for memory in order:
             free = memory.capacity_bytes - self._used[id(memory)]
             if free >= num_bytes:
                 return memory
         return None
+
+    def _home_index(self, key: tuple[int, int]) -> int:
+        """Index of a sequence's home floating memory (stable across runs).
+
+        Uses an explicit integer mix rather than the built-in ``hash`` so the
+        spread is deterministic regardless of ``PYTHONHASHSEED``.
+        """
+
+        workload_id, turn_index = key
+        mixed = (workload_id * 0x9E3779B1 + turn_index * 0x85EBCA77) & 0xFFFFFFFF
+        return mixed % len(self._floating)
 
     def _lru_node_entry(self) -> KVEntry | None:
         node_entries = [e for e in self._entries if e.device is None]
