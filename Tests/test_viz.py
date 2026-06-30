@@ -75,7 +75,7 @@ def test_each_device_has_its_nine_graphs():
     for ids in by_group.values():
         suffixes = {gid.rsplit(":", 1)[1] for gid in ids}
         assert {"compute", "bandwidth", "capacity", "reason", "xfer_obj",
-                "batch", "out_tps", "in_tps"} <= suffixes
+                "batch", "out_tps", "in_tps", "resident", "running"} <= suffixes
         assert any(gid.endswith("xfer_src") for gid in ids)
 
 
@@ -196,7 +196,7 @@ def test_workload_graphs_present():
     wl = [g for g in vm["graphs"] if g["section"] == "workload"]
     assert wl
     suffixes = {g["id"].rsplit(":", 1)[1] for g in wl}
-    assert {"device", "turn", "state", "batch"} <= suffixes
+    assert {"device", "turn", "state", "batch", "tps"} <= suffixes
 
 
 def test_view_model_carries_workload_graph():
@@ -226,6 +226,43 @@ def test_engine_group_graph_labels_groups_and_lists_devices_on_hover():
         assert abbrev.startswith("G")  # group id on the bar
         assert key == f"group:{abbrev}"  # colour keyed by the group
         assert "devices" in full or full  # device list / group name on hover
+
+
+def test_running_sequence_graph_is_discrete_and_stacks_on_overlap():
+    # PRD 1.11: each compute device gets a "Running sequence" discrete graph that
+    # names the live sequence on the bar (colour keyed per sequence) and renders a
+    # "<id>+N" stack with the full list on hover when more than one runs at once.
+    vm = build_view_model(_payload())
+    running = [g for g in vm["graphs"]
+              if g["section"] == "compute_device" and g["id"].endswith(":running")]
+    assert running
+    g = next(r for r in running if r["segments"])
+    assert g["kind"] == "discrete"
+    for abbrev, full, key in ((s[2], s[3], s[4]) for s in g["segments"]):
+        assert abbrev and key.startswith("seq:")
+        if "+" in abbrev:  # a stack: full list on hover, colour keys all members
+            assert full.startswith("Running:\n")
+            head = abbrev.split("+", 1)[0]
+            assert key.startswith(f"seq:{head}+")
+        else:
+            assert full == f"Running: {abbrev}"
+            assert key == f"seq:{abbrev}"
+
+
+def test_current_tps_graph_is_a_per_tenant_value_series():
+    # PRD 3.5: each workload gets a "Current TPS" value graph in tok/s that is
+    # non-zero only while the turn is actively decoding.
+    vm = build_view_model(_payload())
+    tps = [g for g in vm["graphs"]
+           if g["section"] == "workload" and g["id"].endswith(":tps")]
+    assert tps
+    g = tps[0]
+    assert g["kind"] == "value"
+    assert g["unit"] == "tok/s"
+    for b in g["buckets"]:
+        assert len(b) == 3 and b[0] <= b[1] and b[2] >= 0.0
+    # At least one workload decodes, so some bucket carries a positive rate.
+    assert any(b[2] > 0.0 for gg in tps for b in gg["buckets"])
 
 
 def test_graph_tree_mirrors_graph_hierarchy():

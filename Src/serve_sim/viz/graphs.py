@@ -335,6 +335,25 @@ def _object_label(label: str) -> tuple[str, str, str]:
     return label, label, label
 
 
+def _running_label(seqs: Any) -> tuple[str, str, str] | None:
+    """(abbrev, full, color_key) for the sequence(s) running on a device.
+
+    Empty buckets (no live compute) become gaps. A lone sequence keeps its id on
+    the bar and a ``seq:<id>`` colour shared with the same sequence elsewhere;
+    more than one renders as a stack -- the first id with a ``+N`` count on the
+    bar and the full list on hover.
+    """
+
+    if not seqs:
+        return None
+    if len(seqs) == 1:
+        seq = seqs[0]
+        return seq, f"Running: {seq}", f"seq:{seq}"
+    head = seqs[0]
+    return (f"{head}+{len(seqs) - 1}", "Running:\n" + "\n".join(seqs),
+            "seq:" + "+".join(seqs))
+
+
 def _device_graphs(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     graphs: list[dict[str, Any]] = []
     timeline = payload.get("device_timeline", [])
@@ -386,6 +405,10 @@ def _device_graphs(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         graphs.append(_value_graph(
             f"dev:{name}:resident", f"Resident tasks -- {name}", "compute_device",
             name, "tasks", None, rows, "resident_tasks"))
+        graphs.append(_discrete_graph(
+            f"dev:{name}:running", f"Running sequence -- {name}", "compute_device",
+            name, _merge_segments(rows, lambda r: _running_label(
+                r.get("running_sequences")))))
     return graphs
 
 
@@ -490,6 +513,9 @@ def _workload_graphs(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
             _merge_segments(rows, lambda r: (
                 (f"B{r['batch']}", f"Batch {r['batch']}", f"batch:{r['batch']}")
                 if r.get("batch") is not None else None))))
+        graphs.append(_value_graph(
+            f"wl:{w}:tps", f"Current TPS -- {w}", "workload", w,
+            "tok/s", None, rows, "decode_tps"))
     return graphs
 
 

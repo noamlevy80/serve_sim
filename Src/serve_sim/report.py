@@ -470,9 +470,12 @@ def device_timeline(
     label for any
     incoming transfer (its source memory and what it moves), the current task's
     batch size, the number of tasks (running batches) concurrently resident on
-    the device, and the effective decode (output) and prefill (input) token
-    throughput -- the same for every device in the task's engine group -- so the
-    visualization can plot absolute values against the device's static ceilings.
+    the device, the ids of the sequences resident on the device for the whole
+    job lifetime (``running_sequences`` -- spanning the wait for weights/KV,
+    prefill and decode; a stack when more than one), and the effective decode
+    (output) and prefill (input) token throughput -- the same for every device in
+    the task's engine group -- so the visualization can plot absolute values
+    against the device's static ceilings.
     """
 
     makespan = result.makespan or 0.0
@@ -532,6 +535,15 @@ def device_timeline(
                               for e in first_tier_events)
             dom = _dominant_transfer(dev_events, t0, t1)
             dev_jobs = jobs_by_device.get(name, [])
+            # 1.11 Running sequence(s): every sequence resident on the device in
+            # the bucket -- the whole job lifetime, so it spans the wait for
+            # weights/KV, prefill and decode, not just active compute. More than
+            # one renders as a stack.
+            running_seqs = sorted({
+                seq_by_request.get(rid) or f"r{rid}"
+                for j in dev_jobs if j.start < t1 and j.end > t0
+                for rid in j.request_ids
+            })
             dev_weights, dev_kv_by_batch = _first_tier_content_at(dev_jobs, {name}, t0)
             content: dict[str, float] = {}
             weight_bytes = sum(dev_weights.values())
@@ -550,6 +562,7 @@ def device_timeline(
                 "content": content,
                 "batch_size": batch_size,
                 "resident_tasks": _resident_tasks_at(dev_jobs, name, t0),
+                "running_sequences": running_seqs,
                 "decode_tokens_per_s": decode_tps.get((name, b), 0.0),
                 "prefill_tokens_per_s": prefill_tps.get((name, b), 0.0),
                 "compute_flops_per_s": bucket_flops / width if width else 0.0,
@@ -951,6 +964,48 @@ def _turn_batch_at(
     return None
 
 
+def _per_tenant_decode_tps(
+    result: RunResult, events: Sequence[EventRecord]
+) -> dict[int, float]:
+    """Per-tenant decode token throughput for every request, keyed by id.
+
+    A decode batch produces all its tenants' tokens together over one wall-clock
+    window (``[min start, max end]`` of the job's decode events); the per-tenant
+    rate the PRD's "Current TPS" graph plots is that batch rate divided by the
+    batch size, so every sequence in the batch shares the same value. Sequences
+    that never decode are absent (the caller treats them as ``0``).
+    """
+
+    jobs_by_index = {j.job_index: j for j in result.jobs}
+    out_tokens = {r.request_id: r.output_tokens for r in result.records}
+    spans: dict[int, list[float]] = {}
+    for e in events:
+        if e.phase != "decode":
+            continue
+        span = spans.get(e.job_index)
+        if span is None:
+            spans[e.job_index] = [e.start, e.end]
+        else:
+            span[0] = min(span[0], e.start)
+            span[1] = max(span[1], e.end)
+
+    per_tenant: dict[int, float] = {}
+    for job_index, (start, end) in spans.items():
+        job = jobs_by_index.get(job_index)
+        if job is None or end <= start:
+            continue
+        batch_size = len(job.request_ids)
+        if batch_size <= 0:
+            continue
+        total = sum(out_tokens.get(rid, 0) for rid in job.request_ids)
+        if total <= 0:
+            continue
+        rate = (total / (end - start)) / batch_size
+        for rid in job.request_ids:
+            per_tenant[rid] = rate
+    return per_tenant
+
+
 def _workload_key(record: RequestRecord) -> tuple[int, str]:
     """A stable (sort-key, label) for a record's workload (or itself if standalone)."""
 
@@ -966,16 +1021,20 @@ def workload_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str
     (or a standalone request); at each instant exactly one turn is current. The
     row reports that turn's index, its serving device, the full engine group it
     runs on (a stable ``group`` id plus the ``devices`` list), the id of the
-    batch currently executing it (``batch``, ``None`` when not being computed)
-    and its lifecycle state (not-arrived / in-queue / KV-fetch / prefill /
-    decode / done).
+    batch currently executing it (``batch``, ``None`` when not being computed),
+    its lifecycle state (not-arrived / in-queue / KV-fetch / prefill / decode /
+    done) and, while actively decoding, the per-tenant decode throughput
+    (``decode_tps`` -- the batch's token rate divided by its batch size; ``0``
+    otherwise).
     """
 
     makespan = result.makespan or 0.0
     if makespan <= 0 or num_buckets < 1:
         return []
     width = makespan / num_buckets
-    events_by_request = _events_by_request(_rescaled(result.events))
+    rescaled = _rescaled(result.events)
+    events_by_request = _events_by_request(rescaled)
+    per_tenant_decode_tps = _per_tenant_decode_tps(result, rescaled)
 
     workloads: dict[str, list[RequestRecord]] = {}
     labels: dict[str, int] = {}
@@ -1034,6 +1093,8 @@ def workload_timeline(result: RunResult, num_buckets: int = 64) -> list[dict[str
                 "group": _group_id(devices),
                 "devices": list(devices),
                 "batch": batch,
+                "decode_tps": (per_tenant_decode_tps.get(current.request_id, 0.0)
+                               if state == "decode" else 0.0),
             })
     return rows
 
@@ -1673,11 +1734,12 @@ def write_outputs(
         out / "device_timeline.csv",
         ["bucket", "time_start", "time_end", "device", "busy_fraction",
          "memory_bytes", "content_json", "batch_size", "resident_tasks",
-         "decode_tokens_per_s",
+         "running_sequences_json", "decode_tokens_per_s",
          "prefill_tokens_per_s", "compute_flops_per_s", "compute_seconds",
          "first_tier_bytes_per_s", "bandwidth_seconds", "transfer_source",
          "transfer_object", *(f"{state}_fraction" for state in DEVICE_STATES)],
-        [{**row, "content_json": json.dumps(row["content"], sort_keys=True)}
+        [{**row, "content_json": json.dumps(row["content"], sort_keys=True),
+          "running_sequences_json": json.dumps(row.get("running_sequences", []))}
          for row in timeline],
     )
     _write_csv(
@@ -1692,7 +1754,7 @@ def write_outputs(
     _write_csv(
         out / "workload_timeline.csv",
         ["bucket", "time_start", "time_end", "workload", "turn", "sequence",
-         "state", "device", "group", "devices_json"],
+         "state", "device", "group", "devices_json", "decode_tps"],
         [{**row, "devices_json": json.dumps(row.get("devices", []))}
          for row in work_timeline],
     )

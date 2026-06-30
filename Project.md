@@ -447,6 +447,7 @@ The default for all graphs is displayed.
 1.8 Effective device output token throughput (total tokens per second of current task) - if device is a rank in a parallelism group, this is the effective throughput of the part of the token generation the device is responsible for. When not decoding this is 0
 1.9 Effective device input token throughput, similar to 1.8 but for prefill; when not prefilling, this is 0.
 1.10 Number of resident tasks - the total number of current resident tasks (running batches) on the device
+1.11 Running sequence - the ID of the sequence (e.g. w2t1) currently running on the device; if more than 1 - a stack is shown.
 2. For each independent memory device:
 2.1 Bandwidth used (with both absolute and relative to max)
 2.2 Capacity used (with both absolute and relative to max) - broken down by content - KV and weights
@@ -458,6 +459,7 @@ The default for all graphs is displayed.
 3.2 Current turn
 3.3 State (of current turn sequence): Not arrived, In queue, KV Fetch, Prefill, Decode, Done
 3.4 In batch - each executed batch will get a unique batch ID, and this displays the ID for this sequence over time; when the sequence is not actively being computed, this graph is empty.
+3.5 Current TPS - the TPS of the sequence, when actively decoding. Otherwise, 0. Note - if the sequence is part of a batch, this is the per-tennant TPS inside the batch (the batch TPS divided by batch size)
 
 ### Workload Tab
 The workload tab provides a visualization of the workloads that were used in the run.
