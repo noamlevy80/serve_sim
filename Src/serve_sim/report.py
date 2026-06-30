@@ -623,8 +623,18 @@ def memory_summaries(result: RunResult) -> list[dict[str, Any]]:
     rescaled = _rescaled(result.events)
     by_memory: dict[str, list[EventRecord]] = {}
     for event in rescaled:
-        if event.memory and event.bandwidth_time > 0:
-            by_memory.setdefault(event.memory, []).append(event)
+        if event.bandwidth_time <= 0:
+            continue
+        # A transfer occupies both ends' bandwidth, so it counts against the
+        # memory it streamed from (``memory``) and the one it wrote into
+        # (``destination_memory``); a compute read has only a source memory.
+        names = set()
+        if event.memory:
+            names.add(event.memory)
+        if event.destination_memory:
+            names.add(event.destination_memory)
+        for name in names:
+            by_memory.setdefault(name, []).append(event)
 
     summaries: list[dict[str, Any]] = []
     for mem in result.memories:
@@ -740,8 +750,12 @@ def memory_timeline(
 
     events_by_memory: dict[str, list[EventRecord]] = {}
     for e in rescaled:
+        # Charge a transfer's bandwidth against both ends (source ``memory`` and
+        # ``destination_memory``); a compute read has only its source memory.
         if e.memory:
             events_by_memory.setdefault(e.memory, []).append(e)
+        if e.destination_memory and e.destination_memory != e.memory:
+            events_by_memory.setdefault(e.destination_memory, []).append(e)
     events_by_device: dict[str, list[EventRecord]] = {}
     for e in rescaled:
         if e.device:

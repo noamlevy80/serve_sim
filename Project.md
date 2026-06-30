@@ -224,6 +224,7 @@ Memory to memory data transfers generate data transfer events
 Data transfer events cost latency + transfer time, where transfer time is the volume / bandwidth
 Bandwidth is the minimum across both ends of the transfer and the link connecting them; latency is the maximum across the two ends and the link.
 The link is the scale-up network when the two memory devices are in different nodes, and the in-node (CXL) link when they share a node (intra-package first-tier accesses use the memory's own bandwidth and incur no link latency).
+A transfer occupies the bandwidth of *both* ends for its duration -- the source memory it reads from and the destination memory it writes into -- so the arbiter contends it on both, and either memory can be the bottleneck when several transfers share it; the per-memory bandwidth reports attribute the moved bytes to both ends.
 
 #### Compute
 Compute events take the maximum of compute-bound time and bandwidth-bound time

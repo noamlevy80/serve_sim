@@ -20,9 +20,12 @@ result is identical to running each generator on its own.
 Resources are identified by object identity: two jobs contend only when they
 were handed the *same* :class:`ComputeDevice` / :class:`MemoryDevice` instance.
 A compute event loads its device's compute pool (for FLOPs) and its first-tier
-memory's bandwidth (for bytes); a transfer event loads the memory it streams from
-(its ``source_memory`` when set -- e.g. the input NVM for a weight load -- else
-the device's second-tier memory); a kernel-launch event is a fixed, unshared wait.
+memory's bandwidth (for bytes); a transfer event occupies the bandwidth of *both*
+ends -- the memory it streams from (its ``source_memory`` when set -- e.g. the
+input NVM for a weight load -- else the device's second-tier memory) and the
+memory it writes into (its ``destination_memory`` when set, else the device's
+first-tier memory) -- so concurrent transfers sharing either memory split that
+memory's bandwidth; a kernel-launch event is a fixed, unshared wait.
 """
 
 from __future__ import annotations
@@ -157,15 +160,37 @@ class ResourceArbiter:
             rate = event.flops / event.compute_time
             demands.append(_Demand(("compute", id(device)), event.flops, rate))
         if event.bandwidth_time > 0 and event.bytes_read > 0:
-            if event.source_memory is not None:
-                memory = event.source_memory
-            elif event.phase == "transfer":
-                memory = device.second_tier_memory or device.first_tier_memory
-            else:
-                memory = device.first_tier_memory
             rate = event.bytes_read / event.bandwidth_time
-            demands.append(_Demand(("bandwidth", id(memory)), event.bytes_read, rate))
+            # A transfer occupies the bandwidth of *both* ends simultaneously, so
+            # contend it on the source memory it streams from and the destination
+            # it writes into; concurrent transfers sharing either memory split
+            # that memory's bandwidth. A compute event only reads its first tier.
+            seen: set[int] = set()
+            for memory in ResourceArbiter._bandwidth_memories(event, device):
+                if id(memory) in seen:
+                    continue
+                seen.add(id(memory))
+                demands.append(_Demand(("bandwidth", id(memory)), event.bytes_read, rate))
         return demands, 0.0
+
+    @staticmethod
+    def _bandwidth_memories(event: ComputeEvent, device) -> list:
+        """Memories whose bandwidth ``event`` consumes (source then destination).
+
+        A compute event reads only the device's first-tier memory. A transfer
+        streams from its ``source_memory`` (else the device's second/first tier)
+        *into* its ``destination_memory`` (else the device's first tier), and
+        occupies both ends' bandwidth for its duration.
+        """
+
+        if event.phase in ("transfer", "weight_transfer", "expert_transfer"):
+            if event.source_memory is not None:
+                source = event.source_memory
+            else:
+                source = device.second_tier_memory or device.first_tier_memory
+            destination = event.destination_memory or device.first_tier_memory
+            return [source, destination]
+        return [device.first_tier_memory]
 
     # --- co-simulation ------------------------------------------------------
 
@@ -385,6 +410,7 @@ class ResourceArbiter:
             start=start,
             end=end,
             source_memory=event.source_memory,
+            destination_memory=event.destination_memory,
         )
 
 

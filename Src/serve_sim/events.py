@@ -118,6 +118,11 @@ class ComputeEvent:
             the source memory the arbiter should contend the bandwidth on; left
             ``None`` for compute and for transfers whose source is the device's
             own second/first tier.
+        destination_memory: For a transfer, the memory the bytes are written
+            *into*. A transfer occupies the bandwidth of both ends, so the arbiter
+            contends this memory in addition to ``source_memory``. Left ``None``
+            for compute, and for transfers whose destination is the device's own
+            first-tier memory (the arbiter derives it in that case).
     """
 
     group_index: int
@@ -131,6 +136,7 @@ class ComputeEvent:
     start: float
     end: float
     source_memory: MemoryDevice | None = None
+    destination_memory: MemoryDevice | None = None
 
 
 @dataclass
@@ -666,6 +672,7 @@ class EventGenerator:
             start=start,
             end=start + duration,
             source_memory=self.devices[0].second_tier_memory,
+            destination_memory=self.devices[0].first_tier_memory,
         )
 
     def _build_shared_expert_transfer_event(
@@ -698,6 +705,7 @@ class EventGenerator:
             start=start,
             end=start + duration,
             source_memory=source,
+            destination_memory=self.devices[0].first_tier_memory,
         )
 
 

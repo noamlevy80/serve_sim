@@ -423,6 +423,7 @@ class EventRecord:
     start: float
     end: float
     rescaled: bool
+    destination_memory: str = ""  # name of the memory written into ("" if none)
 
 
 @dataclass(frozen=True)
@@ -1682,9 +1683,12 @@ class Simulator:
                     if 0 <= ev.device_index < len(device_names):
                         dev_name = device_names[ev.device_index]
                         mem_name = self._event_memory_name(devices[ev.device_index], ev)
+                        dst_name = self._event_destination_memory_name(
+                            devices[ev.device_index], ev)
                     else:
                         dev_name = ""
                         mem_name = ""
+                        dst_name = ""
                     result.events.append(
                         EventRecord(
                             job_index=job_index,
@@ -1704,6 +1708,7 @@ class Simulator:
                             start=ev.start,
                             end=ev.end,
                             rescaled=is_rescaled,
+                            destination_memory=dst_name,
                         )
                     )
                     # A routed-expert fetch streams to the whole engine (the
@@ -1928,6 +1933,22 @@ class Simulator:
                 return event.source_memory.name
             memory = device.second_tier_memory or device.first_tier_memory
             return memory.name
+        return device.first_tier_memory.name
+
+    @staticmethod
+    def _event_destination_memory_name(device: ComputeDevice, event: ComputeEvent) -> str:
+        """Name of the memory ``event`` wrote its bytes into, or ``""`` if none.
+
+        Mirrors the arbiter's destination-side bandwidth attribution: a transfer
+        writes into its explicit ``destination_memory`` when set, else the
+        device's first-tier memory. Compute and kernel-launch events have no
+        write destination.
+        """
+
+        if event.phase not in ("transfer", "weight_transfer", "expert_transfer"):
+            return ""
+        if event.destination_memory is not None:
+            return event.destination_memory.name
         return device.first_tier_memory.name
 
     def _job_footprint(
@@ -2339,7 +2360,7 @@ class Simulator:
                     group_index=-1, phase="weight_transfer", device_index=index,
                     flops=0.0, bytes_read=shard, compute_time=0.0,
                     bandwidth_time=d1, duration=d1, start=0.0, end=d1,
-                    source_memory=nvm))
+                    source_memory=nvm, destination_memory=ram))
             stage1_end = max((e.end for e in events), default=0.0)
             # Stage 2: each node's RAM -> its own devices (resident non-experts).
             dev_bytes = float(planner.streaming_footprint(pp, 0, 0, tp))
@@ -2353,7 +2374,8 @@ class Simulator:
                         group_index=-1, phase="weight_transfer", device_index=index,
                         flops=0.0, bytes_read=dev_bytes, compute_time=0.0,
                         bandwidth_time=d2, duration=d2, start=stage1_end,
-                        end=stage1_end + d2, source_memory=ram))
+                        end=stage1_end + d2, source_memory=ram,
+                        destination_memory=destination))
             return events
 
         source = self.system.input_memory
@@ -2371,7 +2393,8 @@ class Simulator:
                     group_index=-1, phase="weight_transfer", device_index=index,
                     flops=0.0, bytes_read=dev_bytes, compute_time=0.0,
                     bandwidth_time=duration, duration=duration, start=0.0,
-                    end=duration, source_memory=source))
+                    end=duration, source_memory=source,
+                    destination_memory=destination))
             return events
 
         weight_bytes = float(planner.footprint(pp, ep, 0, tp))
@@ -2394,6 +2417,7 @@ class Simulator:
                     start=0.0,
                     end=duration,
                     source_memory=source,
+                    destination_memory=destination,
                 )
             )
         return events
@@ -2573,6 +2597,7 @@ class Simulator:
                     start=0.0,
                     end=duration,
                     source_memory=source,
+                    destination_memory=destination,
                 )
             )
         return events
@@ -2724,10 +2749,11 @@ class Simulator:
         """Admit a standalone, arbiter-accounted KV offload transfer.
 
         Moves ``num_bytes`` of KV from ``device``'s first-tier memory to the
-        ``floating`` memory. The transfer contends the floating memory's bandwidth
-        (the binding resource for offload), so a slow floating tier surfaces as
-        contention on concurrent work; it holds no engine slot and does not delay
-        the served request, which has already retired.
+        ``floating`` memory. The transfer contends the bandwidth of both ends --
+        the device's first tier (source) and the floating memory (destination) --
+        so the slower end (typically the floating tier) surfaces as contention on
+        concurrent work; it holds no engine slot and does not delay the served
+        request, which has already retired.
         """
 
         if num_bytes <= 0:
@@ -2747,7 +2773,8 @@ class Simulator:
             duration=duration,
             start=0.0,
             end=duration,
-            source_memory=floating,
+            source_memory=device.first_tier_memory,
+            destination_memory=floating,
         )
         arbiter.admit_events([event], [device])
 
