@@ -133,6 +133,33 @@ def test_first_token_under_pdd_follows_prefill_and_transfer():
     assert rec.first_token_time < rec.completion_time
 
 
+def test_pdd_handoff_is_a_bandwidth_accounted_transfer():
+    """The prefill->decode KV handoff must obey the same physics as any move.
+
+    It is a real arbiter transfer (not a free clock delay): it appears in the
+    event log and its moved bytes are charged to the decode engine's memory it
+    writes into, so the move is visible in the per-memory bandwidth reports.
+    """
+
+    model = toy_model()
+    system = make_system(2)
+    g0, g1 = system.compute_devices
+    req = Request(0, model, prompt_tokens=48, output_tokens=4)
+
+    result = Simulator(system, StrategyConfig(allow_pdd=True, max_batch_size=1)).run([req])
+
+    handoffs = [e for e in result.events
+                if e.rescaled and e.job_phase == "kv_transfer"]
+    assert handoffs, "expected a logged prefill->decode KV handoff transfer"
+    # It streams from the prefill engine's memory into the decode engine's.
+    assert {e.memory for e in handoffs} == {f"{g0.name}-mem"}
+    assert {e.destination_memory for e in handoffs} == {f"{g1.name}-mem"}
+
+    # The decode engine's memory records the handoff's moved bytes.
+    summaries = {m["memory"]: m for m in memory_summaries(result)}
+    assert summaries[f"{g1.name}-mem"]["bytes_moved"] > 0
+
+
 # --- aggregate report -----------------------------------------------------------
 
 

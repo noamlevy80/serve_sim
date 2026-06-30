@@ -37,7 +37,7 @@ from .device_memory import DeviceHbmResidency, MemoryPolicy
 from .events import ComputeEvent, EventGenerator
 from .hardware import ComputeDevice
 from .parallelism import ParallelismPlanner
-from .pdd import context_kv_bytes, kv_transfer_duration, split_work
+from .pdd import context_kv_bytes, split_work
 from .placement import EnginePool, EngineSlot
 from .kv_store import KVCacheManager, Match
 from .shards import WorkShardGenerator
@@ -840,6 +840,13 @@ class Simulator:
             if self.strategy.global_kv_cache
             else None
         )
+        # Standalone KV-move jobs (offloads/spills and the PDD prefill->decode
+        # handoff) admitted to the arbiter outside the batch dispatch loop. They
+        # are not in ``job_meta`` (they serve no request and hold no engine
+        # slot), so their rescaled events are collected separately:
+        # ``(job_index, device, batch_index, job_phase)``. Reset per run by
+        # ``run`` / ``_run_pdd``.
+        self._aux_jobs: list[tuple[int, ComputeDevice, int, str]] = []
 
     def _build_groups(self) -> list[EngineGroup]:
         """Partition the system's compute devices into engine groups.
@@ -1174,6 +1181,7 @@ class Simulator:
             return self._run_pdd(requests, progress=progress)
 
         strategy = self.strategy
+        self._aux_jobs = []
         initial, next_of = _turn_chains(requests)
         arrivals = sorted(initial, key=lambda r: r.arrival_time)
         arrival_pos = 0
@@ -1382,13 +1390,18 @@ class Simulator:
         """
 
         strategy = self.strategy
+        self._aux_jobs = []
         initial, next_of = _turn_chains(requests)
         arrivals = sorted(initial, key=lambda r: r.arrival_time)
         arrival_pos = 0
         prefill_ready: list[Request] = []
         decode_ready: list[Request] = []
-        # Prefill done, KV transfer in flight: (request, decode_ready_time).
-        pending: list[tuple[Request, float]] = []
+        # Prefill done, KV handoff transfer in flight: (request, handoff job).
+        pending: list[tuple[Request, int]] = []
+        # Round-robins handoff destinations across the decode engines so parallel
+        # sequences land on distinct decode hardware (as their decode batches
+        # will), rather than all contending one representative memory.
+        handoff_rr = 0
         prefill_window: float | None = None
         decode_window: float | None = None
 
@@ -1414,21 +1427,12 @@ class Simulator:
         meta: dict[int, tuple[float, int, tuple[str, ...]]] = {}
         result = RunResult()
 
-        prefill_rep = self._prefill_pool.slots[0].devices[0]
-        decode_rep = self._decode_pool.slots[0].devices[0]
-
         def report(now: float) -> None:
             if progress is not None:
                 avg_tps, avg_ttft = _running_averages(result.records)
                 progress(RunProgress(len(result.records), total, now,
                                      time.perf_counter() - start_wall,
                                      avg_tps, avg_ttft))
-
-        def transfer_ready_time(req: Request, prefill_end: float) -> float:
-            kv_bytes = context_kv_bytes(req.model, req.prompt_tokens)
-            return prefill_end + kv_transfer_duration(
-                kv_bytes, prefill_rep, decode_rep, self.system
-            )
 
         def next_arrival_time() -> float | None:
             if arrival_pos < len(arrivals):
@@ -1448,8 +1452,9 @@ class Simulator:
                 deadline = decode_window + strategy.max_window_duration
                 if deadline > arbiter.time:
                     candidates.append(deadline)
-            for _, ready_time in pending:
-                if ready_time > arbiter.time:
+            for _req, handoff in pending:
+                ready_time = arbiter.job_end_time(handoff)
+                if ready_time is not None and ready_time > arbiter.time:
                     candidates.append(ready_time)
             ne = arbiter.next_event_time()
             if ne is not None:
@@ -1474,10 +1479,25 @@ class Simulator:
                 pool.release(slot)
                 self._free_reservation(slot, job_index)
                 if kind == "prefill":
-                    # KV handoff: schedule each sequence for decode after its
-                    # transfer completes (the sequence stays "in flight").
+                    # KV handoff: move each sequence's KV from the prefill engine
+                    # to a decode engine as a real, bandwidth-contended transfer;
+                    # the sequence enters the decode queue once it completes.
+                    decode_slots = self._decode_pool.slots
                     for req in reqs:
-                        pending.append((req, transfer_ready_time(req, end)))
+                        _, b_index, _ = meta[id(req)]
+                        kv_bytes = context_kv_bytes(req.model, req.prompt_tokens)
+                        dst = decode_slots[handoff_rr % len(decode_slots)].devices[0]
+                        handoff_rr += 1
+                        handoff = self._admit_pdd_handoff(
+                            arbiter, slot.devices[0], dst, kv_bytes,
+                            batch_index=b_index,
+                        )
+                        if handoff is None:
+                            decode_ready.append(req)
+                            if decode_window is None:
+                                decode_window = now
+                            continue
+                        pending.append((req, handoff))
                 else:  # decode complete -> request done
                     in_flight -= len(reqs)
                     first_token_time = _first_token_end(
@@ -1522,15 +1542,15 @@ class Simulator:
                 if prefill_window is None:
                     prefill_window = now
 
-            # 3) Move transferred sequences into the decode queue.
-            still_pending: list[tuple[Request, float]] = []
-            for req, ready_time in pending:
-                if ready_time <= now:
+            # 3) Move handed-off sequences into the decode queue.
+            still_pending: list[tuple[Request, int]] = []
+            for req, handoff in pending:
+                if arbiter.job_is_done(handoff):
                     decode_ready.append(req)
                     if decode_window is None:
                         decode_window = now
                 else:
-                    still_pending.append((req, ready_time))
+                    still_pending.append((req, handoff))
             pending = still_pending
 
             progressed = False
@@ -1777,6 +1797,42 @@ class Simulator:
                     model=model_name,
                 )
             )
+
+        # Standalone KV-move jobs (offloads/spills) serve no request and hold no
+        # engine slot, so they never entered ``job_meta``. Record their rescaled
+        # (and isolated) events here so the memories they touch -- the device's
+        # first tier they read from and the floating memory they write into --
+        # show the bandwidth that grows the floating memory's occupancy. They
+        # reserve no long-lived footprint, so they produce no ``JobRecord``.
+        for job_index, device, b_index, aux_phase in self._aux_jobs:
+            device_name = device.name
+            original = arbiter.job_original_events(job_index)
+            rescaled = arbiter.job_rescaled_events(job_index)
+            for events, is_rescaled in ((original, False), (rescaled, True)):
+                for ev in events:
+                    result.events.append(
+                        EventRecord(
+                            job_index=job_index,
+                            batch_index=b_index,
+                            job_phase=aux_phase,
+                            request_ids=(),
+                            group_index=ev.group_index,
+                            phase=ev.phase,
+                            device=device_name,
+                            memory=self._event_memory_name(device, ev),
+                            model="",
+                            flops=ev.flops,
+                            bytes_read=ev.bytes_read,
+                            compute_time=ev.compute_time,
+                            bandwidth_time=ev.bandwidth_time,
+                            duration=ev.duration,
+                            start=ev.start,
+                            end=ev.end,
+                            rescaled=is_rescaled,
+                            destination_memory=self._event_destination_memory_name(
+                                device, ev),
+                        )
+                    )
 
         for record in result.records:
             if record.request_id in first_token:
@@ -2673,7 +2729,8 @@ class Simulator:
         # source of each spill move.
         for spilled in store.spilled:
             self._admit_kv_move(
-                arbiter, slot.devices[0], spilled.memory, spilled.num_bytes)
+                arbiter, slot.devices[0], spilled.memory, spilled.num_bytes,
+                batch_index)
             result.decisions.append(_decision(
                 now, "kv_transfer", req, (spilled.memory.name,), batch_index,
                 tokens=spilled.context_tokens,
@@ -2690,7 +2747,8 @@ class Simulator:
             id(slot.devices[0]) in self._hbm
         )
         if not retained_on_device:
-            self._admit_kv_move(arbiter, slot.devices[0], store.memory, store.num_bytes)
+            self._admit_kv_move(
+                arbiter, slot.devices[0], store.memory, store.num_bytes, batch_index)
         result.decisions.append(_decision(
             now, "kv_transfer", req, (store.memory.name,), batch_index,
             tokens=context_tokens, source_request_id=req.request_id,
@@ -2718,7 +2776,8 @@ class Simulator:
         spilled, dropped = self._kv.spill_residents(residents, now)
         source_device = slot.devices[0]
         for entry in spilled:
-            self._admit_kv_move(arbiter, source_device, entry.memory, entry.num_bytes)
+            self._admit_kv_move(
+                arbiter, source_device, entry.memory, entry.num_bytes, batch_index)
         if result is None:
             return
         for entry in spilled:
@@ -2745,6 +2804,7 @@ class Simulator:
         device,
         floating,
         num_bytes: float,
+        batch_index: int = -1,
     ) -> None:
         """Admit a standalone, arbiter-accounted KV offload transfer.
 
@@ -2753,7 +2813,10 @@ class Simulator:
         the device's first tier (source) and the floating memory (destination) --
         so the slower end (typically the floating tier) surfaces as contention on
         concurrent work; it holds no engine slot and does not delay the served
-        request, which has already retired.
+        request, which has already retired. The job is registered in
+        ``self._aux_jobs`` so ``_collect_outputs`` records its rescaled event in
+        the log -- otherwise the floating memory's occupancy would grow with no
+        matching bandwidth.
         """
 
         if num_bytes <= 0:
@@ -2776,7 +2839,54 @@ class Simulator:
             source_memory=device.first_tier_memory,
             destination_memory=floating,
         )
-        arbiter.admit_events([event], [device])
+        job_index = arbiter.admit_events([event], [device])
+        self._aux_jobs.append((job_index, device, batch_index, "kv_offload"))
+
+    def _admit_pdd_handoff(
+        self,
+        arbiter: IncrementalArbiter,
+        source: ComputeDevice,
+        destination: ComputeDevice,
+        num_bytes: float,
+        batch_index: int = -1,
+    ) -> int | None:
+        """Admit the prefill->decode KV handoff as an arbiter-accounted transfer.
+
+        A disaggregated sequence's KV must move from the prefill engine's
+        first-tier memory to the decode engine's first-tier memory before decode
+        can begin. Modelling it as a real transfer event -- rather than a fixed
+        clock delay -- makes it obey the same physics as every other move: it
+        contends the bandwidth of both ends, so concurrent handoffs sharing a
+        memory slow each other down, and the moved bytes surface in the
+        per-memory bandwidth reports. The job holds no engine slot and reserves
+        no footprint; the sequence is gated into the decode queue on its
+        completion. Returns the job index, or ``None`` when there is nothing to
+        move.
+        """
+
+        if num_bytes <= 0:
+            return None
+        src_mem = source.first_tier_memory
+        dst_mem = destination.first_tier_memory
+        link = self.system.link_between(src_mem, dst_mem)
+        duration = transfer_duration(num_bytes, src_mem, dst_mem, link)
+        event = ComputeEvent(
+            group_index=-1,
+            phase="transfer",
+            device_index=0,
+            flops=0.0,
+            bytes_read=num_bytes,
+            compute_time=0.0,
+            bandwidth_time=duration,
+            duration=duration,
+            start=0.0,
+            end=duration,
+            source_memory=src_mem,
+            destination_memory=dst_mem,
+        )
+        job_index = arbiter.admit_events([event], [source])
+        self._aux_jobs.append((job_index, source, batch_index, "kv_transfer"))
+        return job_index
 
     @staticmethod
     def _eviction_decision(now: float, entry) -> DecisionRecord:

@@ -231,6 +231,39 @@ def test_completion_records_kv_offload_transfer():
     assert offloads[0].source_devices == ("g0",)
 
 
+def test_kv_offload_is_accounted_as_bandwidth_on_the_node_memory():
+    """A KV offload must show up as moved bytes on its destination node memory.
+
+    Regression: the offload was admitted to the arbiter but never collected into
+    the event log, so the floating memory's occupancy grew while its recorded
+    bandwidth (``bytes_moved``) stayed at zero. Every byte that lands on a node
+    memory must be backed by a logged transfer event.
+    """
+
+    from serve_sim.report import memory_summaries
+
+    model = toy_model()
+    system = make_kv_system([80e9])
+    req = request_from_messages(0, model, [dict(SYSTEM), dict(USER)], workload_id=0)
+
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run([req])
+
+    # The decision says KV landed on the node; the bandwidth report must agree.
+    summaries = {m["memory"]: m for m in memory_summaries(result)}
+    node = summaries["node-0"]
+    assert node["bytes_moved"] > 0, (
+        "node memory gained KV occupancy but recorded no transfer bandwidth"
+    )
+
+    # The offload is a logged transfer event whose destination is the node memory.
+    offload_events = [
+        e for e in result.events
+        if e.rescaled and e.job_phase == "kv_offload"
+        and e.destination_memory == "node-0"
+    ]
+    assert offload_events, "expected a logged kv_offload event into node memory"
+
+
 def test_cross_conversation_reuse_is_recorded():
     model = toy_model()
     system = make_kv_system([80e9])
