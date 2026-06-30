@@ -5,8 +5,9 @@ Usage::
     python -m serve_sim CONFIG [--output-root DIR] [--run-id ID]
                                [--tokenizer {tiktoken,whitespace}] [--quiet]
 
-Writes the raw outputs under ``<output-root>/<run-id>/``, reports progress as
-sequences complete, and prints a short summary of the run.
+Writes the raw outputs under ``<output-root>/<run-id>/``, prints a log of
+arrival/issue/completion milestones as the run progresses (or, with ``--quiet``,
+a simple sequences-done progress bar), and a short summary of the run.
 """
 
 from __future__ import annotations
@@ -16,7 +17,12 @@ import sys
 from typing import Sequence
 
 from .report import summarize
-from .runner import BuildProgressReporter, ProgressReporter, run_from_config
+from .runner import (
+    BuildProgressReporter,
+    EventLogReporter,
+    ProgressReporter,
+    run_from_config,
+)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -44,7 +50,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--quiet",
         action="store_true",
-        help="Suppress the per-progress sequence/time updates.",
+        help="Replace the per-milestone log with a simple sequences-done progress bar.",
     )
     args = parser.parse_args(argv)
 
@@ -54,8 +60,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         tokenizer = _make_tokenizer(args.tokenizer)
 
-    progress = None if args.quiet else ProgressReporter()
-    build_progress = None if args.quiet else BuildProgressReporter()
+    # Default: an append-only log of arrival/issue/completion milestones.
+    # ``--quiet``: revert to the in-place sequences-done progress bar.
+    progress = ProgressReporter() if args.quiet else None
+    events = None if args.quiet else EventLogReporter()
+    build_progress = BuildProgressReporter()
     result, out_dir = run_from_config(
         args.config,
         output_root=args.output_root,
@@ -63,6 +72,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tokenizer=tokenizer,
         progress=progress,
         build_progress=build_progress,
+        events=events,
         verbose=not args.quiet,
     )
 

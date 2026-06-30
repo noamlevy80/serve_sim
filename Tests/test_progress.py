@@ -16,8 +16,13 @@ import pytest
 
 from serve_sim.hardware import ComputeDevice, MemoryDevice
 from serve_sim.model import toy_model
-from serve_sim.orchestrator import Request, RunProgress, Simulator, StrategyConfig
-from serve_sim.runner import BuildProgress, BuildProgressReporter, ProgressReporter
+from serve_sim.orchestrator import Request, RunEvent, RunProgress, Simulator, StrategyConfig
+from serve_sim.runner import (
+    BuildProgress,
+    BuildProgressReporter,
+    EventLogReporter,
+    ProgressReporter,
+)
 from serve_sim.system import Network, Node, System
 
 
@@ -165,3 +170,95 @@ def test_build_progress_reporter_throttles_intermediate_updates():
     reporter(BuildProgress(workloads_done=3, workloads_total=3,
                            requests_built=5, wall_time=0.3))
     assert "3/3 workloads" in stream.getvalue()
+
+
+def test_run_emits_arrival_issue_completion_events():
+    model = toy_model()
+    system = make_system(1)
+    reqs = [Request(i, model, 32, 4) for i in range(3)]
+
+    seen: list[RunEvent] = []
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run(
+        reqs, events=seen.append
+    )
+
+    kinds = {e.kind for e in seen}
+    assert kinds == {"arrival", "issue", "completion"}
+    # Every sequence arrives, is issued and completes.
+    arrivals = [e for e in seen if e.kind == "arrival"]
+    issues = [e for e in seen if e.kind == "issue"]
+    completions = [e for e in seen if e.kind == "completion"]
+    assert len(arrivals) == 3
+    assert len(issues) == 3  # max_batch_size=1 -> one batch per sequence
+    assert len(completions) == len(result.records) == 3
+    # Arrival carries token counts; completion carries timing.
+    assert all(e.prompt_tokens == 32 and e.output_tokens == 4 for e in arrivals)
+    assert all(e.queue_delay is not None for e in completions)
+    # Issue carries a batch id, members and an engine-group label.
+    assert all(e.engine_group and e.members for e in issues)
+
+
+def test_run_events_completed_count_is_monotonic():
+    model = toy_model()
+    system = make_system(2)
+    reqs = [Request(i, model, 48, 4, arrival_time=i * 0.1) for i in range(4)]
+
+    seen: list[RunEvent] = []
+    Simulator(system, StrategyConfig(max_batch_size=1)).run(reqs, events=seen.append)
+
+    completed = [e.completed for e in seen]
+    assert completed == sorted(completed)
+    assert seen[-1].completed == 4
+    assert all(e.total == 4 for e in seen)
+
+
+def test_run_events_under_pdd():
+    model = toy_model()
+    system = make_system(2)
+    reqs = [Request(i, model, 48, 4) for i in range(3)]
+
+    seen: list[RunEvent] = []
+    Simulator(system, StrategyConfig(allow_pdd=True, max_batch_size=1)).run(
+        reqs, events=seen.append
+    )
+
+    # PDD issues each sequence twice (prefill then decode) but completes once.
+    phases = {e.phase for e in seen if e.kind == "issue"}
+    assert phases == {"prefill", "decode"}
+    assert len([e for e in seen if e.kind == "completion"]) == 3
+
+
+def test_event_log_reporter_formats_each_milestone():
+    stream = io.StringIO()
+    reporter = EventLogReporter(stream=stream)
+
+    reporter(RunEvent(kind="arrival", sim_time=1.0, wall_time=0.1,
+                      completed=0, total=3, sequence="w0t0",
+                      prompt_tokens=32, output_tokens=4))
+    reporter(RunEvent(kind="issue", sim_time=1.5, wall_time=0.2,
+                      completed=0, total=3, batch_index=0,
+                      members=("w0t0",), engine_group="g0"))
+    reporter(RunEvent(kind="completion", sim_time=2.0, wall_time=0.3,
+                      completed=1, total=3, sequence="w0t0",
+                      queue_delay=0.5, ttft=0.7, tps=12.5))
+
+    out = stream.getvalue()
+    lines = out.strip().splitlines()
+    assert len(lines) == 3  # one line per milestone (append-only log)
+    assert "ARRIVE" in out and "w0t0" in out and "in=32" in out
+    assert "ISSUE" in out and "batch#0" in out and "g0" in out
+    assert "DONE" in out and "ttft=" in out and "tps=12.5" in out
+    assert "sim" in out and "wall" in out
+
+
+def test_event_log_reporter_handles_missing_metrics():
+    stream = io.StringIO()
+    reporter = EventLogReporter(stream=stream)
+
+    reporter(RunEvent(kind="completion", sim_time=2.0, wall_time=0.3,
+                      completed=1, total=1, sequence="w0t0",
+                      queue_delay=0.0, ttft=None, tps=None))
+
+    out = stream.getvalue()
+    assert "ttft=-" in out and "tps=-" in out
+

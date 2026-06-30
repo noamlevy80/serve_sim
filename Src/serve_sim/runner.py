@@ -37,6 +37,8 @@ from .orchestrator import (
     ParallelismSection,
     ProgressCallback,
     Request,
+    RunEvent,
+    RunEventCallback,
     RunProgress,
     RunResult,
     Simulator,
@@ -85,6 +87,52 @@ class ProgressReporter:
         self._stream.write("\r" + line.ljust(80))
         if done:
             self._stream.write("\n")
+        self._stream.flush()
+
+
+def _fmt_secs(value: float | None) -> str:
+    """Format an optional duration in seconds, or ``-`` when unknown."""
+
+    return f"{value:.4g}s" if value is not None else "-"
+
+
+class EventLogReporter:
+    """A :data:`RunEventCallback` that prints one log line per milestone.
+
+    Unlike the in-place :class:`ProgressReporter` progress bar, this emits an
+    append-only log: every sequence arrival, batch issue and sequence completion
+    is printed on its own line, each prefixed with the simulation clock and the
+    elapsed wall-clock time.
+    """
+
+    def __init__(self, stream: TextIO | None = None) -> None:
+        self._stream = stream if stream is not None else sys.stderr
+
+    def __call__(self, event: RunEvent) -> None:
+        prefix = (
+            f"[sim {event.sim_time:11.3f}s  wall {event.wall_time:8.3f}s]"
+            f"  {event.completed:>5}/{event.total}  "
+        )
+        if event.kind == "arrival":
+            body = (
+                f"ARRIVE  {event.sequence:<8}  "
+                f"in={event.prompt_tokens} out={event.output_tokens}"
+            )
+        elif event.kind == "issue":
+            phase = f" {event.phase}" if event.phase else ""
+            members = " ".join(event.members)
+            body = (
+                f"ISSUE   batch#{event.batch_index}{phase} -> "
+                f"{event.engine_group}  [{members}]"
+            )
+        else:  # completion
+            tps = f"{event.tps:.1f}" if event.tps is not None else "-"
+            body = (
+                f"DONE    {event.sequence:<8}  "
+                f"queue={_fmt_secs(event.queue_delay)} "
+                f"ttft={_fmt_secs(event.ttft)} tps={tps}"
+            )
+        self._stream.write(prefix + body + "\n")
         self._stream.flush()
 
 
@@ -334,6 +382,7 @@ def run_from_config(
     tokenizer: Tokenizer | None = None,
     progress: ProgressCallback | None = None,
     build_progress: BuildProgressCallback | None = None,
+    events: RunEventCallback | None = None,
     verbose: bool = False,
 ) -> tuple[RunResult, Path]:
     """Run a simulation described by ``config_path`` and write its outputs.
@@ -342,7 +391,9 @@ def run_from_config(
     :class:`~serve_sim.orchestrator.RunProgress` as sequences complete (see
     :class:`ProgressReporter` for a printing implementation). If ``build_progress``
     is given it is called with a :class:`BuildProgress` as the suite's turns are
-    tokenized into requests (see :class:`BuildProgressReporter`).
+    tokenized into requests (see :class:`BuildProgressReporter`). If ``events`` is
+    given it is called with a :class:`~serve_sim.orchestrator.RunEvent` at each
+    arrival/issue/completion milestone (see :class:`EventLogReporter`).
 
     Returns the :class:`RunResult` and the output directory that was written.
     """
@@ -378,7 +429,9 @@ def run_from_config(
         progress=build_progress,
     )
 
-    result = Simulator(system, strategy).run(requests, progress=progress)
+    result = Simulator(system, strategy).run(
+        requests, progress=progress, events=events
+    )
 
     timestamp = f"run-{datetime.now():%Y%m%d-%H%M%S}"
     label = run_id or cfg.get("run_id")

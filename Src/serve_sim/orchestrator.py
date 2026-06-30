@@ -575,6 +575,63 @@ class RunProgress:
 ProgressCallback = Callable[["RunProgress"], None]
 
 
+@dataclass(frozen=True)
+class RunEvent:
+    """A single milestone in the run log: a sequence arriving in the queue, a
+    batch being issued to an engine group, or a sequence completing.
+
+    Every event carries the simulation clock (``sim_time``) and the real time
+    elapsed since the run started (``wall_time``), plus the running done/total
+    sequence count. The remaining fields are populated per ``kind``:
+
+    - ``"arrival"``: ``sequence`` (the ``w<workload>t<turn>`` id), ``prompt_tokens``
+      and ``output_tokens`` of the arriving sequence.
+    - ``"issue"``: ``batch_index`` (the batch id), ``members`` (the sequence ids
+      in the batch), ``engine_group`` (first device + rank count, e.g. ``g0x4``)
+      and ``phase`` (``"prefill"``/``"decode"`` under PDD, else empty).
+    - ``"completion"``: ``sequence`` plus the retired sequence's ``queue_delay``,
+      ``ttft`` and decode ``tps``.
+    """
+
+    kind: str
+    sim_time: float
+    wall_time: float
+    completed: int
+    total: int
+    sequence: str = ""
+    prompt_tokens: int = 0
+    output_tokens: int = 0
+    batch_index: int = -1
+    members: tuple[str, ...] = ()
+    engine_group: str = ""
+    phase: str = ""
+    queue_delay: float | None = None
+    ttft: float | None = None
+    tps: float | None = None
+
+
+# Called with a :class:`RunEvent` at each arrival/issue/completion milestone.
+RunEventCallback = Callable[["RunEvent"], None]
+
+
+def _seq_label(workload_id: int | None, turn_index: int | None, request_id: int) -> str:
+    """Sequence id as ``w<workload>t<turn>``, or ``r<request_id>`` if standalone."""
+
+    if workload_id is not None and turn_index is not None and workload_id >= 0:
+        return f"w{workload_id}t{turn_index}"
+    return f"r{request_id}"
+
+
+def _engine_group_label(device_names: Sequence[str]) -> str:
+    """Engine-group label as first device + rank count (e.g. ``g0x4``)."""
+
+    if not device_names:
+        return ""
+    if len(device_names) == 1:
+        return device_names[0]
+    return f"{device_names[0]}x{len(device_names)}"
+
+
 def _running_averages(records: Sequence["RequestRecord"]) -> tuple[float | None, float | None]:
     """Running mean decode TPS and TTFT over the retired records (skip ``None``)."""
 
@@ -1169,16 +1226,22 @@ class Simulator:
         return worst
 
     def run(
-        self, requests: list[Request], *, progress: ProgressCallback | None = None
+        self,
+        requests: list[Request],
+        *,
+        progress: ProgressCallback | None = None,
+        events: RunEventCallback | None = None,
     ) -> RunResult:
         """Event-driven serving loop over ``requests``; returns per-request timing.
 
         If ``progress`` is given it is called with a :class:`RunProgress` each time
-        the run retires one or more sequences (and once when it finishes).
+        the run retires one or more sequences (and once when it finishes). If
+        ``events`` is given it is called with a :class:`RunEvent` at each
+        arrival/issue/completion milestone.
         """
 
         if self.strategy.allow_pdd:
-            return self._run_pdd(requests, progress=progress)
+            return self._run_pdd(requests, progress=progress, events=events)
 
         strategy = self.strategy
         self._aux_jobs = []
@@ -1204,6 +1267,40 @@ class Simulator:
                 progress(RunProgress(len(result.records), total, now,
                                      time.perf_counter() - start_wall,
                                      avg_tps, avg_ttft))
+
+        def emit_arrival(req: Request, now: float) -> None:
+            if events is not None:
+                events(RunEvent(
+                    kind="arrival", sim_time=now,
+                    wall_time=time.perf_counter() - start_wall,
+                    completed=len(result.records), total=total,
+                    sequence=_seq_label(req.workload_id, req.turn_index, req.request_id),
+                    prompt_tokens=req.prompt_tokens, output_tokens=req.output_tokens))
+
+        def emit_issue(
+            now: float, b_index: int, batch: Sequence[Request],
+            device_names: Sequence[str], phase: str = "",
+        ) -> None:
+            if events is not None:
+                events(RunEvent(
+                    kind="issue", sim_time=now,
+                    wall_time=time.perf_counter() - start_wall,
+                    completed=len(result.records), total=total,
+                    batch_index=b_index,
+                    members=tuple(
+                        _seq_label(r.workload_id, r.turn_index, r.request_id)
+                        for r in batch),
+                    engine_group=_engine_group_label(device_names), phase=phase))
+
+        def emit_completion(record: RequestRecord, now: float) -> None:
+            if events is not None:
+                events(RunEvent(
+                    kind="completion", sim_time=now,
+                    wall_time=time.perf_counter() - start_wall,
+                    completed=len(result.records), total=total,
+                    sequence=_seq_label(
+                        record.workload_id, record.turn_index, record.request_id),
+                    queue_delay=record.queue_delay, ttft=record.ttft, tps=record.tps))
 
         # job_index -> (requests, dispatch_time, batch_index, slot, pool)
         jobs: dict[
@@ -1262,20 +1359,20 @@ class Simulator:
                     arbiter.job_rescaled_events(job_index)
                 )
                 for req in reqs:
-                    result.records.append(
-                        RequestRecord(
-                            request_id=req.request_id,
-                            arrival_time=req.arrival_time,
-                            dispatch_time=dispatch_time,
-                            completion_time=end,
-                            prompt_tokens=req.prompt_tokens,
-                            output_tokens=req.output_tokens,
-                            batch_index=b_index,
-                            first_token_time=first_token_time,
-                            workload_id=req.workload_id,
-                            turn_index=req.turn_index,
-                        )
+                    record = RequestRecord(
+                        request_id=req.request_id,
+                        arrival_time=req.arrival_time,
+                        dispatch_time=dispatch_time,
+                        completion_time=end,
+                        prompt_tokens=req.prompt_tokens,
+                        output_tokens=req.output_tokens,
+                        batch_index=b_index,
+                        first_token_time=first_token_time,
+                        workload_id=req.workload_id,
+                        turn_index=req.turn_index,
                     )
+                    result.records.append(record)
+                    emit_completion(record, now)
                     # Offload this turn's KV to floating memory so a later
                     # sequence can reuse its prefix (evicting LRU if the floating
                     # pool is full).
@@ -1287,7 +1384,9 @@ class Simulator:
                     # done (it arrives the instant its predecessor completes).
                     follow_on = next_of.get((req.workload_id, req.turn_index))
                     if follow_on is not None:
-                        ready.append(replace(follow_on, arrival_time=end))
+                        arrived = replace(follow_on, arrival_time=end)
+                        ready.append(arrived)
+                        emit_arrival(arrived, now)
                         if window_open is None:
                             window_open = now
             if len(result.records) != completed_before:
@@ -1295,7 +1394,9 @@ class Simulator:
 
             # 2) Admit arrivals that have occurred by ``now``.
             while arrival_pos < len(arrivals) and arrivals[arrival_pos].arrival_time <= now:
-                ready.append(arrivals[arrival_pos])
+                arrived = arrivals[arrival_pos]
+                ready.append(arrived)
+                emit_arrival(arrived, now)
                 arrival_pos += 1
                 if window_open is None:
                     window_open = now
@@ -1353,6 +1454,7 @@ class Simulator:
                         now, "decode", req, device_names, batch_index,
                         tokens=req.output_tokens,
                         batch_members=members))
+                emit_issue(now, batch_index, batch, device_names)
                 jobs[job_index] = (batch, now, batch_index, slot, group.pool)
                 job_meta[job_index] = ("full", batch, slot, batch_index, pp, ep, tp)
                 batch_index += 1
@@ -1378,7 +1480,11 @@ class Simulator:
         return result
 
     def _run_pdd(
-        self, requests: list[Request], *, progress: ProgressCallback | None = None
+        self,
+        requests: list[Request],
+        *,
+        progress: ProgressCallback | None = None,
+        events: RunEventCallback | None = None,
     ) -> RunResult:
         """Two-phase PDD loop: prefill pool -> KV transfer -> decode pool.
 
@@ -1433,6 +1539,40 @@ class Simulator:
                 progress(RunProgress(len(result.records), total, now,
                                      time.perf_counter() - start_wall,
                                      avg_tps, avg_ttft))
+
+        def emit_arrival(req: Request, now: float) -> None:
+            if events is not None:
+                events(RunEvent(
+                    kind="arrival", sim_time=now,
+                    wall_time=time.perf_counter() - start_wall,
+                    completed=len(result.records), total=total,
+                    sequence=_seq_label(req.workload_id, req.turn_index, req.request_id),
+                    prompt_tokens=req.prompt_tokens, output_tokens=req.output_tokens))
+
+        def emit_issue(
+            now: float, b_index: int, batch: Sequence[Request],
+            device_names: Sequence[str], phase: str,
+        ) -> None:
+            if events is not None:
+                events(RunEvent(
+                    kind="issue", sim_time=now,
+                    wall_time=time.perf_counter() - start_wall,
+                    completed=len(result.records), total=total,
+                    batch_index=b_index,
+                    members=tuple(
+                        _seq_label(r.workload_id, r.turn_index, r.request_id)
+                        for r in batch),
+                    engine_group=_engine_group_label(device_names), phase=phase))
+
+        def emit_completion(record: RequestRecord, now: float) -> None:
+            if events is not None:
+                events(RunEvent(
+                    kind="completion", sim_time=now,
+                    wall_time=time.perf_counter() - start_wall,
+                    completed=len(result.records), total=total,
+                    sequence=_seq_label(
+                        record.workload_id, record.turn_index, record.request_id),
+                    queue_delay=record.queue_delay, ttft=record.ttft, tps=record.tps))
 
         def next_arrival_time() -> float | None:
             if arrival_pos < len(arrivals):
@@ -1505,20 +1645,20 @@ class Simulator:
                     )
                     for req in reqs:
                         dispatch_time, b_index, _ = meta[id(req)]
-                        result.records.append(
-                            RequestRecord(
-                                request_id=req.request_id,
-                                arrival_time=req.arrival_time,
-                                dispatch_time=dispatch_time,
-                                completion_time=end,
-                                prompt_tokens=req.prompt_tokens,
-                                output_tokens=req.output_tokens,
-                                batch_index=b_index,
-                                first_token_time=first_token_time,
-                                workload_id=req.workload_id,
-                                turn_index=req.turn_index,
-                            )
+                        record = RequestRecord(
+                            request_id=req.request_id,
+                            arrival_time=req.arrival_time,
+                            dispatch_time=dispatch_time,
+                            completion_time=end,
+                            prompt_tokens=req.prompt_tokens,
+                            output_tokens=req.output_tokens,
+                            batch_index=b_index,
+                            first_token_time=first_token_time,
+                            workload_id=req.workload_id,
+                            turn_index=req.turn_index,
                         )
+                        result.records.append(record)
+                        emit_completion(record, now)
                         # Offload this turn's KV to floating memory for later
                         # cross-conversation prefix reuse (evicting LRU if full).
                         if self._kv_active:
@@ -1529,7 +1669,9 @@ class Simulator:
                         # is done; it enters the prefill queue for its turn.
                         follow_on = next_of.get((req.workload_id, req.turn_index))
                         if follow_on is not None:
-                            prefill_ready.append(replace(follow_on, arrival_time=end))
+                            arrived = replace(follow_on, arrival_time=end)
+                            prefill_ready.append(arrived)
+                            emit_arrival(arrived, now)
                             if prefill_window is None:
                                 prefill_window = now
             if len(result.records) != completed_before:
@@ -1537,7 +1679,9 @@ class Simulator:
 
             # 2) Admit arrivals into the prefill queue.
             while arrival_pos < len(arrivals) and arrivals[arrival_pos].arrival_time <= now:
-                prefill_ready.append(arrivals[arrival_pos])
+                arrived = arrivals[arrival_pos]
+                prefill_ready.append(arrived)
+                emit_arrival(arrived, now)
                 arrival_pos += 1
                 if prefill_window is None:
                     prefill_window = now
@@ -1606,6 +1750,7 @@ class Simulator:
                             source_devices=device_names))
                 jobs[job_index] = ("prefill", batch, slot, self._prefill_pool)
                 job_meta[job_index] = ("prefill", batch, slot, batch_index, pp, ep, tp)
+                emit_issue(now, batch_index, batch, device_names, "prefill")
                 batch_index += 1
                 progressed = True
             if not prefill_ready:
@@ -1649,6 +1794,7 @@ class Simulator:
                         batch_members=members))
                 jobs[job_index] = ("decode", batch, slot, self._decode_pool)
                 job_meta[job_index] = ("decode", batch, slot, batch_index, pp, ep, tp)
+                emit_issue(now, batch_index, batch, device_names, "decode")
                 batch_index += 1
                 progressed = True
             if not decode_ready:
