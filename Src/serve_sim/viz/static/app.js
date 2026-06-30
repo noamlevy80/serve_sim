@@ -62,7 +62,28 @@ async function boot() {
   setupTabs();
   setupControls();
   await setupRunPicker();
-  window.addEventListener("resize", () => { renderGrid(); renderWorkload(); });
+  syncTimelineLeftOffset();
+  window.addEventListener("resize", () => {
+    syncTimelineLeftOffset();
+    renderGrid();
+    renderWorkload();
+  });
+}
+
+// Pin the graph-selection panel just below the sticky controls bar. The bar's
+// height varies with font/zoom, so measuring it (instead of hard-coding a top)
+// keeps the panel's first row from sliding under the bar when the page scrolls.
+function syncTimelineLeftOffset() {
+  const left = document.querySelector(".timeline-left");
+  const controls = document.querySelector(".controls");
+  if (!left || !controls) return;
+  // The controls bar has no height while the timeline tab is hidden; skip then
+  // so we don't pin the panel using a bogus (zero) measurement.
+  if (!controls.offsetHeight) return;
+  const controlsTop = parseFloat(getComputedStyle(controls).top) || 0;
+  const offset = controlsTop + controls.offsetHeight + 8;
+  left.style.top = `${offset}px`;
+  left.style.maxHeight = `calc(100vh - ${offset + 14}px)`;
 }
 
 // Fetch a run's view model (the default when ``run`` is null) and (re)render.
@@ -115,7 +136,7 @@ function setupTabs() {
       document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
       btn.classList.add("active");
       document.getElementById(btn.dataset.tab).classList.add("active");
-      if (btn.dataset.tab === "timeline") renderGrid();
+      if (btn.dataset.tab === "timeline") { syncTimelineLeftOffset(); renderGrid(); }
       if (btn.dataset.tab === "workload") renderWorkload();
     });
   });

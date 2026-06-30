@@ -723,6 +723,30 @@ def test_memory_timeline_content_decomposes_occupancy():
     )
 
 
+def test_memory_timeline_eviction_object_tracks_departed_kv_band():
+    # When a batch completes its first-tier "KV B<n>" band leaves the occupancy
+    # stack; the eviction-object series records that removal (the user-visible
+    # case of KV being freed from device HBM) even with no kv_eviction decision.
+    model = toy_model()
+    system = make_system(1)
+    # Two batches run back to back on the one device, so the first batch's KV
+    # band departs while the second runs.
+    reqs = [Request(i, model, 64, 8, workload_id=0, turn_index=i) for i in range(2)]
+    result = Simulator(system, StrategyConfig(max_batch_size=1)).run(reqs)
+
+    rows = [r for r in memory_timeline(result, 64) if r["role"] == "first_tier"]
+    assert rows
+    # Some first-tier bucket reports a departed KV band as the last evicted object.
+    assert any(r["eviction_object"].startswith("KV B") for r in rows), \
+        "expected a departed KV band to be recorded as the eviction object"
+    # The eviction object only ever names a band that really left the stack.
+    assert all(
+        r["eviction_object"] in ("", "weights", "KV")
+        or r["eviction_object"].startswith("KV B")
+        for r in rows
+    )
+
+
 def test_memory_timeline_tracks_offloaded_kv_residency():
     model = toy_model()
     system = make_system(1)

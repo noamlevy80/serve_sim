@@ -672,43 +672,6 @@ def _floating_kv_residency(
     return intervals
 
 
-def _memory_evictions(
-    result: RunResult,
-) -> dict[str, list[tuple[float, str]]]:
-    """Per-memory ordered ``(time, object_label)`` of objects removed from it.
-
-    Reconstructs, for each memory device, the sequence of objects evicted from
-    it. A ``kv_eviction`` names the floating memory it left and the sequence
-    whose KV was reclaimed; a ``weight_eviction`` / ``expert_eviction`` names the
-    compute slot whose first-tier memory gave up a model's weights / routed
-    experts. Object labels share the ``weights:`` / ``experts:`` / ``kv:`` form
-    used for transfer objects so the visualization colours them consistently.
-    Sorted by time within each memory.
-    """
-
-    first_tier_of = {d.name: d.first_tier_memory for d in result.device_specs}
-    evictions: dict[str, list[tuple[float, str]]] = {}
-    for d in result.decisions:
-        if d.kind == "kv_eviction":
-            seq = _sequence_id(d.workload_id, d.turn_index)
-            label = f"kv:{seq}" if seq else "kv"
-            memories = list(d.devices)
-        elif d.kind == "weight_eviction":
-            label = f"weights:{d.model}" if d.model else "weights"
-            memories = [first_tier_of.get(dev) for dev in d.devices]
-        elif d.kind == "expert_eviction":
-            label = f"experts:{d.model}" if d.model else "experts"
-            memories = [first_tier_of.get(dev) for dev in d.devices]
-        else:
-            continue
-        for mem in memories:
-            if mem:
-                evictions.setdefault(mem, []).append((d.time, label))
-    for lst in evictions.values():
-        lst.sort(key=lambda x: x[0])
-    return evictions
-
-
 def _first_tier_content_at(
     jobs: Sequence[JobRecord], attached: set[str], t: float
 ) -> tuple[dict[str, float], dict[int, float]]:
@@ -746,10 +709,11 @@ def memory_timeline(
     in the bucket, the occupancy split by content (``content``: on a first-tier
     memory a ``weights`` band plus one ``KV B<n>`` band per co-resident dispatch
     batch; on a floating memory the offloaded ``KV``), a discrete label for
-    the dominant incoming transfer (its source and object), and the most recent
-    object evicted from the memory (``eviction_object``), so the visualization
-    can stack occupancy by content and plot bandwidth against the memory's
-    static ceiling.
+    the dominant incoming transfer (its source and object), and the object most
+    recently *removed* from the memory (``eviction_object`` -- see
+    :func:`_assign_eviction_objects`), so the visualization can stack occupancy
+    by content, plot bandwidth against the memory's static ceiling and show what
+    was last evicted.
     """
 
     makespan = result.makespan or 0.0
@@ -760,9 +724,6 @@ def memory_timeline(
     seq_by_request = _sequence_by_request(result.records)
     first_tier_of = {d.name: d.first_tier_memory for d in result.device_specs}
     residency = _floating_kv_residency(result)
-    evictions = _memory_evictions(result)
-    evict_times = {mem: [t for t, _ in lst] for mem, lst in evictions.items()}
-    evict_labels = {mem: [lbl for _, lbl in lst] for mem, lst in evictions.items()}
 
     events_by_memory: dict[str, list[EventRecord]] = {}
     for e in rescaled:
@@ -848,15 +809,6 @@ def memory_timeline(
                     source = dom.device
                     obj = _transfer_object_label(dom, seq_by_request)
 
-            # Last object removed from this memory at or before the bucket end:
-            # a step function that holds the most recent eviction's label.
-            evicted = ""
-            etimes = evict_times.get(mem.name)
-            if etimes:
-                idx = bisect.bisect_left(etimes, t1) - 1
-                if idx >= 0:
-                    evicted = evict_labels[mem.name][idx]
-
             rows.append({
                 "bucket": b,
                 "time_start": t0,
@@ -871,11 +823,64 @@ def memory_timeline(
                 "content": content,
                 "transfer_source": source,
                 "transfer_object": obj,
-                "eviction_object": evicted,
+                "eviction_object": "",
             })
         if progress is not None:
             progress(b + 1, num_buckets)
+    _assign_eviction_objects(rows, residency, makespan)
     return rows
+
+
+def _assign_eviction_objects(
+    rows: list[dict[str, Any]],
+    residency: Mapping[str, Sequence[tuple[float, float, str, float]]],
+    makespan: float,
+) -> None:
+    """Fill each memory row's ``eviction_object`` with the last band it lost.
+
+    For a first-tier memory the evictable objects are the occupancy bands the
+    capacity graph shows: a band present in one bucket and gone the next (a
+    completed batch's ``KV B<n>`` or displaced ``weights``) is a removal, labelled
+    by that band key so it keeps the colour it had in the capacity stack. A
+    floating memory aggregates every offloaded sequence under one ``KV`` band, so
+    its per-sequence evictions come from the residency intervals instead: an
+    interval that ends before the makespan is an eviction of ``kv:<sequence>``.
+    Each row then holds the most recent removal at or before its bucket end (a
+    step function), or empty before the first removal.
+    """
+
+    by_memory: dict[str, list[dict[str, Any]]] = {}
+    role_of: dict[str, str] = {}
+    for r in rows:
+        by_memory.setdefault(r["memory"], []).append(r)
+        role_of[r["memory"]] = r["role"]
+
+    for mem, mrows in by_memory.items():
+        mrows.sort(key=lambda r: r["bucket"])
+        events: list[tuple[float, str]] = []
+        if role_of[mem] == "first_tier":
+            prev: set[str] | None = None
+            for r in mrows:
+                cur = set(r["content"])
+                if prev is not None:
+                    removed = prev - cur
+                    if removed:
+                        events.append((r["time_start"], max(removed)))
+                prev = cur
+        else:
+            for start, end, label, _bytes in residency.get(mem, []):
+                if end < makespan:
+                    events.append((end, f"kv:{label}"))
+        if not events:
+            continue
+        events.sort(key=lambda e: e[0])
+        times = [t for t, _ in events]
+        labels = [lbl for _, lbl in events]
+        for r in mrows:
+            idx = bisect.bisect_right(times, r["time_end"]) - 1
+            if idx >= 0:
+                r["eviction_object"] = labels[idx]
+
 
 
 # State of a workload's current turn at an instant, in lifecycle order.

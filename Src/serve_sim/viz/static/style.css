@@ -131,16 +131,19 @@ table.summary tr:last-child td { border-bottom: none; }
 .timeline-body { display: flex; gap: 12px; align-items: flex-start; }
 .timeline-body .grid { flex: 1; min-width: 0; }
 
-/* Left column: the graph-type selector with the reason legend pinned beneath. */
+/* Left column: the graph-type selector with the reason legend pinned beneath.
+   ``top``/``max-height`` are overridden at runtime by syncTimelineLeftOffset()
+   to match the measured height of the sticky controls bar; the values below are
+   a fallback for before that runs. */
 .timeline-left {
   flex: 0 0 20%;
   width: 20%;
   position: sticky;
-  top: 116px;
+  top: 150px;
   display: flex;
   flex-direction: column;
   gap: 10px;
-  max-height: calc(100vh - 130px);
+  max-height: calc(100vh - 164px);
 }
 
 .tree-panel {

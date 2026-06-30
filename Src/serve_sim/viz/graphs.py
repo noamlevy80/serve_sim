@@ -307,7 +307,14 @@ def _reason_fraction_graph(gid: str, title: str, section: str, group: str,
 
 
 def _object_label(label: str) -> tuple[str, str, str]:
-    """(abbrev, full, color_key) for a transfer-object label."""
+    """(abbrev, full, color_key) for a transfer- or eviction-object label.
+
+    Handles both the transfer-object form (``weights:<model>`` / ``experts:
+    <model>`` / ``kv:<seq>``) and the occupancy-band keys used for evictions
+    (``weights`` / ``KV`` / ``KV B<n>``). For the band keys the colour key is the
+    band key itself, so an evicted band shares the colour it had in the capacity
+    graph.
+    """
 
     if label.startswith("weights:"):
         model = label[len("weights:"):]
@@ -318,6 +325,13 @@ def _object_label(label: str) -> tuple[str, str, str]:
     if label.startswith("kv:"):
         seq = label[len("kv:"):]
         return seq, f"KV: {seq}", f"kv:{seq}"
+    if label.startswith("KV B"):
+        batch = label[len("KV B"):]
+        return f"B{batch}", f"KV batch {batch}", label
+    if label == "weights":
+        return "W", "Weights", label
+    if label == "KV":
+        return "KV", "KV", label
     return label, label, label
 
 

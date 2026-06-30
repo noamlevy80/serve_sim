@@ -274,10 +274,11 @@ def test_memory_timeline_records_the_last_evicted_object():
     evictions = [d for d in result.decisions if d.kind == "kv_eviction"]
     assert evictions, "expected at least one LRU eviction decision"
 
-    rows = memory_timeline(result, 32)
+    rows = memory_timeline(result, 64)
     floating = [r for r in rows if r["memory"] == "node-0"]
-    # After the first eviction, the floating memory's eviction-object label holds
-    # the evicted sequence's KV id and persists until the next eviction.
+    # A floating memory aggregates every offloaded sequence under one "KV" band,
+    # so its evictions come from the residency intervals: the eviction-object
+    # label names the evicted sequence ("kv:<seq>") and holds until the next one.
     labelled = [r for r in floating if r["eviction_object"]]
     assert labelled, "expected the eviction object to be recorded for node-0"
     assert all(r["eviction_object"].startswith("kv:") for r in labelled)
