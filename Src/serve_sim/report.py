@@ -1174,6 +1174,12 @@ def workload_graph(result: RunResult) -> dict[str, Any]:
             group_ids[devices] = f"G{len(group_ids)}"
         return group_ids[devices]
 
+    def _model(request_id: int) -> str:
+        for e in events_by_request.get(request_id, []):
+            if e.model:
+                return e.model
+        return ""
+
     nodes: list[dict[str, Any]] = []
     node_by_request: dict[int, str] = {}        # request id -> its input node id
     node_by_seq: dict[tuple[int, int], str] = {}  # (workload, turn) -> input node id
@@ -1184,6 +1190,7 @@ def workload_graph(result: RunResult) -> dict[str, Any]:
         for i, r in enumerate(turns):
             seq = _sequence_id(r.workload_id, r.turn_index) or f"{label}t{r.turn_index}"
             group = _group(r.request_id)
+            model = _model(r.request_id)
             first_token = (r.first_token_time if r.first_token_time is not None
                            else r.completion_time)
             in_id = f"{label}:t{r.turn_index}:in"
@@ -1196,14 +1203,14 @@ def workload_graph(result: RunResult) -> dict[str, Any]:
                 "sub": 0, "t0": r.arrival_time, "t1": first_token,
                 "turn": r.turn_index, "tokens": r.prompt_tokens, "group": group,
                 "ttft_s": r.ttft, "tps": None, "text": f"T{r.turn_index} in",
-                "sequence": seq, "desc": "",
+                "sequence": seq, "model": model, "desc": "",
             })
             nodes.append({
                 "id": out_id, "kind": "decode", "workload": label, "lane": lane,
                 "sub": 1, "t0": first_token, "t1": r.completion_time,
                 "turn": r.turn_index, "tokens": r.output_tokens, "group": group,
                 "ttft_s": None, "tps": r.tps, "text": f"T{r.turn_index} out",
-                "sequence": seq, "desc": "",
+                "sequence": seq, "model": model, "desc": "",
             })
             if i + 1 < len(turns):
                 nxt = turns[i + 1]

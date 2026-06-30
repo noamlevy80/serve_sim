@@ -1,0 +1,22 @@
+{
+  "name": "Dual-node B200 (8x B200)",
+  "description": "Two homogeneous nodes, each with 4 NVIDIA B200 GPUs (8 GPUs total). All devices are connected point-to-point over the scale-up network; GPUs within a node also share an in-node CXL link to the (optional) node memory. A single datacenter NVM pool is the input device that holds all model weights at init.",
+  "network": {
+    "scale_up_bandwidth_bytes_per_s": 1.8e12,
+    "scale_up_latency_s": 1.0e-6,
+    "cxl_bandwidth_bytes_per_s": 6.4e10,
+    "cxl_latency_s": 3.0e-7,
+    "notes": "ESTIMATE - scale-up modeled point-to-point (no congestion/topology): ~1.8 TB/s NVLink-class link at ~1 us; in-node CXL ~64 GB/s (PCIe5 x16-class) at ~300 ns. Tune to the fabric you want to model."
+  },
+  "input_memory": "datacenter-nvm",
+  "nodes": [
+    {
+      "name": "node-0",
+      "node_memory": "nvidia-grace-lpddr5x",
+      "compute_devices": [
+        { "device": "nvidia-b200", "count": 2 }
+      ],
+      "count": 36
+    }
+  ]
+}

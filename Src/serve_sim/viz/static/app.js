@@ -670,6 +670,8 @@ function renderWorkload() {
   ctx.textBaseline = "middle";
   const laneLabel = {};
   for (const n of wg.nodes) if (!(n.lane in laneLabel)) laneLabel[n.lane] = n.workload;
+  const laneModel = {};
+  for (const n of wg.nodes) if (!(n.lane in laneModel) && n.model) laneModel[n.lane] = n.model;
   for (let i = 0; i < lanes; i++) {
     const top = WL.padT + i * WL.laneH;
     if (i % 2 === 0) {
@@ -678,7 +680,8 @@ function renderWorkload() {
     }
     ctx.fillStyle = "#9aa3b2";
     ctx.textAlign = "left";
-    ctx.fillText(laneLabel[i] || "", 6, top + WL.laneH / 2);
+    const label = laneModel[i] ? `${laneLabel[i] || ""}  ${laneModel[i]}` : (laneLabel[i] || "");
+    ctx.fillText(label, 6, top + WL.laneH / 2);
   }
 
   // Time-axis ticks across the top.
@@ -796,6 +799,7 @@ function attachWlHover(canvas) {
     if (hit.kind === "tool") {
       lines.push(hit.desc || "Tool call");
     } else {
+      if (hit.model) lines.push(`model ${hit.model}`);
       lines.push(`${formatEng(hit.tokens)} tokens`);
       if (hit.group) lines.push(`group ${hit.group}`);
       if (hit.kind === "decode" && hit.tps != null)
