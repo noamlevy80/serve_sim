@@ -1,0 +1,79 @@
+{
+  "name": "Qwen3.5-397B-A17B",
+  "source": "https://huggingface.co/Qwen/Qwen3.5-397B-A17B",
+  "note": "MoE hybrid (qwen3_5_moe), 397B total / 17B active. 60 layers in a [linear x3, full] x15 pattern (full_attention_interval=4): linear layers use a Gated DeltaNet mixer (16 key / 64 value heads, head_dim 128, no KV cache), full layers use GQA (32 query / 2 kv heads, head_dim 256, partial rotary 0.25). Every layer has a sparse MoE FFN: 512 routed experts, 10 active per token, moe_intermediate 1024, plus 1 shared expert (intermediate 1024). Text config only; the vision encoder is not modelled.",
+  "global": {
+    "num_layers": 60,
+    "hidden_size": 4096,
+    "vocab_size": 248320,
+    "tie_word_embeddings": false,
+    "param_dtype_bytes": 2,
+    "kv_dtype_bytes": 2,
+    "layer_pattern": [
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full",
+      "linear", "linear", "linear", "full"
+    ]
+  },
+  "blocks": {
+    "linear": {
+      "block_type": "composite",
+      "linear_attention": {
+        "block_type": "gated_deltanet",
+        "num_key_heads": 16,
+        "num_value_heads": 64,
+        "key_head_dim": 128,
+        "value_head_dim": 128,
+        "conv_kernel_dim": 4
+      },
+      "ffn": {
+        "block_type": "ffn",
+        "ffn_type": "MoE",
+        "intermediate_size": 1024,
+        "gated": true,
+        "num_experts": 512,
+        "num_experts_per_token": 10,
+        "num_shared_experts": 1,
+        "shared_expert_intermediate_size": 1024
+      }
+    },
+    "full": {
+      "block_type": "composite",
+      "attention": {
+        "block_type": "attention",
+        "attention_type": "GQA",
+        "num_query_heads": 32,
+        "num_kv_heads": 2,
+        "head_dim": 256,
+        "sliding_window": null,
+        "sparse_attention": false
+      },
+      "ffn": {
+        "block_type": "ffn",
+        "ffn_type": "MoE",
+        "intermediate_size": 1024,
+        "gated": true,
+        "num_experts": 512,
+        "num_experts_per_token": 10,
+        "num_shared_experts": 1,
+        "shared_expert_intermediate_size": 1024
+      }
+    }
+  },
+  "mtp": {
+    "num_mtp_layers": 1,
+    "mtp_layer_pattern": ["linear", "ffn"]
+  }
+}
