@@ -636,6 +636,12 @@ def memory_summaries(result: RunResult) -> list[dict[str, Any]]:
         for name in names:
             by_memory.setdefault(name, []).append(event)
 
+    # Residency held on floating memories (offloaded KV and homed model
+    # weights/experts) lives off-device, so it is reconstructed from the log
+    # rather than the per-device reservation model.
+    kv_residency = _floating_kv_residency(result)
+    weight_residency = _floating_weight_residency(result)
+
     summaries: list[dict[str, Any]] = []
     for mem in result.memories:
         mem_events = by_memory.get(mem.name, [])
@@ -643,6 +649,9 @@ def memory_summaries(result: RunResult) -> list[dict[str, Any]]:
         bytes_moved = sum(e.bytes_read for e in mem_events)
         busy = _union_length([(e.start, e.end) for e in mem_events])
         peak_mem = _memory_peak_occupancy(result, mem.attached_devices)
+        peak_mem += _residency_peak(
+            kv_residency.get(mem.name, []) + weight_residency.get(mem.name, [])
+        )
         summaries.append({
             "memory": mem.name,
             "role": mem.role,
@@ -693,6 +702,56 @@ def _floating_kv_residency(
         label = _sequence_id(w, t) or f"w{w}t{t}"
         intervals.setdefault(mem, []).append((start, max(start, end), label, num_bytes))
     return intervals
+
+
+def _floating_weight_residency(
+    result: RunResult,
+) -> dict[str, list[tuple[float, float, str, float]]]:
+    """Reconstruct homed-model weight/expert residency in floating memories.
+
+    When a node can home its shard of a model, that shard (the resident weights
+    *and* the full set of routed experts it later streams to its devices) is
+    staged once from the input NVM into the node's RAM -- a ``weight_transfer``
+    event writing into that floating memory -- and stays resident for the rest of
+    the run (the home is never evicted). Each such event therefore opens a
+    residency band ``[stage_end, makespan)`` of its moved bytes on the
+    destination memory, labelled by the model. Returns, per memory name, the list
+    of ``(start, end, model_label, bytes)`` bands.
+    """
+
+    makespan = result.makespan or 0.0
+    floating = {
+        m.name for m in result.memories if m.role in ("node", "second_tier")
+    }
+    intervals: dict[str, list[tuple[float, float, str, float]]] = {}
+    seen: set[tuple[str, str]] = set()
+    for e in _rescaled(result.events):
+        if e.phase != "weight_transfer" or e.bytes_read <= 0:
+            continue
+        dst = e.destination_memory
+        if dst not in floating:
+            continue
+        # The NVM -> RAM stage happens once per (model, node); dedupe defensively
+        # so a re-derived log never double-counts a home shard.
+        key = (dst, e.model)
+        if key in seen:
+            continue
+        seen.add(key)
+        intervals.setdefault(dst, []).append((e.end, makespan, e.model, e.bytes_read))
+    return intervals
+
+
+def _residency_peak(bands: list[tuple[float, float, str, float]]) -> float:
+    """Peak simultaneous bytes across a list of ``(start, end, label, bytes)``."""
+
+    if not bands:
+        return 0.0
+    points = sorted({b[0] for b in bands} | {b[1] for b in bands})
+    peak = 0.0
+    for t in points:
+        occ = sum(nb for (s, e, _label, nb) in bands if s <= t < e)
+        peak = max(peak, occ)
+    return peak
 
 
 def _first_tier_content_at(
@@ -747,6 +806,7 @@ def memory_timeline(
     seq_by_request = _sequence_by_request(result.records)
     first_tier_of = {d.name: d.first_tier_memory for d in result.device_specs}
     residency = _floating_kv_residency(result)
+    weight_residency = _floating_weight_residency(result)
 
     events_by_memory: dict[str, list[EventRecord]] = {}
     for e in rescaled:
@@ -814,6 +874,13 @@ def memory_timeline(
                 )
                 if kv_bytes > 0:
                     content["KV"] = kv_bytes
+                weight_bytes = sum(
+                    num_bytes
+                    for start, end, label, num_bytes in weight_residency.get(mem.name, [])
+                    if start <= t0 < end
+                )
+                if weight_bytes > 0:
+                    content["weights"] = weight_bytes
             occupancy = sum(content.values())
 
             # Incoming transfer: into a first-tier memory it is the dominant

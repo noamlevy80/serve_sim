@@ -194,6 +194,29 @@ def test_weight_loading_on_streams_from_input_nvm(tmp_path):
     assert first_load <= first_compute
 
 
+def test_homed_weights_show_occupancy_on_the_floating_node_memory(tmp_path):
+    """A homed shard staged into node RAM must show up in that memory's occupancy.
+
+    When a node can home its model shard, the weights (and the experts it later
+    streams) are staged once from the input NVM into the node's RAM and stay
+    resident. That residency lives off-device, so it has to be reconstructed from
+    the ``weight_transfer`` log rather than the per-device reservation model --
+    otherwise the node memory reports zero occupancy while physically holding the
+    shard. This run homes ``tiny-moe`` onto its nodes, so at least one node memory
+    must report a non-zero, feasible peak."""
+
+    result, _ = _run("auto_parallel.json", tmp_path)
+
+    summaries = memory_summaries(result)
+    node_mems = [m for m in summaries if m["role"] == "node"]
+    assert node_mems, "expected floating node memories in this run"
+
+    homed = [m for m in node_mems if m["peak_memory_bytes"] > 0.0]
+    assert homed, "homed weights/experts must appear in node-memory occupancy"
+    for m in homed:
+        assert 0.0 < m["occupancy_fraction"] <= 1.0 + 1e-9
+
+
 def test_weight_loading_off_has_no_input_nvm_traffic(tmp_path):
     result, _ = _run("weight_loading_off.json", tmp_path)
 
