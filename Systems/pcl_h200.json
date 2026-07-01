@@ -1,0 +1,28 @@
+{
+  "name": "PCL H200 (2 nodes x 4 H200 NVL)",
+  "description": "Lab partition 'pcl_h200': one dual-socket Xeon Platinum 8580 (2x60-core Emerald Rapids) server with 2048 GB DDR5-4400 and 8 NVIDIA H200 NVL GPUs (2x 4 with quad NVLink Bridge). Modeled as two nodes, one per socket, each with 4 H200 NVL GPUs and 1024 GB of DDR5 node memory. Used to produce grounding measurements against the simulator.",
+  "network": {
+    "scale_up_bandwidth_bytes_per_s": 9.0e11,
+    "scale_up_latency_s": 1.0e-6,
+    "cxl_bandwidth_bytes_per_s": 6.4e10,
+    "cxl_latency_s": 3.0e-7,
+    "notes": "ESTIMATE - scale-up modeled point-to-point (no congestion/topology): H200 NVL quad NVLink Bridge ~900 GB/s GPU-to-GPU within a 4-GPU group at ~1 us; in-node CPU memory over PCIe5 x16-class CXL ~64 GB/s at ~300 ns. Tune to measured fabric numbers."
+  },
+  "input_memory": "datacenter-nvm",
+  "nodes": [
+    {
+      "name": "node-0",
+      "node_memory": "xeon-8580-ddr5",
+      "compute_devices": [
+        { "device": "nvidia-h200", "count": 4 }
+      ]
+    },
+    {
+      "name": "node-1",
+      "node_memory": "xeon-8580-ddr5",
+      "compute_devices": [
+        { "device": "nvidia-h200", "count": 4 }
+      ]
+    }
+  ]
+}

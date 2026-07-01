@@ -1,0 +1,8 @@
+{
+  "name": "NVIDIA H200",
+  "source": "https://www.nvidia.com/en-us/data-center/h200/ (H200 SXM: FP16 Tensor Core 1,979 TFLOPS with sparsity => 989.5 TFLOPS dense per GPU)",
+  "peak_flops_fp16": 9.895e14,
+  "first_tier_memory": "nvidia-h200-hbm3e",
+  "notes": "Dense FP16/BF16 tensor-core throughput per single H200 SXM GPU. Sparse is 2x.",
+  "kernel_launch_latency": 5e-6
+}

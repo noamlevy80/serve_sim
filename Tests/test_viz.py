@@ -312,7 +312,8 @@ def test_sequences_table_has_one_row_per_turn():
     seq = next(t for t in tables if t["title"] == "Sequences")
     assert seq["columns"] == [
         "Sequence", "Model", "Engine group(s)", "Time in queue (s)",
-        "TTFT (prefill, s)", "TPS (decode, tok/s)", "Total idle wait (s)",
+        "TTFT (prefill, s)", "TPS (decode, tok/s)", "KV size (B)",
+        "Total idle wait (s)",
         "Comm wait (s)", "Total latency (s)", "Effective TPS (tok/s)"]
     assert len(seq["rows"]) == 3
     for q in payload["sequences"]:
@@ -320,6 +321,7 @@ def test_sequences_table_has_one_row_per_turn():
         assert q["idle_wait_s"] >= 0.0
         assert q["comm_wait_s"] >= 0.0
         assert q["latency_s"] >= q["queue_s"]
+        assert q["kv_bytes"] > 0.0
 
 
 # --- Flask app ------------------------------------------------------------------

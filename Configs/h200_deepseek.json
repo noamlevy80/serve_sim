@@ -1,0 +1,49 @@
+{
+  "run_id": null,
+  "system": "../Systems/pcl_h200.json",
+  "models_dir": "../Models",
+  "tokenizer": "tiktoken",
+  "output_root": "Outputs",
+
+  "dataset": {
+    "dataset": "sammshen/lmcache-agentic-traces",
+    "config": "default",
+    "split": "train",
+    "cache_dir": "../Dataset"
+  },
+
+  "suite": {
+    "name": "Example short randomized suite",
+    "description": "Draws a handful of random multi-turn workloads from the cached source dataset and assigns each a model at random, for a quick end-to-end run.",
+    "type": "randomized",
+    "num_workloads": 20,
+    "models": ["qwen3.6-27b"]
+  },
+
+  "max_batch_size": 16,
+  "max_concurrency": null,
+  "concurrency_window_sec": 0.5,
+
+  "allow_pdd": false,
+  "prefill_engine_fraction": 0.5,
+
+  "model_weight_loading": true,
+
+  "memory_policy": "global_lru",
+  "hbm_kv_fraction": 0.5,
+
+  "auto_parallelism": true,
+  "pipeline_parallel": 1,
+  "expert_parallel": 4,
+  "tensor_parallel": 2,
+  "max_parallelism": 8,
+
+  "prefill_chunk_size": null,
+  "event_random_factor_range": 0.05,
+  "arrival_interval_sec": 0.005,
+  "arrival_variance_sec2": 0.0001,
+  "max_turns_per_workload": 16,
+
+  "report_time_buckets": 256,
+  "random_seed": 7
+}

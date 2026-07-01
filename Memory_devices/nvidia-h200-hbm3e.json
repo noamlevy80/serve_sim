@@ -1,0 +1,7 @@
+{
+  "name": "NVIDIA H200 HBM3e",
+  "source": "https://www.nvidia.com/en-us/data-center/h200/ (H200 SXM: 141 GB HBM3e at 4.8 TB/s per GPU)",
+  "capacity_bytes": 1.41e11,
+  "bandwidth_bytes_per_s": 4.8e12,
+  "notes": "Per-GPU first-tier HBM3e. 141 GB at 4.8 TB/s."
+}

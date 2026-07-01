@@ -1420,6 +1420,9 @@ def sequence_table(result: RunResult) -> list[dict[str, Any]]:
     (arrival to answer), and the effective TPS (output tokens over that
     end-to-end latency). Rows are ordered by workload then turn, with standalone
     requests last.
+
+    Each row also carries ``kv_bytes``: the KV-cache size the sequence holds at
+    its full context length (prompt plus generated tokens).
     """
 
     by_request = _events_by_request(_rescaled(result.events))
@@ -1442,6 +1445,7 @@ def sequence_table(result: RunResult) -> list[dict[str, Any]]:
             "queue_s": r.queue_delay,
             "ttft_prefill_s": ttft_prefill,
             "tps_tokens_per_s": r.tps,
+            "kv_bytes": r.kv_bytes,
             "idle_wait_s": _idle_wait(
                 events, r.dispatch_time, r.completion_time),
             "comm_wait_s": _comm_wait(

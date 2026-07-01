@@ -1,0 +1,7 @@
+{
+  "name": "Xeon Platinum 8580 DDR5-4400 (per socket)",
+  "source": "Intel Xeon Platinum 8580 (Emerald Rapids): 8 DDR5 channels per socket. Lab config populated with DDR5-4400. 2048 GB total across the dual-socket server => 1024 GB per socket/node.",
+  "capacity_bytes": 1.024e12,
+  "bandwidth_bytes_per_s": 2.816e11,
+  "notes": "CPU-managed node memory tier for one Xeon 8580 socket. Capacity 1024 GB (half of the 2048 GB dual-socket server). Bandwidth 8 channels x 4400 MT/s x 8 B ~= 281.6 GB/s per socket."
+}

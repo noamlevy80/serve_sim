@@ -358,6 +358,7 @@ class RequestRecord:
     first_token_time: float | None = None
     workload_id: int = -1
     turn_index: int = 0
+    kv_bytes: float = 0.0
 
     @property
     def queue_delay(self) -> float:
@@ -1370,6 +1371,8 @@ class Simulator:
                         first_token_time=first_token_time,
                         workload_id=req.workload_id,
                         turn_index=req.turn_index,
+                        kv_bytes=context_kv_bytes(
+                            req.model, req.prompt_tokens + req.output_tokens),
                     )
                     result.records.append(record)
                     emit_completion(record, now)
@@ -1656,6 +1659,8 @@ class Simulator:
                             first_token_time=first_token_time,
                             workload_id=req.workload_id,
                             turn_index=req.turn_index,
+                            kv_bytes=context_kv_bytes(
+                                req.model, req.prompt_tokens + req.output_tokens),
                         )
                         result.records.append(record)
                         emit_completion(record, now)
