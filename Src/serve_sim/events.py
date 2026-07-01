@@ -280,6 +280,7 @@ class EventGenerator:
         expert_trace: list[GroupActivation] | None = None,
         expert_cache_capacity: int | None = None,
         expert_source: MemoryDevice | None = None,
+        expert_sources: list[MemoryDevice] | None = None,
         expert_fetch_latency: float = 0.0,
         expert_residency: list[DeviceHbmResidency] | None = None,
         expert_index_bytes: float | None = None,
@@ -294,14 +295,18 @@ class EventGenerator:
         group whose working set is not already resident on the first tier; each
         rank moves only the experts it owns (residency reuse keeps the set small).
 
-        The source of those experts is either ``expert_source`` -- a single shared
-        memory (the home node's RAM) reached over a fabric whose one-way latency
-        is ``expert_fetch_latency`` -- or, when ``expert_source`` is ``None``, each
-        device's own ``second_tier_memory`` (the legacy per-device two-tier path,
-        which requires ``pipeline_parallel == tensor_parallel == 1``). Expert
-        indices are assumed identical across the whole model, so a fetch for an
-        index moves that expert's weights from every MoE layer at once and the
-        per-fetch byte count is independent of the pipeline/tensor split.
+        The source of those experts is either ``expert_sources`` -- one source
+        memory *per slot device* (the RAM of the node that device sits on, so a
+        model sharded across several nodes streams each device's experts from its
+        own node's RAM in parallel; co-located devices share their node memory's
+        bandwidth) -- or ``expert_source`` -- a single shared memory (e.g. the
+        input NVM when no node can home the model) reached over a fabric whose
+        one-way latency is ``expert_fetch_latency`` -- or, when both are ``None``,
+        each device's own ``second_tier_memory`` (the legacy per-device two-tier
+        path, which requires ``pipeline_parallel == tensor_parallel == 1``).
+        Expert indices are assumed identical across the whole model, so a fetch
+        for an index moves that expert's weights from every MoE layer at once and
+        the per-fetch byte count is independent of the pipeline/tensor split.
 
         When ``expert_residency`` is given (one persistent
         :class:`DeviceHbmResidency` per ep rank, sharing each device's HBM with
@@ -319,20 +324,33 @@ class EventGenerator:
         tp = self.tensor_parallel
         divide = ep * tp
 
+        if expert_sources is not None and len(expert_sources) != len(self.devices):
+            raise ValueError(
+                "expert_sources must have one source memory per device "
+                f"({len(self.devices)}); got {len(expert_sources)}"
+            )
+        shared_source = expert_source is not None or expert_sources is not None
         streaming = (
             expert_trace is not None
             and self.model.num_moe_layers > 0
-            and (expert_source is not None or self.devices[0].second_tier_memory is not None)
+            and (shared_source or self.devices[0].second_tier_memory is not None)
         )
         caches: list = []
         trace_by_group: dict[int, GroupActivation] = {}
         shared_tier2 = False
+        source_for = None
         if streaming:
             if expert_residency is None and expert_cache_capacity is None:
                 raise ValueError(
                     "expert_cache_capacity is required for expert streaming"
                 )
-            if expert_source is None:
+            if expert_sources is not None:
+                _srcs = expert_sources
+                source_for = lambda di: _srcs[di]
+            elif expert_source is not None:
+                _src = expert_source
+                source_for = lambda di: _src
+            if not shared_source:
                 # Legacy per-device second-tier path: the device layout below
                 # assumes the ep ranks occupy devices 0..ep-1, which only holds
                 # without a pipeline or tensor split.
@@ -395,22 +413,22 @@ class EventGenerator:
                     evicted_total += len(evicted)
                 total_misses = sum(rank_misses)
                 if total_misses:
-                    if expert_source is not None:
-                        total_bytes = total_misses * self._moe_routed_bytes_per_miss
-                        transfer = self._build_shared_expert_transfer_event(
-                            group_index, total_bytes, expert_source,
+                    if shared_source:
+                        transfers = self._build_expert_transfer_events(
+                            group_index, rank_misses, source_for,
                             expert_fetch_latency, phase, clock,
                         )
                     else:
                         rank_bytes = [
                             m * self._moe_routed_bytes_per_miss for m in rank_misses
                         ]
-                        transfer = self._build_transfer_event(
+                        transfers = [self._build_transfer_event(
                             group_index, rank_bytes, shared_tier2, phase, clock,
-                        )
-                    clock = transfer.end
-                    schedule.events.append(transfer)
-                    schedule.expert_fetch_bytes += transfer.bytes_read
+                        )]
+                    clock = max((t.end for t in transfers), default=clock)
+                    for transfer in transfers:
+                        schedule.events.append(transfer)
+                        schedule.expert_fetch_bytes += transfer.bytes_read
                     schedule.expert_fetch_groups += 1
                     schedule.expert_experts_loaded += total_misses
                 schedule.expert_evictions += evicted_total
@@ -675,38 +693,73 @@ class EventGenerator:
             destination_memory=self.devices[0].first_tier_memory,
         )
 
-    def _build_shared_expert_transfer_event(
+    def _build_expert_transfer_events(
         self,
         group_index: int,
-        total_bytes: float,
-        source: MemoryDevice,
+        rank_misses: list[int],
+        source_for,
         latency: float,
         phase: str,
         start: float,
-    ) -> ComputeEvent:
-        """Expert-fetch event from a single shared source (the home node RAM).
+    ) -> list[ComputeEvent]:
+        """Expert-fetch events, one per distinct source memory, run in parallel.
 
-        Every rank's missed experts stream from the same node memory, so that
-        memory's bandwidth bounds the whole group's movement and the fabric's
-        one-way ``latency`` is paid once. The arbiter contends ``total_bytes`` on
-        ``source`` so concurrent jobs fetching from the same node RAM share it.
+        Each ep rank's missed experts are sharded across the ``pp * tp`` devices
+        that hold its weights (every pipeline stage's copy of each MoE layer,
+        split ``1/tp`` within the layer), and every such device streams its slice
+        from its *own* node's source memory (``source_for(device_index)``). Bytes
+        are bucketed by source memory so devices co-located on one node share that
+        memory's bandwidth, while devices on different nodes stream concurrently.
+        Every event starts at ``start``; the caller advances the clock to the
+        latest end (the fetch completes when the slowest node's slice lands). When
+        all devices resolve to one memory (a single shared source, e.g. the input
+        NVM, or a single-node slot) this collapses to one event over that memory.
         """
 
-        duration = (latency + total_bytes / source.bandwidth_bytes_per_s) * self._time_scale()
-        return ComputeEvent(
-            group_index=group_index,
-            phase="expert_transfer",
-            device_index=0,
-            flops=0.0,
-            bytes_read=total_bytes,
-            compute_time=0.0,
-            bandwidth_time=duration,
-            duration=duration,
-            start=start,
-            end=start + duration,
-            source_memory=source,
-            destination_memory=self.devices[0].first_tier_memory,
-        )
+        pp = self.pipeline_parallel
+        ep = self.expert_parallel
+        tp = self.tensor_parallel
+        # id(source) -> [source_memory, total_bytes, representative device index].
+        buckets: dict[int, list] = {}
+        for r in range(ep):
+            if rank_misses[r] <= 0:
+                continue
+            rank_bytes = rank_misses[r] * self._moe_routed_bytes_per_miss
+            rank_devices = [
+                self._device_index(stage, r, t)
+                for stage in range(pp)
+                for t in range(tp)
+            ]
+            per_device = rank_bytes / len(rank_devices)
+            for device_index in rank_devices:
+                source = source_for(device_index)
+                entry = buckets.get(id(source))
+                if entry is None:
+                    buckets[id(source)] = [source, per_device, device_index]
+                else:
+                    entry[1] += per_device
+        events: list[ComputeEvent] = []
+        for source, total_bytes, device_index in buckets.values():
+            duration = (
+                latency + total_bytes / source.bandwidth_bytes_per_s
+            ) * self._time_scale()
+            events.append(
+                ComputeEvent(
+                    group_index=group_index,
+                    phase="expert_transfer",
+                    device_index=device_index,
+                    flops=0.0,
+                    bytes_read=total_bytes,
+                    compute_time=0.0,
+                    bandwidth_time=duration,
+                    duration=duration,
+                    start=start,
+                    end=start + duration,
+                    source_memory=source,
+                    destination_memory=self.devices[device_index].first_tier_memory,
+                )
+            )
+        return events
 
 
     def _build_event(

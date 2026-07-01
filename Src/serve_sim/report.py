@@ -588,7 +588,12 @@ def _memory_peak_occupancy(result: RunResult, attached_devices: Sequence[str]) -
 
     The footprint model reserves ``per_device_bytes`` (weights + KV) on each
     compute device's first-tier memory; a memory shared by several devices holds
-    the sum. Evaluated at every job boundary to find the peak.
+    the sum. A device keeps a single resident copy of each model's weights that
+    all of that model's concurrent batches share, so weights are counted once per
+    (device, model) while KV is counted per co-resident batch -- otherwise several
+    in-flight batches of one model would each re-charge the shared weights and
+    inflate the peak past capacity. Evaluated at every job boundary to find the
+    peak.
     """
 
     attached = set(attached_devices)
@@ -601,11 +606,19 @@ def _memory_peak_occupancy(result: RunResult, attached_devices: Sequence[str]) -
     breakpoints = sorted({j.start for j in jobs} | {j.end for j in jobs})
     peak = 0.0
     for t in breakpoints:
-        occ = sum(
-            j.per_device_bytes * sum(1 for d in j.devices if d in attached)
-            for j in jobs
-            if j.start <= t < j.end
-        )
+        active = [j for j in jobs if j.start <= t < j.end]
+        occ = 0.0
+        for d in attached:
+            weights: dict[str, float] = {}
+            kv = 0.0
+            for j in active:
+                if d not in j.devices:
+                    continue
+                weights[j.model] = max(
+                    weights.get(j.model, 0.0), j.weight_bytes_per_device
+                )
+                kv += j.kv_bytes_per_device
+            occ += sum(weights.values()) + kv
         peak = max(peak, occ)
     return peak
 
@@ -682,13 +695,24 @@ def _floating_kv_residency(
     pair bounds a residency interval ``[store, evict)`` (open to the makespan if
     never evicted). Returns, per memory name, the list of
     ``(start, end, sequence_label, bytes)`` intervals.
+
+    Only *floating* memories (a node's RAM or the second-tier pool) are
+    reconstructed this way: a first-tier device HBM's occupancy is already fully
+    described by the per-device reservation model (:func:`_memory_peak_occupancy`),
+    so KV cached back into an HBM must not be re-added on top of it -- and the
+    store/evict log for on-device KV is bounded by the HBM cache fraction rather
+    than the never-evicted floating home, so treating it as residency would
+    accumulate unbounded, unevicted bytes and inflate the peak past capacity.
     """
 
     makespan = result.makespan or 0.0
+    floating = {
+        m.name for m in result.memories if m.role in ("node", "second_tier")
+    }
     stores: dict[tuple[str, int, int], tuple[float, float]] = {}
     evicts: dict[tuple[str, int, int], float] = {}
     for d in result.decisions:
-        if len(d.devices) != 1:
+        if len(d.devices) != 1 or d.devices[0] not in floating:
             continue
         key = (d.devices[0], d.workload_id, d.turn_index)
         if d.kind == "kv_transfer" and d.bytes_moved > 0:
@@ -763,7 +787,8 @@ def _first_tier_content_at(
     ``t`` on the attached devices, splitting each job's per-device reservation
     into its weight portion (keyed by model) and its KV portion (keyed by the
     dispatch ``batch_index`` of the task holding it, so co-resident parallel
-    tasks stay separable).
+    tasks stay separable). A model's resident weights are shared by all of its
+    concurrent batches, so they are counted once per device (not once per batch).
     """
 
     weights: dict[str, float] = {}
@@ -774,7 +799,9 @@ def _first_tier_content_at(
         count = sum(1 for d in j.devices if d in attached)
         if count == 0:
             continue
-        weights[j.model] = weights.get(j.model, 0.0) + j.weight_bytes_per_device * count
+        weights[j.model] = max(
+            weights.get(j.model, 0.0), j.weight_bytes_per_device * count
+        )
         kv_by_batch[j.batch_index] = (
             kv_by_batch.get(j.batch_index, 0.0) + j.kv_bytes_per_device * count
         )

@@ -459,6 +459,79 @@ def test_memory_summary_captures_weight_load_on_input_nvm():
     assert by_name["nvm"]["num_events"] >= 1
 
 
+def test_peak_occupancy_counts_shared_weights_once_per_model():
+    # Several in-flight batches of one model share a single resident copy of its
+    # weights on the device, so the peak reservation must count those weights
+    # once (not once per batch) plus each batch's own KV. A second model that is
+    # genuinely co-resident adds its own weights on top.
+    from types import SimpleNamespace
+
+    from serve_sim.orchestrator import JobRecord
+    from serve_sim.report import _memory_peak_occupancy
+
+    def job(idx, model, weight, kv, start, end):
+        return JobRecord(
+            job_index=idx, batch_index=idx, job_phase="full",
+            request_ids=(idx,), devices=("gpu0",), start=start, end=end,
+            per_device_bytes=weight + kv, weight_bytes_per_device=weight,
+            kv_bytes_per_device=kv, model=model,
+        )
+
+    # Three concurrent batches of model A (60 GB weights, 5 GB KV each) overlap
+    # with one batch of model B (40 GB weights, 3 GB KV) on the same device.
+    jobs = [
+        job(1, "A", 60e9, 5e9, 0.0, 4.0),
+        job(2, "A", 60e9, 5e9, 1.0, 4.0),
+        job(3, "A", 60e9, 5e9, 2.0, 4.0),
+        job(4, "B", 40e9, 3e9, 2.0, 4.0),
+    ]
+    result = SimpleNamespace(jobs=jobs)
+
+    peak = _memory_peak_occupancy(result, ["gpu0"])
+
+    # A's weights counted once (60) + B's (40) + every batch's KV (5+5+5+3).
+    assert peak == pytest.approx(60e9 + 40e9 + 18e9)
+    # The naive sum-of-per-device-bytes would have over-counted to 3*65 + 43.
+    assert peak < (3 * 65e9 + 43e9)
+
+
+def test_floating_kv_residency_ignores_first_tier_hbm():
+    # A first-tier device HBM's occupancy is fully described by the per-device
+    # reservation model, so KV cached back into an HBM must not be reconstructed
+    # as extra residency and stacked on top -- only floating memories (a node's
+    # RAM / second-tier pool) are. Otherwise the never-evicted store log inflates
+    # the reported peak past capacity.
+    from types import SimpleNamespace
+
+    from serve_sim.orchestrator import DecisionRecord
+    from serve_sim.report import _floating_kv_residency
+
+    def kv_store(mem, w, t, num_bytes):
+        return DecisionRecord(
+            time=1.0, kind="kv_transfer", request_id=w, workload_id=w,
+            turn_index=t, model="A", devices=(mem,), batch_index=0,
+            bytes_moved=num_bytes,
+        )
+
+    result = SimpleNamespace(
+        makespan=10.0,
+        decisions=[
+            kv_store("hbm0", 0, 0, 5e9),   # first-tier device HBM -> ignored
+            kv_store("node-ram", 1, 0, 7e9),  # floating node RAM -> kept
+        ],
+        memories=[
+            SimpleNamespace(name="hbm0", role="first_tier"),
+            SimpleNamespace(name="node-ram", role="node"),
+        ],
+    )
+
+    residency = _floating_kv_residency(result)
+
+    assert "hbm0" not in residency
+    assert "node-ram" in residency
+    assert sum(b for (_, _, _, b) in residency["node-ram"]) == pytest.approx(7e9)
+
+
 # --- orchestration decisions ----------------------------------------------------
 
 

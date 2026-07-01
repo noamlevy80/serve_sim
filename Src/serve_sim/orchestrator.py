@@ -1845,6 +1845,11 @@ class Simulator:
             rescaled = arbiter.job_rescaled_events(job_index)
 
             for events, is_rescaled in ((original, False), (rescaled, True)):
+                # Carriers of each routed-expert fetch, keyed by group: the set of
+                # slot devices that actually stream a shard (one per source node)
+                # plus the group's overall span, used below to mark the remaining
+                # devices as waiting.
+                expert_groups: dict[int, dict] = {}
                 for ev in events:
                     if 0 <= ev.device_index < len(device_names):
                         dev_name = device_names[ev.device_index]
@@ -1879,36 +1884,53 @@ class Simulator:
                     )
                     # A routed-expert fetch streams to the whole engine (the
                     # ranks share the prefetch and none can start the group until
-                    # it lands), so every *other* device of the slot is stalled
-                    # waiting for experts -- not idle. Log a zero-cost waiting
-                    # marker on each (no bytes/bandwidth, so memory and DMA
-                    # accounting stay attributed to the representative event) so
-                    # the per-device state reflects what the device is doing.
+                    # it lands). One device per source node carries the actual
+                    # transfer; record the group's carriers and span so that every
+                    # other slot device can be marked as waiting once below.
                     if ev.phase == "expert_transfer" and 0 <= ev.device_index < len(device_names):
-                        for idx, other_name in enumerate(device_names):
-                            if idx == ev.device_index:
-                                continue
-                            result.events.append(
-                                EventRecord(
-                                    job_index=job_index,
-                                    batch_index=b_index,
-                                    job_phase=job_phase,
-                                    request_ids=request_ids,
-                                    group_index=ev.group_index,
-                                    phase="expert_transfer",
-                                    device=other_name,
-                                    memory=mem_name,
-                                    model=model_name,
-                                    flops=0.0,
-                                    bytes_read=0.0,
-                                    compute_time=0.0,
-                                    bandwidth_time=0.0,
-                                    duration=ev.duration,
-                                    start=ev.start,
-                                    end=ev.end,
-                                    rescaled=is_rescaled,
-                                )
+                        info = expert_groups.get(ev.group_index)
+                        if info is None:
+                            expert_groups[ev.group_index] = {
+                                "carriers": {ev.device_index},
+                                "start": ev.start,
+                                "end": ev.end,
+                                "memory": mem_name,
+                            }
+                        else:
+                            info["carriers"].add(ev.device_index)
+                            info["start"] = min(info["start"], ev.start)
+                            info["end"] = max(info["end"], ev.end)
+
+                # Every slot device that is not a carrier for a given fetch is
+                # stalled waiting for experts -- not idle. Log a single zero-cost
+                # waiting marker per such device spanning the whole fetch (no
+                # bytes/bandwidth, so memory and DMA accounting stay attributed to
+                # the carrier events) so the per-device state reflects the stall.
+                for group_index, info in expert_groups.items():
+                    for idx, other_name in enumerate(device_names):
+                        if idx in info["carriers"]:
+                            continue
+                        result.events.append(
+                            EventRecord(
+                                job_index=job_index,
+                                batch_index=b_index,
+                                job_phase=job_phase,
+                                request_ids=request_ids,
+                                group_index=group_index,
+                                phase="expert_transfer",
+                                device=other_name,
+                                memory=info["memory"],
+                                model=model_name,
+                                flops=0.0,
+                                bytes_read=0.0,
+                                compute_time=0.0,
+                                bandwidth_time=0.0,
+                                duration=info["end"] - info["start"],
+                                start=info["start"],
+                                end=info["end"],
+                                rescaled=is_rescaled,
                             )
+                        )
 
             # First-token time: completion of the earliest decode step.
             decode_events = [e for e in rescaled if e.phase == "decode"]
@@ -2393,11 +2415,22 @@ class Simulator:
         slot = placement.slot
         home = self._home_node_for(model, slot, group)
         expert_source = None
+        expert_sources = None
         expert_latency = 0.0
         if expert_trace is not None:
-            expert_source = (
-                home.node_memory if home is not None else self.system.input_memory
-            )
+            if home is not None:
+                # The model is sharded across the nodes owning the slot's devices;
+                # each device streams its experts from its own node's RAM, so the
+                # movement spreads across every node the slot spans rather than
+                # funneling through one representative memory.
+                expert_sources = [
+                    self.system.node_of(d).node_memory for d in slot.devices
+                ]
+            else:
+                # No node can home the model: all devices stream from the shared
+                # input NVM (one source, so co-streaming contends on it).
+                expert_sources = [self.system.input_memory for _ in slot.devices]
+            expert_source = expert_sources[0]
             expert_latency = self._expert_fetch_latency(expert_source, slot, home)
             kv_tokens = sum(r.prompt_tokens + r.output_tokens for r in batch)
             self._job_reserve[batch_index] = self._planner_for(
@@ -2467,6 +2500,7 @@ class Simulator:
                 expert_trace=expert_trace,
                 expert_cache_capacity=expert_cap,
                 expert_source=expert_source,
+                expert_sources=expert_sources,
                 expert_fetch_latency=expert_latency,
                 expert_residency=expert_residency,
                 expert_index_bytes=expert_index_bytes,

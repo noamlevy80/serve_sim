@@ -982,6 +982,41 @@ def test_expert_fetch_stalls_the_whole_engine_group():
         )
 
 
+def test_moe_expert_stream_spreads_across_home_nodes():
+    # When the model is homed across several nodes, each device streams its own
+    # expert shard from its own node's RAM, so the fetch bandwidth spreads over
+    # every node the slot spans instead of funneling through one memory.
+    from serve_sim.model import toy_moe_model
+
+    model = toy_moe_model()
+    system = make_streaming_system(num_devices=1, num_nodes=2)  # one device/node
+    strat = StrategyConfig(
+        max_batch_size=1, model_weight_loading=True, tensor_parallel=2
+    )
+    req = Request(0, model, 64, 8, 0.0)
+
+    result = Simulator(system, strat).run([req])
+
+    ram_names = {
+        system.nodes[0].node_memory.name,
+        system.nodes[1].node_memory.name,
+    }
+    carriers = [
+        e
+        for e in result.events
+        if e.phase == "expert_transfer" and e.bytes_read > 0
+    ]
+    assert carriers, "expected routed-expert streaming events"
+    # Experts stream from BOTH nodes' RAM, not one representative memory.
+    assert {e.memory for e in carriers} == ram_names
+    # Each node moves an equal share of the routed-expert bytes.
+    by_node = {name: 0.0 for name in ram_names}
+    for e in carriers:
+        by_node[e.memory] += e.bytes_read
+    lo, hi = min(by_node.values()), max(by_node.values())
+    assert lo > 0 and abs(hi - lo) <= 1e-6 * hi
+
+
 def test_moe_experts_stream_from_nvm_without_home():
     # No node can home the 39 MB model (10 MB RAM), so the device loads only its
     # resident non-expert weights from the NVM and streams the experts from it.
